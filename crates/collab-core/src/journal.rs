@@ -93,15 +93,37 @@ pub enum JournalError {
 /// Ciphertext storage in a dedicated application-owned directory. Access may prompt via Keychain.
 pub struct Journal {
     root: PathBuf,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-journal"))]
     test_key: Option<TestKeySource>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-journal"))]
 #[derive(Clone)]
 enum TestKeySource {
+    #[cfg(test)]
     Memory(Key),
     Keychain(SecKeychain),
+}
+
+#[cfg(feature = "test-journal")]
+thread_local! {
+    static TEST_KEYCHAIN: std::cell::RefCell<Option<SecKeychain>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Use the supplied disposable Keychain for journals created on this thread during an integration test.
+#[cfg(feature = "test-journal")]
+#[doc(hidden)]
+pub fn with_test_keychain<R>(keychain: SecKeychain, run: impl FnOnce() -> R) -> R {
+    struct RestoreKeychain(Option<SecKeychain>);
+
+    impl Drop for RestoreKeychain {
+        fn drop(&mut self) {
+            TEST_KEYCHAIN.set(self.0.take());
+        }
+    }
+
+    let _restore = RestoreKeychain(TEST_KEYCHAIN.replace(Some(keychain)));
+    run()
 }
 
 /// Keep this lease alive while the application owns the selected journal record.
@@ -113,7 +135,9 @@ impl Journal {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            #[cfg(test)]
+            #[cfg(feature = "test-journal")]
+            test_key: TEST_KEYCHAIN.with_borrow(|keychain| keychain.clone().map(TestKeySource::Keychain)),
+            #[cfg(all(test, not(feature = "test-journal")))]
             test_key: None,
         }
     }
@@ -193,9 +217,10 @@ impl Journal {
     }
 
     fn key(&self, allow_create: bool) -> Result<Key, JournalError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-journal"))]
         if let Some(source) = &self.test_key {
             return match source {
+                #[cfg(test)]
                 TestKeySource::Memory(key) => Ok(key.clone()),
                 TestKeySource::Keychain(keychain) => key_in(keychain, allow_create),
             };

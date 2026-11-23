@@ -1,7 +1,10 @@
+use std::ops::Range;
+
 use designcraft_collab::{CommentAnchor, Operation, SharedId};
-use designcraft_doc::Document;
+use designcraft_doc::{Document, StoryId, TextSel};
 use designcraft_engine::Session;
 use egui::{Button, Context, TextEdit, Ui, Window};
+use serde_json::json;
 
 use super::{Collaboration, Mode, Room, history::HistoryAction, presence};
 use crate::{DesignApp, i18n::tr};
@@ -14,6 +17,7 @@ enum Action {
     Disconnect,
     History(HistoryAction),
     Comment(Box<Operation>),
+    SelectCommentText(StoryId, Range<usize>),
 }
 
 impl DesignApp {
@@ -65,6 +69,7 @@ impl DesignApp {
                 self.collaboration.room = None;
                 self.collaboration.comment.clear();
                 self.collaboration.reply_to = None;
+                self.collaboration.comment_needs_text_selection = false;
                 self.collaboration.confirm_discard = false;
                 self.session.defer_document_edits(None);
             }
@@ -78,12 +83,32 @@ impl DesignApp {
             }
             Some(Action::Comment(edit)) => {
                 let Some(room) = self.collaboration.room.as_mut() else { return };
+                let posted = matches!(&*edit, Operation::CreateComment { .. } | Operation::Reply { .. });
                 match room.queue_local(&mut self.session, vec![*edit]) {
-                    Ok(()) => {
+                    Ok(()) if posted => {
                         self.collaboration.comment.clear();
                         self.collaboration.reply_to = None;
+                        self.collaboration.comment_needs_text_selection = false;
                     }
+                    Ok(()) => {}
                     Err(error) => room.error = Some(error),
+                }
+            }
+            Some(Action::SelectCommentText(story, range)) => {
+                if self.run("tool.select", json!({"tool": "type"})).is_ok()
+                    && self.run("text.select", json!({"story": story.0, "anchor": range.start, "focus": range.end})).is_ok()
+                    && let Some(st) = self.session.active()
+                {
+                    let layout = self.session.cache.get(&st.doc, story, None);
+                    let location = designcraft_compose::caret(&layout, range.start)
+                        .and_then(|(frame, ..)| layout.frames.get(frame))
+                        .and_then(|frame| st.doc.find(frame.frame));
+                    if let Some(loc) = location
+                        && let Some(item) = st.doc.item_at(&loc)
+                    {
+                        let bounds = st.doc.parent_xf(&loc).transform_rect_bbox(item.bounds());
+                        crate::canvas::go_to_spread_rect(self, loc.spread, bounds);
+                    }
                 }
             }
             None => {}
@@ -218,7 +243,12 @@ fn comments(c: &mut Collaboration, st: &designcraft_engine::DocState, lang: &str
             ui.push_id(&thread.id, |ui| {
                 ui.small(author(room, &thread.id));
                 ui.label(&thread.text);
-                if room.replica.comment_is_orphaned(&st.doc, thread) {
+                let target = room.replica.comment_text_range(&st.doc, &thread.anchor);
+                let orphaned = match &thread.anchor {
+                    CommentAnchor::Text { .. } => target.is_none(),
+                    _ => room.replica.comment_is_orphaned(&st.doc, thread),
+                };
+                if orphaned {
                     ui.small(tr(lang, "Anchor removed"));
                 }
                 for reply in &thread.replies {
@@ -227,7 +257,12 @@ fn comments(c: &mut Collaboration, st: &designcraft_engine::DocState, lang: &str
                         ui.label(&reply.text);
                     });
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some((story, range)) = target
+                        && ui.button(tr(lang, "Select text")).clicked()
+                    {
+                        action = Some(Action::SelectCommentText(story, range));
+                    }
                     if ui.add_enabled(enabled, Button::new(tr(lang, "Reply"))).clicked() {
                         c.reply_to = Some(thread.id.clone());
                     }
@@ -241,13 +276,27 @@ fn comments(c: &mut Collaboration, st: &designcraft_engine::DocState, lang: &str
         }
     });
     let local = room.local.as_ref()?;
-    let anchor = st
-        .selection
-        .items
-        .first()
-        .and_then(|id| room.replica.shared_id(*id))
-        .map(CommentAnchor::Object)
-        .or_else(|| page_anchor(st.selection.page.unwrap_or(current_page), &st.doc));
+    let text_selection = st.selection.text.filter(|selection| !selection.is_caret());
+    let anchor = if let Some(selection) = text_selection {
+        selected_text_anchor(ui, room, st, selection)
+    } else if c.comment_needs_text_selection {
+        None
+    } else {
+        st.selection
+            .items
+            .first()
+            .and_then(|id| room.replica.shared_id(*id))
+            .map(CommentAnchor::Object)
+            .or_else(|| page_anchor(st.selection.page.unwrap_or(current_page), &st.doc))
+    };
+    if c.reply_to.is_none() {
+        if text_selection.is_some() {
+            let caption = if anchor.is_some() { "Attached to selected text" } else { "This text selection can’t be anchored." };
+            ui.small(tr(lang, caption));
+        } else if c.comment_needs_text_selection {
+            ui.small(tr(lang, "Select text to reattach this comment."));
+        }
+    }
     ui.add_enabled(
         enabled,
         TextEdit::multiline(&mut c.comment)
@@ -255,6 +304,9 @@ fn comments(c: &mut Collaboration, st: &designcraft_engine::DocState, lang: &str
             .char_limit(1000)
             .hint_text(tr(lang, if c.reply_to.is_some() { "Write a reply" } else { "Write a comment" })),
     );
+    if c.comment.is_empty() {
+        c.comment_needs_text_selection = false;
+    }
     let can_post = enabled && (c.reply_to.is_some() || anchor.is_some()) && !c.comment.trim().is_empty();
     ui.horizontal(|ui| {
         if ui.add_enabled(can_post, Button::new(tr(lang, "Post"))).clicked() {
@@ -271,6 +323,37 @@ fn comments(c: &mut Collaboration, st: &designcraft_engine::DocState, lang: &str
         }
     });
     action
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CommentSelection {
+    document: u64,
+    document_revision: u64,
+    room_revision: u64,
+    actor: designcraft_collab_core::ActorId,
+    selection: TextSel,
+}
+
+fn selected_text_anchor(ui: &Ui, room: &Room, st: &designcraft_engine::DocState, selection: TextSel) -> Option<CommentAnchor> {
+    if selection.cell.is_some() {
+        return None;
+    }
+    let key = ui.make_persistent_id("text-comment-selection");
+    let source = CommentSelection {
+        document: st.uid,
+        document_revision: st.revision,
+        room_revision: room.revision,
+        actor: room.local.as_ref()?.actor,
+        selection,
+    };
+    if let Some((saved, anchor)) = ui.data(|data| data.get_temp::<(CommentSelection, Option<CommentAnchor>)>(key))
+        && saved == source
+    {
+        return anchor;
+    }
+    let anchor = room.replica.text_comment_anchor(&st.doc, selection.story, selection.range());
+    ui.data_mut(|data| data.insert_temp(key, (source, anchor.clone())));
+    anchor
 }
 
 fn page_anchor(index: usize, doc: &Document) -> Option<CommentAnchor> {

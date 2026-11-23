@@ -1,6 +1,9 @@
-use designcraft_doc::{CharFormat, ItemId, ParaFormat, anchored::OBJECT_MARK};
+use designcraft_doc::{Align, CharFormat, ItemId, ParaFormat, anchored::OBJECT_MARK, styles::ParagraphStyle};
 
-use super::{AtomId, BasicTextFormat, Error, MAX_EDIT_ATOMS, Story, StoryId, Styles, TextEdit, TextFormatChange, TextReplica, TextSplice};
+use super::{
+    AtomId, BasicTextFormat, Error, MAX_EDIT_ATOMS, ParagraphFormatChange, Story, StoryId, Styles, TextEdit, TextFormatChange, TextReplica,
+    TextSplice,
+};
 
 fn story(value: &str) -> Story {
     let mut story = Story::with_text(StoryId(1), value, ParaFormat::default());
@@ -259,4 +262,112 @@ fn a_caret_hint_retains_the_intended_anchor_among_identical_characters() {
     replica.apply(&mut projected, &styles, "alice", 1, &edits).unwrap();
     assert_eq!(projected, after);
     assert_eq!(replica.byte_after(&AtomId::Seed(1)), Ok(6));
+}
+
+#[test]
+fn paragraph_formatting_stays_with_a_deleted_break_until_the_break_is_restored() {
+    let styles = Styles::default();
+    let mut current = story("AB\nCD");
+    current.paras[0].para.align = Some(Align::Right);
+    let mut replica = TextReplica::new(&current, &styles).unwrap();
+    let separator = AtomId::Seed(2);
+    let merge = TextEdit::Delete { atoms: vec![separator.clone()] };
+    let stale = TextEdit::FormatParagraph { after: Some(separator), change: ParagraphFormatChange::Align(Some(Align::Center)) };
+    let stale = serde_json::from_str(&serde_json::to_string(&stale).unwrap()).unwrap();
+    replica.apply(&mut current, &styles, "alice", 1, &[merge]).unwrap();
+    replica.apply(&mut current, &styles, "bob", 1, &[stale]).unwrap();
+    assert_eq!(current.text, "ABCD");
+    assert_eq!(current.paras.len(), 1);
+    assert_eq!(current.paras[0].para.align, Some(Align::Right));
+
+    replica.set_batch_active(&mut current, "alice", 1, false).unwrap();
+    assert_eq!(current.text, "AB\nCD");
+    assert_eq!(current.paras[1].para.align, Some(Align::Center));
+    replica.set_batch_active(&mut current, "bob", 1, false).unwrap();
+    assert_eq!(current.paras[1].para.align, None);
+
+    let before = current.clone();
+    let valid = TextEdit::FormatParagraph { after: None, change: ParagraphFormatChange::Align(None) };
+    let bad = TextEdit::FormatParagraph { after: Some(AtomId::Seed(0)), change: ParagraphFormatChange::Align(None) };
+    assert_eq!(replica.apply(&mut current, &styles, "alice", 2, &[valid, bad]), Err(Error::Invalid("paragraph anchor")));
+    assert_eq!(current, before);
+    replica.set_batch_active(&mut current, "bob", 1, true).unwrap();
+    assert_eq!(current.paras[1].para.align, Some(Align::Center));
+}
+
+#[test]
+fn capture_formats_a_new_paragraph_by_its_inserted_break() {
+    let styles = Styles::default();
+    let mut current = story("AB\nCD");
+    current.paras[0].para.align = Some(Align::Right);
+    current.paras[1].para.align = Some(Align::Center);
+    let mut draft = current.clone();
+    draft.insert(1, "\n");
+    assert_eq!(draft.paras[1].para.align, Some(Align::Right));
+    draft.paras[1].para.space_before = Some(8.0);
+
+    let mut replica = TextReplica::new(&current, &styles).unwrap();
+    let edits = replica.capture(&current, &draft, &styles, "alice", 1).unwrap();
+    assert!(matches!(&edits[..], [
+        TextEdit::Insert { text, .. },
+        TextEdit::FormatParagraph {
+            after: Some(AtomId::Inserted { actor, sequence: 1, index: 0 }),
+            change: ParagraphFormatChange::SpaceBefore(Some(8.0)),
+        },
+    ] if text == "\n" && actor.as_ref() == "alice"));
+    replica.apply(&mut current, &styles, "alice", 1, &edits).unwrap();
+    assert_eq!(current, draft);
+}
+
+#[test]
+fn old_text_operations_replay_with_a_long_existing_paragraph_style() {
+    let mut styles = Styles::default();
+    let name = "Long style name ".repeat(10);
+    styles.paragraph.push(ParagraphStyle {
+        name: name.clone(),
+        based_on: None,
+        next_style: None,
+        para: Default::default(),
+        chars: Default::default(),
+        shortcut: String::new(),
+    });
+    let mut current = story("AB");
+    current.paras[0].style.clone_from(&name);
+    let mut replica = TextReplica::new(&current, &styles).unwrap();
+    let edit = serde_json::from_value(serde_json::json!({
+        "type": "insert",
+        "after": { "kind": "seed", "value": 0 },
+        "text": "\n",
+        "format": { "style": "[None]" }
+    }))
+    .unwrap();
+    replica.apply(&mut current, &styles, "alice", 1, &[edit]).unwrap();
+    assert_eq!(current.text, "A\nB");
+    assert!(current.paras.iter().all(|paragraph| paragraph.style == name));
+}
+
+#[test]
+fn replacing_a_break_with_identical_text_creates_a_new_paragraph_identity() {
+    let styles = Styles::default();
+    let mut current = story("AB\nCD");
+    current.paras[0].para.align = Some(Align::Right);
+    current.paras[1].para.align = Some(Align::Center);
+    let mut draft = current.clone();
+    draft.replace(2..3, "\n");
+
+    let mut replica = TextReplica::new(&current, &styles).unwrap();
+    let splice = TextSplice { old: 2..3, new: 2..3 };
+    let edits = replica.capture_at(&current, &draft, &styles, "alice", 1, Some(splice)).unwrap();
+    assert!(matches!(&edits[..], [
+        TextEdit::Delete { atoms },
+        TextEdit::Insert { text, .. },
+    ] if *atoms == [AtomId::Seed(2)] && text == "\n"));
+
+    let concurrent = TextEdit::FormatParagraph { after: None, change: ParagraphFormatChange::Align(Some(Align::Left)) };
+    replica.apply(&mut current, &styles, "bob", 1, &[concurrent]).unwrap();
+    replica.apply(&mut current, &styles, "alice", 1, &edits).unwrap();
+    assert_eq!(current.text, draft.text);
+    assert_eq!(current.paras[1].para.align, Some(Align::Left));
+    replica.set_batch_active(&mut current, "alice", 1, false).unwrap();
+    assert_eq!(current.paras[1].para.align, Some(Align::Center));
 }

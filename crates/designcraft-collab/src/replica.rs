@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use designcraft_doc::{
@@ -6,7 +7,7 @@ use designcraft_doc::{
 };
 
 use crate::artwork::Placement;
-use crate::text::{AtomId, TextEdit, TextReplica, TextSplice};
+use crate::text::{AtomId, CaptureHint, TextEdit, TextReplica, TextSplice};
 use crate::{CommentAnchor, CommentReply, CommentThread, Error, MAX_OPERATIONS, Operation, ShapeFrame, SharedId, layers, pages, validation};
 
 const MAX_ORDER_ITEMS: usize = 512;
@@ -48,7 +49,30 @@ impl Replica {
         match &thread.anchor {
             CommentAnchor::Page(id) => !document.spreads.iter().flat_map(|spread| &spread.pages).any(|page| page.id == *id),
             CommentAnchor::Object(id) => self.local_id(id).is_none_or(|local| document.item(local).is_none()),
+            CommentAnchor::Text { .. } => self.comment_text_range(document, &thread.anchor).is_none(),
         }
+    }
+
+    /// Capture the original visible atoms of a nonempty UTF-8 byte range.
+    pub fn text_comment_anchor(&self, document: &Document, story: StoryId, range: Range<usize>) -> Option<CommentAnchor> {
+        let current = document.story(story)?;
+        if current.text.get(range.clone())?.is_empty() {
+            return None;
+        }
+        let atoms = match self.text.get(&story) {
+            Some(replica) => replica.atoms_in(range),
+            None => TextReplica::new(current, &document.styles).ok()?.atoms_in(range),
+        }
+        .ok()?;
+        Some(CommentAnchor::Text { story, atoms })
+    }
+
+    /// Resolve a text comment to the span between its first and last surviving original atom.
+    pub fn comment_text_range(&self, document: &Document, anchor: &CommentAnchor) -> Option<(StoryId, Range<usize>)> {
+        let CommentAnchor::Text { story, atoms } = anchor else { return None };
+        document.story(*story)?;
+        let range = self.text.get(story)?.visible_anchored_range(atoms)?;
+        Some((*story, range))
     }
 
     /// Capture a committed local edit while retaining the pre-edit replica. The
@@ -195,9 +219,9 @@ impl Replica {
             }
             let replica = self.text.get(&id).cloned().map_or_else(|| TextReplica::new(previous, &before.styles), Ok)?;
             let hint = selection
-                .filter(|(old, new)| old.story == id && new.story == id && old.cell.is_none() && new.cell.is_none() && new.is_caret())
+                .filter(|(old, new)| old.story == id && new.story == id && old.cell.is_none() && new.cell.is_none())
                 .and_then(|(old, new)| text_splice_hint(old, new, previous.text.len(), current.text.len()));
-            let edits = replica.capture_at(previous, current, &before.styles, actor, sequence, hint)?;
+            let edits = replica.capture_with_hint(previous, current, &before.styles, actor, sequence, hint)?;
             if !edits.is_empty() {
                 operations.push(Operation::Text { story: id, actor: actor.into(), sequence, edits });
             }
@@ -597,6 +621,14 @@ impl Replica {
                 return Err(Error::UnknownResource);
             }
             CommentAnchor::Object(id) if !self.items.contains_key(id) => return Err(Error::UnknownObject),
+            CommentAnchor::Text { story, atoms } => {
+                let current = document.story(*story).ok_or(Error::UnknownResource)?;
+                let replica = match self.text.entry(*story) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => entry.insert(TextReplica::new(current, &document.styles)?),
+                };
+                replica.validate_comment_atoms(atoms)?;
+            }
             _ => {}
         }
         let thread = CommentThread { id: id.clone(), anchor: anchor.clone(), text: text.to_owned(), replies: Vec::new(), resolved: false };
@@ -689,16 +721,22 @@ fn story_is_referenced(document: &Document, id: StoryId) -> bool {
             .any(|placeholder| matches!(placeholder.anchor, PlaceholderAnchor::Text { story, .. } if story == id))
 }
 
-fn text_splice_hint(before: TextSel, after: TextSel, old_len: usize, new_len: usize) -> Option<TextSplice> {
+fn text_splice_hint(before: TextSel, after: TextSel, old_len: usize, new_len: usize) -> Option<CaptureHint> {
+    if !after.is_caret() {
+        if (before.anchor < before.focus) != (after.anchor < after.focus) {
+            return None;
+        }
+        return CaptureHint::delete_surrounding(before.range(), after.range(), old_len, new_len);
+    }
     let end = after.focus;
     if !before.is_caret() {
         let start = before.anchor.min(before.focus);
         let old_end = before.anchor.max(before.focus);
-        return (start <= end).then_some(TextSplice { old: start..old_end, new: start..end });
+        return (start <= end).then(|| TextSplice { old: start..old_end, new: start..end }.into());
     }
     if new_len >= old_len {
-        return (before.focus <= end).then_some(TextSplice { old: before.focus..before.focus, new: before.focus..end });
+        return (before.focus <= end).then(|| TextSplice { old: before.focus..before.focus, new: before.focus..end }.into());
     }
     let old_end = end.checked_add(old_len - new_len)?;
-    Some(TextSplice { old: end..old_end, new: end..end })
+    Some(TextSplice { old: end..old_end, new: end..end }.into())
 }

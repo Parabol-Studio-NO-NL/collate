@@ -6,7 +6,12 @@ use designcraft_doc::geom::{Affine, PathData};
 use designcraft_doc::{Fill, Item, ItemId, LayerId, PageId, Shape, SpreadId, StoryId, Stroke};
 use serde::{Deserialize, Serialize};
 
-use crate::{artwork::Placement, layers::LayerEdit, pages::PageEdit, text::TextEdit};
+use crate::{
+    artwork::Placement,
+    layers::LayerEdit,
+    pages::PageEdit,
+    text::{AtomId, TextEdit},
+};
 
 /// Seed IDs are defined by the immutable starting document. Subsequent IDs are
 /// tied to an authenticated actor and a proposal sequence, independent of a Mac's
@@ -169,6 +174,7 @@ impl Change {
 pub enum CommentAnchor {
     Page(PageId),
     Object(SharedId),
+    Text { story: StoryId, atoms: Vec<AtomId> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

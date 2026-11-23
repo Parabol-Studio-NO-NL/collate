@@ -491,17 +491,16 @@ fn the_control_panel_grid_button_keeps_first_line_only() {
     assert_eq!(crate::panels::text_attrs(&mut h.state_mut().app).unwrap()["para"]["gridAlign"], "none");
 }
 
-/// The course's chapter 16: the text Control panel has InDesign's two modes. A shows the
-/// Character Formatting Controls (the case buttons, kerning and tracking, the scales…), ¶ the
-/// Paragraph Formatting Controls (alignment, indents, spacing, the drop cap…).
+/// The default text controls surface common formatting in either group, and the focused views
+/// still make the rest of each group available in a narrower window.
 #[test]
-fn the_type_control_panel_has_character_and_paragraph_modes() {
+fn the_type_control_panel_shows_both_groups_by_default() {
     let mut app = app();
     app.run("file.new", serde_json::json!({})).unwrap();
     let f = app.run("frame.create", serde_json::json!({"rect": [72, 72, 400, 300], "content": "text", "text": "Bulbs"})).unwrap();
     app.run("text.select", serde_json::json!({"story": f["story"], "anchor": 0, "focus": 5})).unwrap();
     app.session.set_tool("type");
-    let mut h = test_window::open(app, vec2(2400.0, 700.0));
+    let mut h = test_window::open(app, vec2(1280.0, 700.0));
     let bar = test_window::panel_rect(&h, "control_bar");
     let in_bar = move |r: egui::Rect| bar.y_range().contains(r.center().y);
     let click = |h: &mut egui_kittest::Harness<'static, test_window::Window>, label: &str| {
@@ -512,18 +511,27 @@ fn the_type_control_panel_has_character_and_paragraph_modes() {
         h.run_steps(3);
     };
     let has = |h: &egui_kittest::Harness<'static, test_window::Window>, label: &str| h.query_all_by_label(label).any(|n| in_bar(n.rect()));
+    for label in ["Font Size", "Leading", "Align center", "Left Indent", "Space After"] {
+        assert!(h.query_all_by_label(label).any(|n| bar.contains_rect(n.rect())), "{label} should be visible in the default Control panel");
+    }
+    click(&mut h, "Align center");
+    assert_eq!(crate::panels::text_attrs(&mut h.state_mut().app).unwrap()["para"]["align"], "center");
+    click(&mut h, "Character Formatting Controls");
     assert!(has(&h, "Small Caps") && has(&h, "Vertical Scale") && !has(&h, "Drop Cap Number of Lines"));
     click(&mut h, "Small Caps");
     click(&mut h, "Paragraph Formatting Controls");
     assert!(has(&h, "Drop Cap Number of Lines") && has(&h, "Space Before") && !has(&h, "Small Caps"));
     click(&mut h, "Align to Baseline Grid");
-    click(&mut h, "Align center");
+    click(&mut h, "Align right");
     let a = crate::panels::text_attrs(&mut h.state_mut().app).unwrap();
     assert_eq!(a["chars"]["capitalization"], "smallCaps");
     assert_eq!(a["para"]["gridAlign"], "allLines");
-    assert_eq!(a["para"]["align"], "center");
-    click(&mut h, "Character Formatting Controls");
-    assert!(has(&h, "Small Caps"));
+    assert_eq!(a["para"]["align"], "right");
+    h.get_by_label("All Text Controls").focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(has(&h, "Small Caps") && has(&h, "Drop Cap Number of Lines"));
 }
 
 /// The course's chapter 21: the ¶ Control panel has InDesign's Bulleted and Numbered List
