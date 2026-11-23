@@ -1167,3 +1167,6 @@ fn concurrent_editor_text_inserts_and_deletes_keep_the_other_peers_atoms() {
     wait_for(&mut [&mut host, &mut guest], "catch up after a revision gap", |apps| room(apps[1]).can_edit());
     assert_eq!(*document(&guest), unchanged);
 }
+
+#[cfg(target_os = "macos")]
+mod restart;

@@ -92,6 +92,13 @@ jobs:
         run: >-
           cargo test --locked -p designcraft-collab-core --features secure-journal
           --lib journal::tests:: -- --include-ignored
+      - name: Verify the shared room survives a process restart
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
+        run: >-
+          cargo test --locked -p designcraft-ui-egui --lib
+          collaboration::tests::restart::native_room_recovery_reconnects_after_process_exit
+          -- --ignored --exact
       - name: Smoke-test the bundled Sparkle updater
         env:
           RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
