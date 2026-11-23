@@ -60,7 +60,7 @@ designcraft-collab-core = { path = "../collab-core", features = ["native"] }
 base64 = "0.22"
 designcraft-format = { workspace = true }
 craft-image-codecs = { workspace = true }
-craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "c60e7a20063313b80a994075adb4f797b24ab4f1", version = "=0.1.0" }
+craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "33be35625e252cc4f06aa375b3b428521faea37d", version = "=0.1.0" }
 sha2 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies.designcraft-collab-core]
