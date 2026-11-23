@@ -59,7 +59,7 @@ expect_rejection() {
     echo "Expected appcast generation to fail for $channel at $prefix." >&2
     return 1
   fi
-  if ! rg --fixed-strings --quiet "$expected" "$work/rejection.log"; then
+  if ! grep -Fq -- "$expected" "$work/rejection.log"; then
     cat "$work/rejection.log" >&2
     return 1
   fi
@@ -89,7 +89,7 @@ expect_build_rejection() {
     echo "Expected the build number check to fail." >&2
     return 1
   fi
-  if ! rg --fixed-strings --quiet "$expected" "$work/build-rejection.log"; then
+  if ! grep -Fq -- "$expected" "$work/build-rejection.log"; then
     cat "$work/build-rejection.log" >&2
     return 1
   fi
