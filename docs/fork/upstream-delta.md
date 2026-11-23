@@ -1,6 +1,8 @@
 # Collate changes to DesignCraft
 
-Baseline: `storytold/designcraft@2d9b83b48eee2e55bc814ba82b7c1dd8b21fac11`.
+The [upstream revision marker](../../tools/fork/upstream-revision) records the latest reviewed DesignCraft commit.
+
+The review of `b7a8a9ac73314eb50dd8ec9c2dcacc3f1d7d555a` covers a single change to DesignCraft's release workflow. It forwards an upstream distribution credential between workflows. Collate distributes official builds through the private studio release workflow, so the source import records the review in the revision marker and excludes upstream release automation.
 
 | Path | Change | Upstream potential |
 | --- | --- | --- |

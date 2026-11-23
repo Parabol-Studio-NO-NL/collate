@@ -196,14 +196,16 @@ pub fn selected_anchor_points(app: &DesignApp) -> Vec<((designcraft_doc::ItemId,
 }
 
 pub fn sel_info(app: &DesignApp) -> Option<SelInfo> {
+    sel_info_for_items(app, &app.session.active()?.selection.items)
+}
+
+fn sel_info_for_items(app: &DesignApp, items: &[designcraft_doc::ItemId]) -> Option<SelInfo> {
     let st = app.session.active()?;
-    if st.selection.items.is_empty() {
-        return None;
-    }
     let d = &st.doc;
+    let first = d.item(*items.first()?)?;
     let with_stroke = app.session.prefs.dimensions_include_stroke;
     let mut b: Option<Rect> = None;
-    for id in &st.selection.items {
+    for id in items {
         let it = d.item(*id)?;
         // Direct Selection of a placed graphic: its bounds, as the Transform fields then set.
         let ib = match it.graphic() {
@@ -223,7 +225,6 @@ pub fn sel_info(app: &DesignApp) -> Option<SelInfo> {
         Some(((_, p0), rest)) => rest.iter().fold(Rect::from_points(*p0, *p0), |r, (_, p)| r.union_pt(*p)),
         None => b?,
     };
-    let first = d.item(st.selection.items[0])?;
     let loc = d.find(first.id)?;
     let o = d.ruler_origin(loc.spread, b.center().x)?;
     // With the graphic selected (Direct Selection), the Text Wrap panel shows its own wrap.
@@ -241,7 +242,7 @@ pub fn sel_info(app: &DesignApp) -> Option<SelInfo> {
     Some(SelInfo {
         page_rect: Rect::new(b.x0 - o.x, b.y0 - o.y, b.x1 - o.x, b.y1 - o.y),
         object_size,
-        count: st.selection.items.len(),
+        count: items.len(),
         fill: first.fill.swatch.clone(),
         stroke: first.stroke.swatch.clone(),
         stroke_weight: first.stroke.weight,

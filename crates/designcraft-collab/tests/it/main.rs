@@ -4,12 +4,14 @@ use designcraft_collab::{Change, CommentAnchor, Error, Operation, Replica, Share
 use designcraft_collab::{
     layers::LayerEdit,
     pages::PageEdit,
-    text::{AtomId, BasicTextFormat, TextEdit},
+    text::{AtomId, BasicTextFormat, MAX_EDIT_ATOMS, TextEdit},
 };
 use designcraft_doc::build::NewDocument;
 use designcraft_doc::color::swatch::BLACK;
 use designcraft_doc::geom::{Affine, Rect, shapes};
-use designcraft_doc::{Content, Document, Fill, Hyperlink, HyperlinkDest, HyperlinkSource, Item, ItemId, LayerId, Shape, SpreadRef, StoryId};
+use designcraft_doc::{
+    Content, Document, Fill, Hyperlink, HyperlinkDest, HyperlinkSource, Item, ItemId, LayerId, Shape, SpreadRef, StoryId, TextSel,
+};
 
 fn seed() -> Document {
     Document::new(&NewDocument::default())
@@ -253,6 +255,150 @@ fn a_page_removal_cannot_bypass_frame_reference_checks() {
     assert_eq!(replica.apply(&mut confirmed, &[Operation::Page { edit }]), Err(Error::UnsupportedObject));
     assert_eq!(confirmed, before);
     assert_eq!(replica.local_id(&shared), Some(frame));
+}
+
+#[test]
+fn deleting_around_a_text_selection_preserves_the_selected_atoms() {
+    use std::ops::Range;
+
+    let check = |text: &str, (anchor, focus): (usize, usize), before: Range<usize>, after: Range<usize>, deleted: &[u32]| {
+        let mut seed = seed();
+        let layer = seed.default_layer();
+        let (_, story) = seed.add_text_frame(SpreadRef::Doc(0), Rect::new(0.0, 0.0, 100.0, 20.0), layer, text, Default::default()).unwrap();
+        let old = TextSel { anchor, focus, ..TextSel::caret(story, 0) };
+        let new = TextSel { anchor: anchor - before.len(), focus: focus - before.len(), ..old };
+        let mut draft = seed.clone();
+        draft.story_mut(story).unwrap().delete(after);
+        draft.story_mut(story).unwrap().delete(before);
+
+        let mut replica = Replica::new(&seed);
+        let operations = replica.capture_selected(&seed, &draft, "alice", 1, Some((old, new))).unwrap();
+        let [Operation::Text { edits, .. }] = operations.as_slice() else { panic!("expected text edits, got {operations:?}") };
+        let atoms: Vec<_> = edits
+            .iter()
+            .flat_map(|edit| match edit {
+                TextEdit::Delete { atoms } => atoms.iter().cloned(),
+                _ => panic!("expected only deletions, got {edit:?}"),
+            })
+            .collect();
+        assert_eq!(atoms, deleted.iter().copied().map(AtomId::Seed).collect::<Vec<_>>());
+
+        replica.apply(&mut seed, &operations).unwrap();
+        let expected = draft.story(story).unwrap();
+        let replayed = seed.story_mut(story).unwrap();
+        replayed.rev = expected.rev;
+        assert_eq!(&*replayed, expected);
+    };
+
+    // The same text results if the second newline is removed instead, but its atom is selected.
+    check("A\n\nB", (2, 3), 1..2, 3..3, &[1]);
+    // Delete on both sides of a reverse selection with a multibyte character and a newline.
+    check("Pα\nλ\n\nαZ", (7, 4), 1..4, 7..10, &[1, 2, 5, 6]);
+}
+
+#[test]
+fn text_comments_follow_original_utf8_atoms_across_edits_undo_and_replay() {
+    let mut seed = seed();
+    let layer = seed.default_layer();
+    let (frame, story) = seed.add_text_frame(SpreadRef::Doc(0), Rect::new(0.0, 0.0, 20.0, 20.0), layer, "Aé😊Z", Default::default()).unwrap();
+    let mut current = seed.clone();
+    let mut replica = Replica::new(&seed);
+    let anchor = replica.text_comment_anchor(&current, story, 1..7).unwrap();
+    let comment = Operation::CreateComment { id: id("alice", 1), anchor: anchor.clone(), text: "Review this range".into() };
+    let mut history = vec![comment.clone()];
+    replica.apply(&mut current, &[comment]).unwrap();
+    assert_eq!(replica.comment_text_range(&current, &anchor), Some((story, 1..7)));
+
+    let insert = |after, text: &str| TextEdit::Insert { after: Some(AtomId::Seed(after)), text: text.into(), format: BasicTextFormat::default() };
+    let insertion = Operation::Text { story, actor: "bob".into(), sequence: 1, edits: vec![insert(0, "!"), insert(1, "文"), insert(2, "?")] };
+    replica.apply(&mut current, std::slice::from_ref(&insertion)).unwrap();
+    history.push(insertion);
+    let range = replica.comment_text_range(&current, &anchor).unwrap().1;
+    assert_eq!(&current.story(story).unwrap().text[range], "é文😊");
+
+    // A freshly captured range containing an insertion must follow story order, even when its IDs sort differently.
+    let edited_anchor = replica.text_comment_anchor(&current, story, 2..11).unwrap();
+    let edited_comment = Operation::CreateComment { id: id("alice", 2), anchor: edited_anchor, text: "Includes the insertion".into() };
+    replica.apply(&mut current, std::slice::from_ref(&edited_comment)).unwrap();
+    history.push(edited_comment);
+
+    let delete =
+        |sequence, seed| Operation::Text { story, actor: "bob".into(), sequence, edits: vec![TextEdit::Delete { atoms: vec![AtomId::Seed(seed)] }] };
+    let first_deletion = delete(2, 1);
+    replica.apply(&mut current, std::slice::from_ref(&first_deletion)).unwrap();
+    history.push(first_deletion);
+    let range = replica.comment_text_range(&current, &anchor).unwrap().1;
+    assert_eq!(&current.story(story).unwrap().text[range], "😊");
+
+    let second_deletion = delete(3, 2);
+    let late_comment = Operation::CreateComment { id: id("alice", 3), anchor: anchor.clone(), text: "Sent before the deletions".into() };
+    for operation in [second_deletion, late_comment] {
+        replica.apply(&mut current, std::slice::from_ref(&operation)).unwrap();
+        history.push(operation);
+    }
+    assert_eq!(replica.comment_text_range(&current, &anchor), None);
+    assert!(replica.comments().filter(|thread| thread.anchor == anchor).all(|thread| replica.comment_is_orphaned(&current, thread)));
+
+    let undo = Operation::SetTextBatchActive { story, actor: "bob".into(), original_sequence: 2, active: false };
+    replica.apply(&mut current, std::slice::from_ref(&undo)).unwrap();
+    history.push(undo);
+    let range = replica.comment_text_range(&current, &anchor).unwrap().1;
+    assert_eq!(&current.story(story).unwrap().text[range], "é");
+    assert!(replica.comments().all(|thread| !replica.comment_is_orphaned(&current, thread)));
+
+    let mut replay = Replica::new(&seed);
+    let mut reopened = seed;
+    let wire = serde_json::to_vec(&history).unwrap();
+    for operation in serde_json::from_slice::<Vec<Operation>>(&wire).unwrap() {
+        replay.apply(&mut reopened, &[operation]).unwrap();
+    }
+    assert_eq!(reopened, current);
+    assert!(replay.comments().eq(replica.comments()));
+    assert_eq!(replay.comment_text_range(&reopened, &anchor), replica.comment_text_range(&current, &anchor));
+
+    let removal = Operation::DeleteText { id: SharedId::Seed(frame), spread: reopened.spreads[0].id, story };
+    replay.apply(&mut reopened, &[removal]).unwrap();
+    assert!(replay.comments().all(|thread| replay.comment_is_orphaned(&reopened, thread)));
+    let stale = Operation::CreateComment { id: id("alice", 4), anchor, text: "The entire story has gone".into() };
+    assert_eq!(replay.apply(&mut reopened, &[stale]), Err(Error::UnknownResource));
+}
+
+#[test]
+fn text_comments_reject_invalid_ranges_before_creating_a_thread() {
+    let mut document = seed();
+    let layer = document.default_layer();
+    let text = "é".repeat(MAX_EDIT_ATOMS + 1);
+    let (_, story) = document.add_text_frame(SpreadRef::Doc(0), Rect::new(0.0, 0.0, 20.0, 20.0), layer, &text, Default::default()).unwrap();
+    let (_, other_story) = add_text_frame(&mut document, 30.0);
+    let mut replica = Replica::new(&document);
+    assert_eq!(replica.text_comment_anchor(&document, story, 0..0), None);
+    assert_eq!(replica.text_comment_anchor(&document, story, 1..2), None);
+    assert_eq!(replica.text_comment_anchor(&document, story, 0..text.len()), None);
+    let limit_anchor = replica.text_comment_anchor(&document, story, 0..MAX_EDIT_ATOMS * 'é'.len_utf8()).unwrap();
+    let foreign = AtomId::Inserted { actor: "bob".into(), sequence: 1, index: 0 };
+    let edit = Operation::Text {
+        story: other_story,
+        actor: "bob".into(),
+        sequence: 1,
+        edits: vec![TextEdit::Insert { after: None, text: "!".into(), format: BasicTextFormat::default() }],
+    };
+    replica.apply(&mut document, &[edit]).unwrap();
+
+    let invalid_ranges = [
+        (vec![], Error::Invalid("text comment range")),
+        (vec![AtomId::Seed(0), AtomId::Seed(0)], Error::Invalid("text comment range")),
+        (vec![AtomId::Seed(1), AtomId::Seed(0)], Error::Invalid("text comment range")),
+        (vec![foreign], Error::Invalid("text comment range")),
+        ((0..=MAX_EDIT_ATOMS as u32).map(AtomId::Seed).collect(), Error::Limit),
+    ];
+    let make_comment = |anchor| Operation::CreateComment { id: id("alice", 1), anchor, text: "A selection comment".into() };
+    for (atoms, error) in invalid_ranges {
+        let operation = make_comment(CommentAnchor::Text { story, atoms });
+        assert_eq!(replica.apply(&mut document, &[operation]), Err(error));
+        assert_eq!(replica.comments().count(), 0);
+    }
+    replica.apply(&mut document, &[make_comment(limit_anchor)]).unwrap();
+    assert_eq!(replica.comments().count(), 1);
 }
 
 #[test]

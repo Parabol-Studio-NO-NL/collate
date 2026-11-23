@@ -10,9 +10,25 @@ repository=$1
 main=$2
 result=$3
 [[ $(cat "$result/status") == ready ]]
-candidate=$(cat "$result/candidate")
-[[ $(git rev-parse "$candidate^1") == "$main" ]]
-upstream=$(git rev-parse "$candidate^2")
+candidate=$(git rev-parse --verify --end-of-options "$(cat "$result/candidate")^{commit}")
+upstream=$(git rev-parse --verify --end-of-options "$(cat "$result/upstream")^{commit}")
+parents=$(git show -s --format=%P "$candidate")
+revision_file=tools/fork/upstream-revision
+if baseline=$(git show "$main:$revision_file" 2>/dev/null); then
+    candidate_revision=$(git show "$candidate:$revision_file")
+    if [[ "$parents" != "$main" || "$candidate_revision" != "$upstream" || "$baseline" == "$upstream" ]] ||
+       ! git merge-base --is-ancestor "$baseline" "$upstream"; then
+        echo 'The snapshot candidate does not match its reviewed base and upstream revision.' >&2
+        exit 1
+    fi
+    operation=Import
+else
+    if [[ "$parents" != "$main $upstream" ]]; then
+        echo 'The integration commit does not have the expected fork and upstream parents.' >&2
+        exit 1
+    fi
+    operation=Merge
+fi
 branch="sync/upstream-${upstream:0:16}-${main:0:16}"
 
 # Authenticate to GitHub without storing the token in the repository or the remote URL.
@@ -44,4 +60,4 @@ fi
 
 # Preserve existing PRs and review history. A new revision or base gets a new PR.
 gh pr create --repo "$repository" --base main --head "$branch" \
-    --title "Merge DesignCraft upstream ${upstream:0:12}" --body-file "$result/report.md"
+    --title "$operation DesignCraft upstream ${upstream:0:12}" --body-file "$result/report.md"
