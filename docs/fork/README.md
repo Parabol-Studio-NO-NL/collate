@@ -38,6 +38,16 @@ bash tools/fork/test-document-roundtrip.sh
 
 On macOS, run the native journal test with `cargo test --locked -p designcraft-collab-core --features secure-journal --lib journal::tests:: -- --include-ignored`. A disposable Keychain lets a second process reopen and update the encrypted file. The test also verifies that a missing key leaves the existing ciphertext intact.
 
+The macOS CI job also reopens a shared room in a separate test process with a disposable
+Keychain. To run the same test locally:
+
+```sh
+cargo test --locked -p designcraft-ui-egui --lib collaboration::tests::restart::native_room_recovery_reconnects_after_process_exit -- --ignored --exact
+```
+
+The test verifies both peer identities, the restored document and comment, resend of an
+unacknowledged edit, and a new edit saved by the guest.
+
 - [Architecture](architecture.md)
 - [Collaboration protocol](collaboration-protocol.md)
 - [Integrating DesignCraft upstream](upstream-sync.md)
