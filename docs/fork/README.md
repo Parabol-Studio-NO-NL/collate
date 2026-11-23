@@ -24,6 +24,8 @@ Font files stay on each Mac. Collate uses DesignCraft's local missing-font fallb
 
 ## Develop
 
+The **Native Sparkle fixture** runs on changes to the updater and macOS packaging. On a disposable GitHub-hosted macOS runner, it uses a temporary certificate and two ad hoc Collate builds to exercise **Check for Updates** over loopback HTTPS. It verifies the signed appcast and archive, then checks that Sparkle installs and relaunches the newer build from the scratch path.
+
 ```sh
 cargo run --locked -p designcraft
 cargo test --locked -p designcraft-collab

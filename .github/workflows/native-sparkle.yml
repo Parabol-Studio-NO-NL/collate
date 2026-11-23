@@ -1,0 +1,44 @@
+name: Native Sparkle fixture
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/native-sparkle.yml"
+      - "tools/fork/*native-sparkle*"
+      - "packaging/macos/codesign/**"
+      - "apps/designcraft/src/sparkle.rs"
+      - "apps/designcraft/Cargo.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-sparkle-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  RUSTUP_TOOLCHAIN: "1.98.1"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  native-sparkle:
+    name: Install a signed test update over HTTPS
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: false
+      - name: Exercise Collate’s updater on the temporary runner
+        run: |
+          export PATH="$(brew --prefix openssl@3)/bin:$PATH"
+          export SPARKLE_FRAMEWORK_PATH="$RUNNER_TEMP/sparkle"
+          bash packaging/macos/codesign/fetch-sparkle.sh "$SPARKLE_FRAMEWORK_PATH"
+          bash tools/fork/test-native-sparkle.sh
