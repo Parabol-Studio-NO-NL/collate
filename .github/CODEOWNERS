@@ -1,0 +1,13 @@
+/.github/ @larshoie
+/tools/fork/ @larshoie
+/docs/fork/security.md @larshoie
+/crates/doc/ @larshoie
+/crates/engine/ @larshoie
+/crates/format/ @larshoie
+/crates/ui-egui/ @larshoie
+/crates/collab-core/ @larshoie
+/crates/designcraft-collab/ @larshoie
+/apps/designcraft/ @larshoie
+/packaging/macos/ @larshoie
+**/Cargo.toml @larshoie
+/Cargo.lock @larshoie

@@ -1,0 +1,35 @@
+[package]
+name = "designcraft-collab-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+native = ["dep:base64", "dep:futures-util", "dep:iroh", "dep:postcard", "dep:subtle", "dep:tokio", "dep:tokio-util"]
+secure-journal = ["dep:chacha20poly1305", "dep:getrandom", "dep:libc", "dep:security-framework", "dep:security-framework-sys", "dep:tempfile", "dep:thiserror", "dep:zeroize"]
+
+[dependencies]
+serde.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+base64 = { version = "0.22", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+iroh = { version = "=1.5.0", default-features = false, features = ["tls-ring"], optional = true }
+postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
+subtle = { version = "2.6", optional = true }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"], optional = true }
+tokio-util = { version = "0.7", features = ["codec", "rt"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
+getrandom = { version = "0.4", optional = true }
+libc = { version = "0.2", optional = true }
+security-framework = { version = "3", optional = true }
+security-framework-sys = { version = "2", optional = true }
+tempfile = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+zeroize = { version = "1", optional = true }
+
+[lints]
+workspace = true
