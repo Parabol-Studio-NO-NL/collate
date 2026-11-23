@@ -50,6 +50,15 @@ cargo test --locked -p designcraft-ui-egui --lib collaboration::tests::restart::
 The test verifies both peer identities, the restored document and comment, resend of an
 unacknowledged edit, and a new edit saved by the guest.
 
+A native smoke test of `f2e4497` ran two Collate editors on the same Mac with
+separate loopback control ports and a temporary clipboard. The guest joined
+by invitation and received the document. Both editors showed their peer and
+agreed on frame geometry after edits from each side. The guest displayed the
+host's selection and received the resolved comment. Quit kept an unacknowledged
+guest edit queued, and the edit reached both editors when the host resumed.
+The guest left and rejoined after a new host edit. The two saved archives
+reopened with matching geometry.
+
 - [Architecture](architecture.md)
 - [Collaboration protocol](collaboration-protocol.md)
 - [Integrating DesignCraft upstream](upstream-sync.md)

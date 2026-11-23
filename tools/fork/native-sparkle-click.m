@@ -75,7 +75,9 @@ static NSButton *InstallButton(NSWindow *window)
         NSString *install = [sparkle localizedStringForKey:@"Install Update" value:@"Install Update" table:@"Sparkle"];
         return FindButton(window.contentView, controller, NSSelectorFromString(@"installUpdate:"), @[install, relaunch]);
     }
-    return FindButton(window.contentView, NSClassFromString(@"SPUStandardUserDriver"), NSSelectorFromString(@"installAndRestart:"), @[relaunch]);
+    Class driver = NSClassFromString(@"SPUStandardUserDriver");
+    NSButton *install = FindButton(window.contentView, driver, NSSelectorFromString(@"installAndRestart:"), @[relaunch]);
+    return install ?: FindButton(window.contentView, driver, NSSelectorFromString(@"retryTermination:"), @[relaunch]);
 }
 
 __attribute__((constructor)) static void StartSparkleClickObserver(void)
@@ -96,7 +98,11 @@ __attribute__((constructor)) static void StartSparkleClickObserver(void)
             (void)tick;
             for (NSWindow *window in NSApp.windows) {
                 NSButton *button = InstallButton(window);
-                if (button != nil && ![clicked containsObject:button] && Log(path, [@"clicked " stringByAppendingString:button.title])) {
+                if (button == nil || [clicked containsObject:button]) {
+                    continue;
+                }
+                NSString *event = [NSString stringWithFormat:@"clicked %@ %@", NSStringFromSelector(button.action), button.title];
+                if (Log(path, event)) {
                     [clicked addObject:button];
                     [button performClick:nil];
                     return;

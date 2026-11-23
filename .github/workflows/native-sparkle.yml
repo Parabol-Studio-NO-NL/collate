@@ -10,6 +10,7 @@ on:
       - "apps/designcraft/src/sparkle.rs"
       - "apps/designcraft/build.rs"
       - "apps/designcraft/Cargo.toml"
+      - "crates/ui-egui/src/app/quit.rs"
       - "crates/ui-egui/src/updates_ui.rs"
       - "Cargo.lock"
 

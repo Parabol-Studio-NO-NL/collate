@@ -16,6 +16,7 @@ import ssl
 import subprocess
 import sys
 import time
+from zipfile import ZipFile
 
 
 UPDATE_PATHS = {
@@ -122,10 +123,17 @@ def read_log(path):
 
 def rpc(port, method, params=None):
     request = json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n"
-    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
         connection.sendall(request.encode("utf-8"))
         with connection.makefile("rb") as response:
             return json.loads(response.readline())
+
+
+def require_rpc(port, method, params=None):
+    reply = rpc(port, method, params)
+    if reply.get("ok") is not True:
+        raise RuntimeError(f"{method} failed: {reply}")
+    return reply.get("result")
 
 
 def build_number(app):
@@ -158,6 +166,58 @@ def wait_for_relaunch(child, processes, deadline):
                     return pid
         time.sleep(0.25)
     raise RuntimeError("Sparkle did not exit the old process and relaunch the scratch app")
+
+
+def check_for_updates(port):
+    require_rpc(port, "ui.menu.invoke", {"command": "help.checkForUpdates", "params": {}})
+
+
+def wait_for_quit_prompt(child, port, deadline, *, retry=False):
+    next_refocus = time.monotonic()
+    while time.monotonic() < deadline:
+        if child.poll() is not None:
+            raise RuntimeError("The old Collate exited before asking what to do with its unsaved document")
+        dialog = require_rpc(port, "ui.inspect").get("dialog")
+        if dialog and dialog.get("id") == "closeDocument" and dialog.get("fields", {}).get("quitting") is True:
+            return
+        if retry and time.monotonic() >= next_refocus:
+            # Sparkle can present its retry button only after noticing the previous quit was canceled.
+            check_for_updates(port)
+            next_refocus = time.monotonic() + 1
+        time.sleep(0.2)
+    raise RuntimeError("Sparkle did not bring up Collate's unsaved document quit prompt")
+
+
+def exercise_unsaved_update(child, app, port, work, deadline):
+    document = work / "layout.designcraft"
+    text = "Keep this edit through the update"
+    require_rpc(port, "engine.execute", {"command": "file.new", "params": {}})
+    require_rpc(port, "app.save", {"path": str(document)})
+    saved = document.read_bytes()
+    require_rpc(
+        port, "engine.execute",
+        {"command": "frame.create", "params": {"rect": [36, 36, 300, 160], "content": "text", "text": text}},
+    )
+    check_for_updates(port)
+    wait_for_quit_prompt(child, port, deadline)
+    if build_number(app) != "1":
+        raise RuntimeError("Sparkle installed over the old build before the unsaved document prompt was answered")
+
+    require_rpc(port, "ui.dialog.cancel")
+    state = require_rpc(port, "document.inspect")
+    if child.poll() is not None or build_number(app) != "1":
+        raise RuntimeError("Cancel did not keep the old Collate build running")
+    if require_rpc(port, "ui.inspect").get("dialog") is not None:
+        raise RuntimeError("Cancel did not dismiss Collate's unsaved document prompt")
+    if state["dirty"] is not True or not any(story["preview"] == text for story in state["stories"]):
+        raise RuntimeError("Cancel did not preserve the dirty edit in Collate")
+    if document.read_bytes() != saved:
+        raise RuntimeError("Cancel changed the document on disk")
+    print("Cancel kept the old app open and preserved the unsaved edit.", flush=True)
+
+    wait_for_quit_prompt(child, port, deadline, retry=True)
+    require_rpc(port, "ui.dialog.confirm")  # Save to the file already associated with this document.
+    return document, text
 
 
 def exercise(app_path, workdir, click_dylib):
@@ -199,16 +259,17 @@ def exercise(app_path, workdir, click_dylib):
         with app_log.open("wb") as log:
             child = subprocess.Popen([binary, "--control", str(port)], stdout=log, stderr=subprocess.STDOUT, env=child_environment)
             try:
-                deadline = time.monotonic() + 150
+                deadline = time.monotonic() + 180
                 wait_for_control(child, port, app_log, click_log, min(deadline, time.monotonic() + 30))
                 request_offset = len(read_log(request_log).splitlines())
-                result = rpc(port, "ui.menu.invoke", {"command": "help.checkForUpdates", "params": {}})
-                if result.get("ok") is not True:
-                    raise RuntimeError(f"Check for Updates command failed: {result}")
+                document, text = exercise_unsaved_update(child, app, port, work, deadline)
 
                 relaunch_pid = wait_for_relaunch(child, processes, deadline)
                 if build_number(app) != "2":
                     raise RuntimeError("Sparkle relaunched without installing fixture build 2")
+                with ZipFile(document) as archive:
+                    if text.encode() not in archive.read("document.json"):
+                        raise RuntimeError("The Save choice did not persist the edit before the app relaunched")
                 subprocess.run(["/usr/bin/codesign", "--verify", "--strict", "--deep", app], check=True, timeout=15)
                 version = subprocess.check_output([binary, "--version"], text=True, env=environment, timeout=15).strip()
                 if version != "Collate 90.1.0":
@@ -218,11 +279,13 @@ def exercise(app_path, workdir, click_dylib):
                     raise RuntimeError("Sparkle did not fetch both the appcast and the archive")
                 click_events = read_log(click_log).splitlines()
                 ready = click_events.index("observer-ready")
-                if not any(event.startswith("clicked ") for event in click_events[ready + 1:]):
-                    raise RuntimeError("The observer did not click the native Sparkle update dialog")
+                actions = iter(event.split(maxsplit=2)[1] for event in click_events[ready + 1:] if event.startswith("clicked "))
+                for action in ("installUpdate:", "installAndRestart:", "retryTermination:"):
+                    if action not in actions:
+                        raise RuntimeError(f"The observer did not click Sparkle's {action} button in order")
                 if not processes.matches(relaunch_pid):
                     raise RuntimeError("The relaunched fixture exited unexpectedly")
-                print(f"Collate checked for updates, installed build 2 and relaunched from PID {child.pid} as PID {relaunch_pid}.")
+                print(f"Collate saved the edit, installed build 2 and relaunched from PID {child.pid} as PID {relaunch_pid}.")
             finally:
                 try:
                     if child.poll() is None:
