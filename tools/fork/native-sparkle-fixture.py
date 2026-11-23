@@ -11,6 +11,7 @@ import plistlib
 import shutil
 import signal
 import socket
+from socketserver import TCPServer
 import ssl
 import subprocess
 import sys
@@ -61,10 +62,17 @@ def serve(docroot, cert, key, port_file, request_log):
         def log_message(self, _format, *_args):
             pass
 
+    class LoopbackServer(ThreadingHTTPServer):
+        def server_bind(self):
+            # HTTPServer resolves the address to derive its name. This server only accepts localhost.
+            TCPServer.server_bind(self)
+            self.server_name = "localhost"
+            self.server_port = self.server_address[1]
+
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     context.load_cert_chain(certfile=cert, keyfile=key)
     request_log.write_text("", encoding="utf-8")
-    with ThreadingHTTPServer(("127.0.0.1", 0), UpdateHandler) as server:
+    with LoopbackServer(("127.0.0.1", 0), UpdateHandler) as server:
         server.socket = context.wrap_socket(server.socket, server_side=True)
         port_file.write_text(f"{server.server_port}\n", encoding="utf-8")
         server.serve_forever()
