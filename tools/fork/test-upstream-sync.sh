@@ -34,10 +34,11 @@ prepare() {
     local ref=$2
     local expected_status=$3
     local expected_exit=$4
+    local fork_ref=${5:-main}
     local exit_status=0
     output="$fixture/$case_name"
 
-    bash "$sync_script" prepare --main main --upstream "$ref" --output "$output" \
+    bash "$sync_script" prepare --main "$fork_ref" --upstream "$ref" --output "$output" \
         >"$fixture/prepare.log" 2>&1 || exit_status=$?
     if [[ "$exit_status" -ne "$expected_exit" || ! -f "$output/status" ]]; then
         cat -- "$fixture/prepare.log" >&2
@@ -96,6 +97,11 @@ mkdir -p tools/fork
 printf 'unreviewed orchestration\n' > tools/fork/runner.sh
 commit_all 'Add upstream orchestration'
 
+git switch --quiet -c upstream-brand upstream-doc
+mkdir -p docs/brand
+printf 'restricted upstream mark\n' > docs/brand/symbol.svg
+commit_all 'Add upstream artwork'
+
 git switch --quiet main
 printf 'local staged content\n' > local.txt
 git add local.txt
@@ -149,6 +155,41 @@ assert_report_contains ".github/workflows/new-ci.yml"
 prepare tool-change upstream-tool blocked 1
 assert_no_candidate
 assert_report_contains "tools/fork/runner.sh"
+
+# A public fork can start with a source snapshot and still detect conflicts
+# against the exact upstream revision that produced it.
+baseline=$(git rev-parse initial-upstream)
+snapshot_index="$fixture/snapshot-index"
+GIT_INDEX_FILE="$snapshot_index" git read-tree "$main"
+baseline_blob=$(printf '%s\n' "$baseline" | git hash-object -w --stdin)
+GIT_INDEX_FILE="$snapshot_index" git update-index --add --cacheinfo "100644,$baseline_blob,tools/fork/upstream-revision"
+snapshot_tree=$(GIT_INDEX_FILE="$snapshot_index" git write-tree)
+snapshot=$(git commit-tree "$snapshot_tree" -m 'Independent public snapshot')
+
+prepare snapshot-unchanged initial-upstream unchanged 0 "$snapshot"
+assert_no_candidate
+prepare snapshot-import upstream-doc ready 0 "$snapshot"
+snapshot_candidate=$(<"$output/candidate")
+[[ "$(git show -s --format=%P "$snapshot_candidate")" == "$snapshot" ]] ||
+    fail 'snapshot import must keep only the public parent'
+[[ "$(git show "$snapshot_candidate:tools/fork/upstream-revision")" == "$upstream" ]] ||
+    fail 'snapshot import must record the new upstream revision'
+git diff --quiet "$snapshot" "$snapshot_candidate" -- .github/workflows/ci.yml fork.txt shared.txt ||
+    fail 'snapshot import changed fork-owned content'
+git diff --quiet "$upstream" "$snapshot_candidate" -- crates/doc/schema.txt 'release notes.txt' ||
+    fail 'snapshot import did not carry the upstream changes'
+prepare snapshot-repeat upstream-doc ready 0 "$snapshot"
+[[ "$(cat "$output/candidate")" == "$snapshot_candidate" ]] || fail 'snapshot candidate was not deterministic'
+prepare snapshot-next upstream-next ready 0 "$snapshot_candidate"
+[[ "$(git show "$(cat "$output/candidate"):tools/fork/upstream-revision")" == "$upstream_next" ]] ||
+    fail 'a later snapshot import did not advance its baseline'
+prepare snapshot-rewind initial-upstream blocked 1 "$snapshot_candidate"
+assert_no_candidate
+prepare snapshot-conflict upstream-conflict conflict 1 "$snapshot"
+assert_no_candidate
+prepare snapshot-guard upstream-brand blocked 1 "$snapshot"
+assert_no_candidate
+assert_report_contains "docs/brand/symbol.svg"
 
 # Checking candidates is observational with respect to the caller's branch, index and files.
 [[ "$(git symbolic-ref --short HEAD)" == main ]] || fail 'prepare changed the checked-out branch'

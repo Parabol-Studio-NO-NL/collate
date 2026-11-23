@@ -1,0 +1,68 @@
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "47 5 * * *"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Open a pull request when the candidate is ready
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Propose DesignCraft integration
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.UPSTREAM_SYNC_ENABLED == 'true')
+    environment: upstream-sync
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: false
+          persist-credentials: false
+      - name: Plan integration from reviewed tooling
+        id: plan
+        shell: bash
+        run: |
+          git fetch --no-tags https://github.com/storytold/designcraft.git \
+            refs/heads/main:refs/remotes/upstream/main
+          main=$(git rev-parse HEAD)
+          output="$RUNNER_TEMP/upstream-sync-result"
+          result=0
+          tools/fork/upstream-sync.sh prepare --main "$main" --upstream upstream/main --output "$output" || result=$?
+          if [[ -f "$output/report.md" ]]; then
+            cat "$output/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f "$output/status" ]]; then
+            status=$(cat "$output/status")
+            printf 'status=%s\nmain=%s\n' "$status" "$main" >> "$GITHUB_OUTPUT"
+            if [[ "$status" == conflict || "$status" == blocked ]]; then
+              echo "::error::Upstream integration requires maintainer review. See the job summary."
+            fi
+          fi
+          exit "$result"
+      - id: app
+        if: steps.plan.outputs.status == 'ready' && vars.UPSTREAM_SYNC_ENABLED == 'true' && (github.event_name == 'schedule' || inputs.publish)
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.UPSTREAM_SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.UPSTREAM_SYNC_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Publish integration PR
+        if: steps.plan.outputs.status == 'ready' && vars.UPSTREAM_SYNC_ENABLED == 'true' && (github.event_name == 'schedule' || inputs.publish)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          FORK_MAIN: ${{ steps.plan.outputs.main }}
+        run: tools/fork/publish-upstream-sync.sh "$GITHUB_REPOSITORY" "$FORK_MAIN" "$RUNNER_TEMP/upstream-sync-result"

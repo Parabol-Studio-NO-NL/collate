@@ -160,4 +160,32 @@ publish "$result" 1
    ! -f "$SYNC_TEST_MOCK/attempts" ]] ||
     fail 'An existing unexpected branch must remain untouched and receive no PR'
 
+snapshot_baseline=$(git merge-base "$main" "$upstream")
+git switch --quiet --orphan snapshot
+mkdir -p tools/fork
+printf '%s\n' "$snapshot_baseline" > tools/fork/upstream-revision
+git add tools/fork/upstream-revision
+git commit --quiet -m 'Independent public snapshot'
+main=$(git rev-parse HEAD)
+snapshot_result="$fixture/prepared snapshot candidate"
+bash "$script_dir/upstream-sync.sh" prepare --main "$main" --upstream "$upstream" --output "$snapshot_result"
+
+make_origin snapshot "$main"
+publish "$snapshot_result" 0
+head=$(<"$SYNC_TEST_MOCK/head")
+remote_snapshot=$(git ls-remote --heads origin "refs/heads/$head" | cut -f1)
+[[ "$remote_snapshot" == "$(cat "$snapshot_result/candidate")" &&
+   "$(git show -s --format=%P "$remote_snapshot")" == "$main" &&
+   "$(git show "$remote_snapshot:tools/fork/upstream-revision")" == "$upstream" ]] ||
+    fail 'Public PR must use the reviewed snapshot candidate and baseline'
+if git merge-base --is-ancestor "$upstream" "$remote_snapshot"; then
+    fail 'Snapshot publication exposed raw upstream ancestry'
+fi
+
+make_origin snapshot-mismatch "$main"
+printf '%s\n' "$snapshot_baseline" > "$snapshot_result/upstream"
+publish "$snapshot_result" 1
+[[ -z $(git ls-remote --heads origin 'refs/heads/sync/*') && ! -f "$SYNC_TEST_MOCK/attempts" ]] ||
+    fail 'A mismatched snapshot revision must not publish a branch or pull request'
+
 printf '%s\n' 'Upstream publication fixture passed.'
