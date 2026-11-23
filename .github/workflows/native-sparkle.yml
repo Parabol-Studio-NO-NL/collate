@@ -6,8 +6,12 @@ on:
       - ".github/workflows/native-sparkle.yml"
       - "tools/fork/*native-sparkle*"
       - "packaging/macos/codesign/**"
+      - "apps/designcraft/src/main.rs"
       - "apps/designcraft/src/sparkle.rs"
+      - "apps/designcraft/build.rs"
       - "apps/designcraft/Cargo.toml"
+      - "crates/ui-egui/src/updates_ui.rs"
+      - "Cargo.lock"
 
 permissions:
   contents: read
@@ -25,7 +29,7 @@ env:
 jobs:
   native-sparkle:
     name: Install a signed test update over HTTPS
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

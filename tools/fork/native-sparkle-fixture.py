@@ -142,7 +142,9 @@ def wait_for_control(child, port, app_log, click_log, deadline):
 
 def wait_for_relaunch(child, processes, deadline):
     while time.monotonic() < deadline:
-        if child.poll() is not None:
+        if (status := child.poll()) is not None:
+            if status != 0:
+                raise RuntimeError(f"The older Collate process exited abnormally with status {status}")
             for pid in processes.pids():
                 if pid != child.pid:
                     return pid
