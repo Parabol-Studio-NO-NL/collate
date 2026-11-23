@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use designcraft_doc::{
@@ -48,7 +49,30 @@ impl Replica {
         match &thread.anchor {
             CommentAnchor::Page(id) => !document.spreads.iter().flat_map(|spread| &spread.pages).any(|page| page.id == *id),
             CommentAnchor::Object(id) => self.local_id(id).is_none_or(|local| document.item(local).is_none()),
+            CommentAnchor::Text { .. } => self.comment_text_range(document, &thread.anchor).is_none(),
         }
+    }
+
+    /// Capture the original visible atoms of a nonempty UTF-8 byte range.
+    pub fn text_comment_anchor(&self, document: &Document, story: StoryId, range: Range<usize>) -> Option<CommentAnchor> {
+        let current = document.story(story)?;
+        if current.text.get(range.clone())?.is_empty() {
+            return None;
+        }
+        let atoms = match self.text.get(&story) {
+            Some(replica) => replica.atoms_in(range),
+            None => TextReplica::new(current, &document.styles).ok()?.atoms_in(range),
+        }
+        .ok()?;
+        Some(CommentAnchor::Text { story, atoms })
+    }
+
+    /// Resolve a text comment to the span between its first and last surviving original atom.
+    pub fn comment_text_range(&self, document: &Document, anchor: &CommentAnchor) -> Option<(StoryId, Range<usize>)> {
+        let CommentAnchor::Text { story, atoms } = anchor else { return None };
+        document.story(*story)?;
+        let range = self.text.get(story)?.visible_anchored_range(atoms)?;
+        Some((*story, range))
     }
 
     /// Capture a committed local edit while retaining the pre-edit replica. The
@@ -597,6 +621,14 @@ impl Replica {
                 return Err(Error::UnknownResource);
             }
             CommentAnchor::Object(id) if !self.items.contains_key(id) => return Err(Error::UnknownObject),
+            CommentAnchor::Text { story, atoms } => {
+                let current = document.story(*story).ok_or(Error::UnknownResource)?;
+                let replica = match self.text.entry(*story) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => entry.insert(TextReplica::new(current, &document.styles)?),
+                };
+                replica.validate_comment_atoms(atoms)?;
+            }
             _ => {}
         }
         let thread = CommentThread { id: id.clone(), anchor: anchor.clone(), text: text.to_owned(), replies: Vec::new(), resolved: false };
