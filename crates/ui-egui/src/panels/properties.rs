@@ -18,6 +18,7 @@ use crate::{DesignApp, icons};
 
 mod document;
 mod flex;
+mod info;
 mod links;
 mod object;
 mod object_panels;
@@ -28,8 +29,9 @@ pub(crate) use document::{PAGE_PRESETS, preset_name};
 use document::{document_sections, page_sections};
 pub use flex::flex_panel;
 use flex::flex_section;
+pub use info::info_panel;
 pub(crate) use links::run_update_links;
-pub use links::{info_panel, links_panel, preflight_panel, update_links};
+pub use links::{links_panel, preflight_panel, update_links};
 #[cfg(test)]
 use object::align_to_icon;
 use object::{align_row, appearance_section, guide_section, quick_actions_object, transform_section, wrap_section};

@@ -14,6 +14,7 @@ mod caret;
 mod edit;
 mod format;
 mod opentype;
+mod statistics;
 mod story;
 
 use asian::{auto_tcy_cmd, grid_settings_cmd, kenten_cmd, ruby_cmd, shatai_cmd, warichu_cmd};
@@ -433,6 +434,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{mixed?: bool} → resolved character/paragraph attributes at the text selection; `ownChars`: what the text has of its own over its paragraph (its character style's attributes and its overrides, what a character style made from the selection sets); with mixed, paraMixed lists the paragraph attributes that differ across the selected paragraphs; the selection's start as `selectedText` (one line, up to 60 characters); `storyOptions` {opticalMargin, opticalMarginSize} of the stories story.options would change (null where they differ)",
             has_doc,
             selection_attrs
+        ),
+        cmd!(
+            query "type.statistics",
+            "Text Statistics",
+            [],
+            None,
+            "{} → characters, words, composed lines and paragraphs for the selected text or current story, with a preview of selected Unicode code points",
+            has_doc,
+            statistics::query
         ),
         cmd!(query "type.openTypeFeatures", "OpenType Features", [], None, "{} → the OpenType features and stylistic sets the selected text's fonts offer, each with its applied and available state (none, some or all of the selection)", has_doc, open_type_features),
         cmd!(
