@@ -155,9 +155,13 @@ const SIZES: &[f64] = &[6.0, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 18.0, 24.0, 30.0,
 /// The Control panel's tracking values (1/1000 em).
 const TRACKING: &[f64] = &[-100.0, -75.0, -50.0, -25.0, -10.0, -5.0, 0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 200.0];
 
-/// Whether the text Control panel shows Paragraph Formatting Controls (¶) rather than Character
-/// Formatting Controls (A).
-const PARA_MODE: &str = "ctl_text_para_mode";
+#[derive(Clone, Copy, Default, PartialEq)]
+enum TextControls {
+    #[default]
+    All,
+    Character,
+    Paragraph,
+}
 
 /// An icon and a field after it, as the Control panel lays its fields out.
 pub(crate) fn icon_field(ui: &mut egui::Ui, icon: &str, tip: &str, field: NumField) -> Option<f64> {
@@ -201,55 +205,74 @@ fn text_toggle(ui: &mut egui::Ui, text: &str, strike: bool, on: bool, tip: &str)
     resp.on_hover_text(tip).clicked()
 }
 
-/// The text Control panel, as InDesign's: A shows the Character Formatting Controls (font, size
-/// and leading, the case and position buttons, kerning and tracking, the scales, baseline shift
-/// and skew, the character style and language); ¶ the Paragraph Formatting Controls (alignment,
-/// the indents, space before and after, the drop cap, the paragraph style, Hyphenate and Align to
-/// Baseline Grid).
+/// The text Control panel starts with typeface, alignment and paragraph spacing. Focused views
+/// keep the complete Character or Paragraph controls close at hand in smaller windows.
 fn control_text(app: &mut DesignApp, ui: &mut egui::Ui) {
-    let t = Tokens::get(ui.ctx());
     let lang = app.ui.language.clone();
     let tr = |s: &str| crate::i18n::tr(&lang, s).to_string();
     let attrs = panels::text_attrs(app);
     let chars = attrs.as_ref().map(|a| a["chars"].clone()).unwrap_or_default();
     let para = attrs.as_ref().map(|a| a["para"].clone()).unwrap_or_default();
-    let mode_id = egui::Id::unique(PARA_MODE);
-    let para_mode = ui.data(|d| d.get_temp::<bool>(mode_id)).unwrap_or(false);
+    let mode_id = egui::Id::unique("ctl_text_mode");
+    let mut mode = ui.data(|d| d.get_temp::<TextControls>(mode_id)).unwrap_or_default();
     ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 3.0;
-        for (para, text, tip) in [(false, "A", "Character Formatting Controls"), (true, "¶", "Paragraph Formatting Controls")] {
-            let on = para_mode == para;
-            let (r, resp) = ui.allocate_exact_size(vec2(24.0, 22.0), Sense::click());
-            if on {
-                ui.painter().rect_filled(r, 2.0, t.tool_active);
-            } else if resp.hovered() {
-                ui.painter().rect_filled(r, 2.0, t.hover);
-            }
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, text, semibold(15.0), if on { t.text_strong } else { t.text_dim });
-            let tip = tr(tip);
-            resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, &tip));
-            if resp.on_hover_text(&tip).clicked() {
-                ui.data_mut(|d| d.insert_temp(mode_id, para));
-            }
+        ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+        if text_mode_button(ui, &tr("All"), &tr("All Text Controls"), 51.0, mode == TextControls::All) {
+            mode = TextControls::All;
         }
+        ui.horizontal(|ui| {
+            for (choice, text, tip) in
+                [(TextControls::Character, "A", "Character Formatting Controls"), (TextControls::Paragraph, "¶", "Paragraph Formatting Controls")]
+            {
+                if text_mode_button(ui, text, &tr(tip), 24.0, mode == choice) {
+                    mode = choice;
+                }
+            }
+        });
     });
+    ui.data_mut(|d| d.insert_temp(mode_id, mode));
     vsep(ui);
-    if para_mode {
+    let show_character = mode != TextControls::Paragraph;
+    let show_paragraph = mode != TextControls::Character;
+    if show_character {
+        control_typeface(app, ui, &chars, &para, &tr);
+        vsep(ui);
+    }
+    if show_paragraph {
+        control_paragraph_layout(app, ui, &para, &tr);
+    }
+    if show_character {
+        control_character(app, ui, &attrs, &chars, &tr);
+    }
+    if show_paragraph {
+        if show_character {
+            vsep(ui);
+        }
         control_paragraph(app, ui, &attrs, &para, &tr);
-    } else {
-        control_character(app, ui, &attrs, &chars, &para, &tr);
     }
 }
 
-/// Draw the character-mode controls and issue their corresponding text commands.
-fn control_character(
-    app: &mut DesignApp,
-    ui: &mut egui::Ui,
-    attrs: &Option<serde_json::Value>,
-    chars: &serde_json::Value,
-    para: &serde_json::Value,
-    tr: &dyn Fn(&str) -> String,
-) {
+fn text_mode_button(ui: &mut egui::Ui, text: &str, tip: &str, width: f32, selected: bool) -> bool {
+    let t = Tokens::get(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 22.0), Sense::click());
+    if selected {
+        ui.painter().rect(rect, 2.0, t.well, Stroke::new(1.0, t.well_rim), egui::StrokeKind::Inside);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 2.0, t.hover);
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, t.text_strong), egui::StrokeKind::Inside);
+    }
+    crate::rtl::paint(ui.painter(), rect.center(), egui::Align2::CENTER_CENTER, text, semibold(13.0), if selected { t.text_strong } else { t.text });
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, tip));
+    response
+        .on_hover_ui(|ui| {
+            crate::rtl::label(ui, tip);
+        })
+        .clicked()
+}
+
+fn control_typeface(app: &mut DesignApp, ui: &mut egui::Ui, chars: &serde_json::Value, para: &serde_json::Value, tr: &dyn Fn(&str) -> String) {
     ui.vertical(|ui| {
         let fam = chars["fontFamily"].as_str().unwrap_or("").to_string();
         let sty = chars["fontStyle"].as_str().unwrap_or("").to_string();
@@ -288,7 +311,16 @@ fn control_character(
             }
         }
     });
-    vsep(ui);
+}
+
+/// Draw the remaining character formatting controls.
+fn control_character(
+    app: &mut DesignApp,
+    ui: &mut egui::Ui,
+    attrs: &Option<serde_json::Value>,
+    chars: &serde_json::Value,
+    tr: &dyn Fn(&str) -> String,
+) {
     // All Caps, Superscript, Underline / Small Caps, Subscript, Strikethrough.
     let caps = chars["capitalization"].as_str().unwrap_or("normal").to_string();
     let pos = chars["position"].as_str().unwrap_or("normal").to_string();
@@ -412,13 +444,7 @@ fn control_character(
     });
 }
 
-fn control_paragraph(
-    app: &mut DesignApp,
-    ui: &mut egui::Ui,
-    attrs: &Option<serde_json::Value>,
-    para: &serde_json::Value,
-    tr: &dyn Fn(&str) -> String,
-) {
+fn control_paragraph_layout(app: &mut DesignApp, ui: &mut egui::Ui, para: &serde_json::Value, tr: &dyn Fn(&str) -> String) {
     let cur: Align = serde_json::from_value(para["align"].clone()).unwrap_or_default();
     if let Some(a) = align_buttons(ui, cur, tr) {
         let _ = app.run("type.para", json!({"attrs": {"align": a}}));
@@ -428,6 +454,15 @@ fn control_paragraph(
     if let Some((k, v)) = indent_space_fields(ui, para, units, tr) {
         let _ = app.run("type.para", json!({"attrs": {k: v}}));
     }
+}
+
+fn control_paragraph(
+    app: &mut DesignApp,
+    ui: &mut egui::Ui,
+    attrs: &Option<serde_json::Value>,
+    para: &serde_json::Value,
+    tr: &dyn Fn(&str) -> String,
+) {
     if let Some((k, v)) = drop_cap_fields(ui, para, tr) {
         let _ = app.run("type.para", json!({"attrs": {k: v.max(0.0) as u64}}));
     }
