@@ -93,9 +93,15 @@ fn encode_packet(message: Message) -> Result<Vec<u8>, String> {
 }
 
 fn encode_edit(message: Message) -> Result<WireEdit, String> {
-    let artwork = matches!(&message, Message::Propose(proposal) | Message::Commit(Commit { proposal, .. }) if proposal.edits.iter().any(Operation::changes_artwork));
-    let bytes = if artwork { encode_packet(message)? } else { encode(message)? };
+    let can_chunk =
+        matches!(&message, Message::Propose(proposal) | Message::Commit(Commit { proposal, .. }) if accepts_chunked_edit(&proposal.edits));
+    let bytes = if can_chunk { encode_packet(message)? } else { encode(message)? };
     WireEdit::new(bytes)
+}
+
+fn accepts_chunked_edit(edits: &[Operation]) -> bool {
+    edits.iter().any(Operation::changes_artwork)
+        || matches!(edits, [Operation::CreateComment { anchor: designcraft_collab::CommentAnchor::Text { .. }, .. }])
 }
 
 enum Mode {
@@ -133,6 +139,7 @@ struct Room {
     next_sequence: u64,
     revision: u64,
     pending: Option<Proposal>,
+    rejected_comment: Option<CommentDraft>,
     frame_entry: Option<typing::FrameEntry>,
     layer_entry: Option<(u64, LayerId)>,
     typing: Option<typing::BufferedTyping>,
@@ -142,6 +149,12 @@ struct Room {
     fatal: bool,
     #[cfg(target_os = "macos")]
     recovery_path_checked: Option<String>,
+}
+
+struct CommentDraft {
+    text: String,
+    reply_to: Option<designcraft_collab::SharedId>,
+    needs_text_selection: bool,
 }
 
 #[derive(Default)]
@@ -155,6 +168,7 @@ pub(crate) struct Collaboration {
     message: Option<String>,
     comment: String,
     reply_to: Option<designcraft_collab::SharedId>,
+    comment_needs_text_selection: bool,
     confirm_discard: bool,
 }
 
@@ -165,6 +179,9 @@ impl DesignApp {
         let Some(st) = self.session.documents().iter().find(|st| st.uid == room.doc_uid) else {
             self.session.defer_document_edits(None);
             self.collaboration.room = None;
+            self.collaboration.comment.clear();
+            self.collaboration.reply_to = None;
+            self.collaboration.comment_needs_text_selection = false;
             self.collaboration.message = Some("The shared document closed.".into());
             return;
         };
@@ -174,6 +191,11 @@ impl DesignApp {
                 room.enable_recovery(self.session.recovery_dir.as_deref(), path);
             }
             room.poll(&mut self.session);
+        }
+        if let Some(draft) = room.rejected_comment.take() {
+            self.collaboration.comment = draft.text;
+            self.collaboration.reply_to = draft.reply_to;
+            self.collaboration.comment_needs_text_selection = draft.needs_text_selection;
         }
         self.session.set_deferred_edit_ready(room.can_edit());
         room.flush_typing(&mut self.session);
@@ -368,6 +390,7 @@ impl Room {
             next_sequence: 1,
             revision: 0,
             pending: None,
+            rejected_comment: None,
             frame_entry: None,
             layer_entry: None,
             typing: None,
@@ -523,10 +546,10 @@ impl Room {
         self.receiving_edits.remove(&actor);
         let Ok(Packet { version: PROTOCOL_VERSION, message }) = serde_json::from_slice(&bytes) else { return self.drop_transfer(actor) };
         match message {
-            Message::Propose(ref proposal) if self.serving(actor) && proposal.edits.iter().any(Operation::changes_artwork) => {
+            Message::Propose(ref proposal) if self.serving(actor) && accepts_chunked_edit(&proposal.edits) => {
                 self.on_guest_message(session, actor, message);
             }
-            Message::Commit(ref commit) if self.host == Some(actor) && commit.proposal.edits.iter().any(Operation::changes_artwork) => {
+            Message::Commit(ref commit) if self.host == Some(actor) && accepts_chunked_edit(&commit.proposal.edits) => {
                 self.on_host_message(session, message);
             }
             _ => self.drop_transfer(actor),
@@ -756,10 +779,22 @@ impl Room {
     fn decline_pending(&mut self, sequence: u64) {
         let Some(proposal) = self.pending.as_ref().filter(|proposal| proposal.sequence == sequence) else { return };
         let submitted = typing::submitted_typing(proposal);
+        let comment = match proposal.edits.as_slice() {
+            [Operation::CreateComment { anchor, text, .. }] => Some(CommentDraft {
+                text: text.clone(),
+                reply_to: None,
+                needs_text_selection: matches!(anchor, designcraft_collab::CommentAnchor::Text { .. }),
+            }),
+            [Operation::Reply { thread, text, .. }] => {
+                Some(CommentDraft { text: text.clone(), reply_to: Some(thread.clone()), needs_text_selection: false })
+            }
+            _ => None,
+        };
         if let Err(error) = self.clear_pending() {
             self.stop_with_error(&error);
             return;
         }
+        self.rejected_comment = comment;
         self.error = Some("The host could not accept this edit. The confirmed document is still open.".into());
         self.preserve_rejected_typing(submitted);
     }

@@ -69,12 +69,18 @@ fn deliver_room_packet(sender: &DesignApp, recipient: &mut DesignApp, message: s
 }
 
 fn assert_converged_layout(doc: &Document, seed: &Document, shape: ItemId, text_frame: ItemId, story: StoryId) {
+    use designcraft_doc::{Fill, color::swatch::BLACK};
+
     assert_eq!(doc.page_count(), seed.page_count());
     assert_eq!(doc.spreads[0].items.iter().map(|item| item.id).collect::<Vec<_>>(), [shape, text_frame]);
-    let original = seed.item(shape).unwrap().bounds();
-    let bounds = doc.item(shape).unwrap().bounds();
-    assert!(bounds.x0 > original.x0 && bounds.y0 > original.y0);
-    assert_eq!(bounds.size(), original.size());
+    let original = seed.item(shape).unwrap();
+    let moved = doc.item(shape).unwrap();
+    let bounds = moved.bounds();
+    let original_bounds = original.bounds();
+    assert!(bounds.x0 > original_bounds.x0 && bounds.y0 > original_bounds.y0);
+    assert_eq!(bounds.size(), original_bounds.size());
+    assert_ne!(moved.fill, original.fill);
+    assert_eq!(moved.fill, Fill::swatch(BLACK));
     let story = doc.story(story).unwrap();
     assert_eq!(story.frames, [text_frame]);
     assert_eq!(story.text, "ABλCD");
@@ -780,25 +786,17 @@ fn three_peers_converge_after_delayed_reordered_and_duplicate_packets() {
     host.run("transform.move", json!({"ids": [shape.0], "dx": 36, "dy": 18})).unwrap();
     writer.run("text.select", json!({"story": story.0, "anchor": 2, "focus": 2})).unwrap();
     writer.run("text.insert", json!({"text": "λ", "raw": true})).unwrap();
-    let anchor = CommentAnchor::Object(SharedId::Seed(shape));
-    let review_room = reviewer.collaboration.room.as_mut().unwrap();
-    let thread = SharedId::Created { actor: review_room.local.as_ref().unwrap().actor.to_string(), sequence: review_room.next_sequence, index: 0 };
-    review_room
-        .queue_local(
-            &mut reviewer.session,
-            vec![Operation::CreateComment { id: thread.clone(), anchor: anchor.clone(), text: "Check alignment".into() }],
-        )
-        .unwrap();
+    reviewer.run("object.fill", json!({"ids": [shape.0], "swatch": "[Black]"})).unwrap();
 
-    // Stage all three changes before polling transport. Send the review before the delayed text proposal.
-    for app in [&mut host, &mut writer] {
+    // Stage all three changes before polling transport. Send the fill before the delayed text proposal.
+    for app in [&mut host, &mut writer, &mut reviewer] {
         let edit = app.session.take_deferred_edit().unwrap();
         app.collaboration.room.as_mut().unwrap().capture_edit(&mut app.session, edit).unwrap();
     }
-    let comment_proposal = room(&reviewer).pending.clone().unwrap();
+    let fill_proposal = room(&reviewer).pending.clone().unwrap();
     let text_proposal = room(&writer).pending.clone().unwrap();
-    deliver_room_packet(&reviewer, &mut host, Message::Propose(comment_proposal.clone()));
-    deliver_room_packet(&reviewer, &mut host, Message::Propose(comment_proposal));
+    deliver_room_packet(&reviewer, &mut host, Message::Propose(fill_proposal.clone()));
+    deliver_room_packet(&reviewer, &mut host, Message::Propose(fill_proposal));
     assert_eq!(room(&host).revision, 2);
     deliver_room_packet(&writer, &mut host, Message::Propose(text_proposal));
     assert_eq!(room(&host).revision, 3);
@@ -828,11 +826,23 @@ fn three_peers_converge_after_delayed_reordered_and_duplicate_packets() {
     assert!(reviewer.session.doc().unwrap().selection.text.is_none());
 
     // Continue over the original transport after fault injection.
+    let anchor = CommentAnchor::Object(SharedId::Seed(shape));
+    let review_room = reviewer.collaboration.room.as_mut().unwrap();
+    let thread = SharedId::Created { actor: review_room.local.as_ref().unwrap().actor.to_string(), sequence: review_room.next_sequence, index: 0 };
+    review_room
+        .queue_local(
+            &mut reviewer.session,
+            vec![Operation::CreateComment { id: thread.clone(), anchor: anchor.clone(), text: "Check alignment".into() }],
+        )
+        .unwrap();
+    wait_for(&mut [&mut host, &mut writer, &mut reviewer], "comment converges over the active room", |apps| {
+        apps.iter().all(|app| room(app).can_edit() && room(app).revision == 4)
+    });
     let state = writer.collaboration.room.as_mut().unwrap();
     let reply = SharedId::Created { actor: state.local.as_ref().unwrap().actor.to_string(), sequence: state.next_sequence, index: 0 };
     state.queue_local(&mut writer.session, vec![Operation::Reply { thread: thread.clone(), id: reply, text: "Aligned".into() }]).unwrap();
     wait_for(&mut [&mut host, &mut writer, &mut reviewer], "reply converges over the active room", |apps| {
-        apps.iter().all(|app| room(app).can_edit() && room(app).revision == 4)
+        apps.iter().all(|app| room(app).can_edit() && room(app).revision == 5)
     });
 
     let host_doc = document(&host);
@@ -851,6 +861,167 @@ fn three_peers_converge_after_delayed_reordered_and_duplicate_packets() {
         assert_eq!(room(app).replica.comments().collect::<Vec<_>>(), expected_comments);
     }
     assert!([&host, &writer, &reviewer].iter().all(|app| !room(app).replica.comment_is_orphaned(document(app), comment)));
+}
+
+#[test]
+fn shared_text_comment_tracks_original_atoms_through_edits_and_replay() {
+    use std::ops::Range;
+
+    use designcraft_collab::text::{AtomId, MAX_EDIT_ATOMS};
+
+    let mut host = editor(&Document::new(&NewDocument::default()), "Text host");
+    let created = host.run("frame.create", json!({"rect": [40, 50, 300, 200], "content": "text", "text": "AéβZ"})).unwrap();
+    let frame = created["id"].as_u64().unwrap();
+    let story = StoryId(created["story"].as_u64().unwrap());
+    let seed = document(&host).clone();
+    let mut guest = editor(&seed, "Text reviewer");
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "text host starts", |apps| room(apps[0]).invitation.is_some() && room(apps[0]).can_edit());
+    join(&mut guest, room(&host).invitation.as_deref().unwrap());
+    wait_for(&mut [&mut host, &mut guest], "text reviewer joins", |apps| room(apps[1]).can_edit());
+
+    let anchor = room(&guest).replica.text_comment_anchor(document(&guest), story, 1..5).unwrap();
+    assert_eq!(anchor, CommentAnchor::Text { story, atoms: vec![AtomId::Seed(1), AtomId::Seed(2)] });
+    let review_room = guest.collaboration.room.as_mut().unwrap();
+    let thread = SharedId::Created { actor: review_room.local.as_ref().unwrap().actor.to_string(), sequence: review_room.next_sequence, index: 0 };
+    review_room
+        .queue_local(
+            &mut guest.session,
+            vec![Operation::CreateComment { id: thread.clone(), anchor: anchor.clone(), text: "Check this text".into() }],
+        )
+        .unwrap();
+
+    // Confirm the concurrent insertion first, so the host receives the comment from revision zero.
+    host.run("text.select", json!({"story": story.0, "anchor": 3})).unwrap();
+    host.run("text.insert", json!({"text": "λ", "raw": true})).unwrap();
+    let insertion = host.session.take_deferred_edit().unwrap();
+    host.collaboration.room.as_mut().unwrap().capture_edit(&mut host.session, insertion).unwrap();
+    assert_eq!(room(&host).revision, 1);
+    wait_for(&mut [&mut host, &mut guest], "stale text comment confirmed", |apps| apps.iter().all(|app| room(app).revision == 2));
+    assert_eq!(room(&host).history[1].0.proposal.base, 0);
+
+    let assert_range = |host: &DesignApp, guest: &DesignApp, text: Option<&str>, range: Option<Range<usize>>| {
+        assert_eq!(document(host), document(guest));
+        for app in [host, guest] {
+            let replica = &room(app).replica;
+            let comment = replica.comments().find(|comment| comment.id == thread).unwrap();
+            assert_eq!(comment.anchor, anchor);
+            assert_eq!(comment.text, "Check this text");
+            assert_eq!(document(app).story(story).map(|story| story.text.as_str()), text);
+            assert_eq!(replica.comment_text_range(document(app), &comment.anchor), range.clone().map(|range| (story, range)));
+            assert_eq!(replica.comment_is_orphaned(document(app), comment), range.is_none());
+        }
+    };
+    assert_range(&host, &guest, Some("AéλβZ"), Some(1..7));
+
+    for (deleted, revision, text, range) in [(1..3, 3, "AλβZ", Some(3..5)), (3..5, 4, "AλZ", None)] {
+        host.run("text.select", json!({"story": story.0, "anchor": deleted.start, "focus": deleted.end})).unwrap();
+        host.run("text.delete", json!({})).unwrap();
+        wait_for(&mut [&mut host, &mut guest], "delete original comment text", |apps| apps.iter().all(|app| room(app).revision == revision));
+        assert_range(&host, &guest, Some(text), range);
+    }
+    for (revision, text, range) in [(5, "AλβZ", 3..5), (6, "AéλβZ", 1..7)] {
+        host.run("edit.undo", json!({})).unwrap();
+        wait_for(&mut [&mut host, &mut guest], "undo revives the text anchor", |apps| apps.iter().all(|app| room(app).revision == revision));
+        assert_range(&host, &guest, Some(text), Some(range));
+    }
+
+    let confirmed: Vec<_> = room(&host).history.iter().map(|(commit, _)| commit).collect();
+    let saved_commits = serde_json::to_vec(&confirmed).unwrap();
+    let recovered = super::replay::restore(&seed, &seed, serde_json::from_slice(&saved_commits).unwrap()).unwrap();
+    assert_eq!(&recovered.document, document(&host));
+    assert_eq!(recovered.replica.comments().collect::<Vec<_>>(), room(&host).replica.comments().collect::<Vec<_>>());
+    assert_eq!(recovered.replica.comment_text_range(&recovered.document, &anchor), Some((story, 1..7)));
+
+    let start = "AéλβZ".len();
+    host.run("text.select", json!({"story": story.0, "anchor": start})).unwrap();
+    host.run("text.insert", json!({"text": "x".repeat(MAX_EDIT_ATOMS), "raw": true})).unwrap();
+    wait_for(&mut [&mut host, &mut guest], "the longest supported selection is inserted", |apps| apps.iter().all(|app| room(app).revision == 7));
+    let range = start..start + MAX_EDIT_ATOMS;
+    let large_anchor = room(&guest).replica.text_comment_anchor(document(&guest), story, range.clone()).unwrap();
+    let review_room = guest.collaboration.room.as_mut().unwrap();
+    let long_id = SharedId::Created { actor: review_room.local.as_ref().unwrap().actor.to_string(), sequence: review_room.next_sequence, index: 0 };
+    review_room
+        .queue_local(
+            &mut guest.session,
+            vec![Operation::CreateComment { id: long_id.clone(), anchor: large_anchor.clone(), text: "Review this passage".into() }],
+        )
+        .unwrap();
+    assert!(review_room.sending_proposal.as_ref().unwrap().0.len() > designcraft_collab_core::MAX_PAYLOAD);
+    wait_for(&mut [&mut host, &mut guest], "the large text anchor crosses the transport in chunks", |apps| {
+        apps.iter().all(|app| room(app).revision == 8)
+    });
+    for app in [&host, &guest] {
+        let replica = &room(app).replica;
+        let comment = replica.comments().find(|comment| comment.id == long_id).unwrap();
+        assert_eq!(comment.anchor, large_anchor);
+        assert_eq!(replica.comment_text_range(document(app), &comment.anchor), Some((story, range.clone())));
+    }
+
+    let review_room = guest.collaboration.room.as_mut().unwrap();
+    let rejected = SharedId::Created { actor: review_room.local.as_ref().unwrap().actor.to_string(), sequence: review_room.next_sequence, index: 0 };
+    review_room
+        .queue_local(&mut guest.session, vec![Operation::CreateComment { id: rejected, anchor: anchor.clone(), text: "Keep this draft".into() }])
+        .unwrap();
+    host.run("edit.clear", json!({"ids": [frame]})).unwrap();
+    let deletion = host.session.take_deferred_edit().unwrap();
+    host.collaboration.room.as_mut().unwrap().capture_edit(&mut host.session, deletion).unwrap();
+    wait_for(&mut [&mut host, &mut guest], "story removal and stale comment rejection", |apps| {
+        apps.iter().all(|app| room(app).revision == 9) && room(apps[1]).pending.is_none()
+    });
+    assert_range(&host, &guest, None, None);
+    assert_eq!(guest.collaboration.comment, "Keep this draft");
+    assert!(guest.collaboration.comment_needs_text_selection);
+}
+
+#[test]
+fn share_window_posts_and_reselects_text_without_editing_the_story() {
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
+
+    let mut app = editor(&Document::new(&NewDocument::default()), "Text reviewer");
+    let text = format!("Aéβ{}", "Z".repeat(520));
+    let frame = app.run("frame.create", json!({"rect": [40, 50, 300, 200], "content": "text", "text": text})).unwrap();
+    let story = StoryId(frame["story"].as_u64().unwrap());
+    app.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut app], "text comment composer is ready", |apps| room(apps[0]).can_edit());
+    app.open_collaboration_dialog();
+    app.run("text.select", json!({"story": story.0, "anchor": 0, "focus": text.len()})).unwrap();
+    app.collaboration.comment = "Check this passage".into();
+
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(550.0, 620.0)).build_ui_state(|ui, app: &mut DesignApp| app.show_collaboration(ui.ctx()), app);
+    harness.run_steps(3);
+    harness.get_by_label("This text selection can’t be anchored.");
+    assert!(harness.get_by_label("Post").accesskit_node().is_disabled());
+    assert_eq!(room(harness.state()).revision, 0);
+    assert_eq!(harness.state().collaboration.comment, "Check this passage");
+
+    let app = harness.state_mut();
+    app.collaboration.comment_needs_text_selection = true;
+    app.run("text.select", json!({"story": story.0, "anchor": 0, "focus": 0})).unwrap();
+    harness.run_steps(3);
+    harness.get_by_label("Select text to reattach this comment.");
+    assert!(harness.get_by_label("Post").accesskit_node().is_disabled());
+
+    harness.state_mut().run("text.select", json!({"story": story.0, "anchor": 5, "focus": 1})).unwrap();
+    harness.run_steps(3);
+    harness.get_by_label("Attached to selected text");
+    harness.get_by_label("Post").click();
+    harness.run_steps(3);
+    let app = harness.state_mut();
+    assert_eq!(room(app).revision, 1);
+    assert_eq!(room(app).replica.comments().next().unwrap().text, "Check this passage");
+    app.run("text.select", json!({"story": story.0, "anchor": 0, "focus": 0})).unwrap();
+    harness.run_steps(3);
+    harness.get_by_label("Select text").click();
+    harness.run_steps(3);
+    let app = harness.state();
+    assert_eq!(app.session.active().unwrap().selection.text.unwrap().range(), 1..5);
+    assert_eq!(document(app).story(story).unwrap().text, text);
+    assert_eq!(room(app).revision, 1);
 }
 
 #[test]

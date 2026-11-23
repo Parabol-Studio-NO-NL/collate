@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use designcraft_doc::{CharAttrs, CharFormat, CharRun, MAX_TYPE_SIZE, MIN_TYPE_SIZE, NO_CHAR_STYLE, ParaFormat, Story, StoryId, Styles};
@@ -280,6 +280,7 @@ pub struct TextReplica {
     batches: BTreeMap<Arc<str>, BTreeMap<u64, usize>>,
     active: Vec<bool>,
     atoms: Vec<Atom>,
+    visible_offsets: Arc<OnceLock<BTreeMap<AtomId, Range<usize>>>>,
 }
 
 impl TextReplica {
@@ -323,6 +324,7 @@ impl TextReplica {
             batches: Default::default(),
             active: Vec::new(),
             atoms,
+            visible_offsets: Default::default(),
         })
     }
 
@@ -378,6 +380,36 @@ impl TextReplica {
         Ok(ids)
     }
 
+    /// Check story order across all atoms, including those already deleted when the comment arrives.
+    pub(crate) fn validate_comment_atoms(&self, ids: &[AtomId]) -> Result<(), Error> {
+        if ids.len() > MAX_EDIT_ATOMS {
+            return Err(Error::Limit);
+        }
+        let mut ordered_atoms = self.atoms.iter();
+        if ids.is_empty() || !ids.iter().all(|id| ordered_atoms.any(|atom| &atom.id == id)) {
+            return Err(Error::Invalid("text comment range"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn visible_anchored_range(&self, ids: &[AtomId]) -> Option<Range<usize>> {
+        let offsets = self.visible_offsets.get_or_init(|| {
+            let mut start = 0;
+            self.visible()
+                .map(|(id, character)| {
+                    let end = start + character.scalar.len_utf8();
+                    let range = start..end;
+                    start = end;
+                    (id.clone(), range)
+                })
+                .collect()
+        });
+        let mut visible = ids.iter().filter_map(|id| offsets.get(id));
+        let first = visible.next()?;
+        let end = visible.next_back().map_or(first.end, |last| last.end);
+        Some(first.start..end)
+    }
+
     /// Apply an accepted canonical batch atomically to the current story. Inserted IDs use the batch's authenticated
     /// actor and sequence, with indices starting at zero across all insertions in that batch.
     pub fn apply(&mut self, story: &mut Story, styles: &Styles, actor: &str, sequence: u64, edits: &[TextEdit]) -> Result<(), Error> {
@@ -406,6 +438,7 @@ impl TextReplica {
         staged.batches.entry(actor.clone()).or_default().insert(sequence, batch);
         staged.apply_edits(styles, actor, sequence, batch, edits)?;
         staged.project_into(story, &before);
+        staged.visible_offsets = Default::default();
         *self = staged;
         Ok(())
     }
@@ -433,6 +466,7 @@ impl TextReplica {
             }
         }
         self.project_into(story, &before);
+        self.visible_offsets = Default::default();
         Ok(())
     }
 
