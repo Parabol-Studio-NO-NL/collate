@@ -10,15 +10,17 @@ use std::{
     sync::Arc,
 };
 
-use designcraft_doc::{
-    BASIC_PARAGRAPH, CharAttrs, CharFormat, CharRun, MAX_TYPE_SIZE, MIN_TYPE_SIZE, NO_CHAR_STYLE, ParaFormat, Story, StoryId, Styles,
-};
+use designcraft_doc::{CharAttrs, CharFormat, CharRun, MAX_TYPE_SIZE, MIN_TYPE_SIZE, NO_CHAR_STYLE, ParaFormat, Story, StoryId, Styles};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, MAX_OPERATIONS, validation};
 
 mod capture;
+mod paragraph;
+pub(crate) use capture::CaptureHint;
 pub use capture::TextSplice;
+use paragraph::ParagraphFormat;
+pub use paragraph::ParagraphFormatChange;
 
 /// Includes deleted anchors. Resetting the allowance requires a new seed and room epoch.
 pub const MAX_STORY_ATOMS: usize = 16_384;
@@ -136,9 +138,23 @@ impl TextFormatChange {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
 pub enum TextEdit {
-    Insert { after: Option<AtomId>, text: String, format: BasicTextFormat },
-    Delete { atoms: Vec<AtomId> },
-    Format { atoms: Vec<AtomId>, change: TextFormatChange },
+    Insert {
+        after: Option<AtomId>,
+        text: String,
+        format: BasicTextFormat,
+    },
+    Delete {
+        atoms: Vec<AtomId>,
+    },
+    Format {
+        atoms: Vec<AtomId>,
+        change: TextFormatChange,
+    },
+    /// A paragraph is named by its preceding newline, or by the start of the story.
+    FormatParagraph {
+        after: Option<AtomId>,
+        change: ParagraphFormatChange,
+    },
 }
 
 impl TextEdit {
@@ -169,6 +185,44 @@ struct FormatWrite {
 }
 
 #[derive(Clone)]
+struct Paragraph {
+    base: Arc<ParagraphFormat>,
+    current: Arc<ParagraphFormat>,
+    writes: Vec<(usize, ParagraphFormatChange)>,
+}
+
+impl Paragraph {
+    fn new(base: Arc<ParagraphFormat>) -> Self {
+        Self { current: base.clone(), base, writes: Vec::new() }
+    }
+
+    fn write(&mut self, batch: usize, change: &ParagraphFormatChange) {
+        change.apply(Arc::make_mut(&mut self.current));
+        self.writes.push((batch, change.clone()));
+    }
+
+    fn update_active(paragraph: &mut Arc<Self>, batch: usize, active: &[bool]) {
+        if !paragraph.writes.iter().any(|(index, _)| *index == batch) {
+            return;
+        }
+        let paragraph = Arc::make_mut(paragraph);
+        let mut current = paragraph.base.clone();
+        for (batch, change) in &paragraph.writes {
+            if active[*batch] {
+                change.apply(Arc::make_mut(&mut current));
+            }
+        }
+        paragraph.current = current;
+    }
+}
+
+struct StoryProjection {
+    text: String,
+    chars: Vec<CharRun>,
+    paras: Vec<ParaFormat>,
+}
+
+#[derive(Clone)]
 struct EmptySample {
     position: EditPosition,
     first_visible: AtomId,
@@ -182,11 +236,20 @@ struct Atom {
     insertion: Option<usize>,
     deletions: Option<Arc<Vec<usize>>>,
     formats: Option<Arc<Vec<FormatWrite>>>,
+    next_paragraph: Option<Arc<Paragraph>>,
 }
 
 impl Atom {
     fn new(id: AtomId, scalar: char, format: Arc<BasicTextFormat>, insertion: Option<usize>) -> Self {
-        Self { id, character: Character { scalar, format: format.clone() }, base_format: format, insertion, deletions: None, formats: None }
+        Self {
+            id,
+            character: Character { scalar, format: format.clone() },
+            base_format: format,
+            insertion,
+            deletions: None,
+            formats: None,
+            next_paragraph: None,
+        }
     }
 
     fn is_visible(&self, active: &[bool]) -> bool {
@@ -211,7 +274,7 @@ impl Atom {
 #[derive(Clone)]
 pub struct TextReplica {
     id: StoryId,
-    paragraph: ParaFormat,
+    first_paragraph: Arc<Paragraph>,
     seed_typing_format: Arc<BasicTextFormat>,
     empty_samples: Vec<EmptySample>,
     batches: BTreeMap<Arc<str>, BTreeMap<u64, usize>>,
@@ -221,10 +284,9 @@ pub struct TextReplica {
 
 impl TextReplica {
     pub fn new(story: &Story, styles: &Styles) -> Result<Self, Error> {
-        let paragraph = simple_paragraph(story)?;
-        if paragraph.style != BASIC_PARAGRAPH && styles.para(&paragraph.style).is_none() {
-            return Err(Error::UnknownResource);
-        }
+        validate_story_shape(story)?;
+        let mut paragraphs = story.paras.iter().map(|format| ParagraphFormat::from_doc(format, styles).map(Arc::new));
+        let first_paragraph = Arc::new(Paragraph::new(paragraphs.next().ok_or(Error::Invalid("story paragraphs"))??));
         let first = story.chars.first().ok_or(Error::Invalid("story runs"))?;
         let typing_format = if story.text.is_empty() { BasicTextFormat::from_char_format(&first.format)? } else { BasicTextFormat::default() };
         let mut atoms = Vec::new();
@@ -242,7 +304,11 @@ impl TextReplica {
                 if atoms.len() == MAX_STORY_ATOMS {
                     return Err(Error::Limit);
                 }
-                atoms.push(Atom::new(AtomId::Seed(atoms.len() as u32), scalar, format.clone(), None));
+                let mut atom = Atom::new(AtomId::Seed(atoms.len() as u32), scalar, format.clone(), None);
+                if scalar == '\n' {
+                    atom.next_paragraph = Some(Arc::new(Paragraph::new(paragraphs.next().ok_or(Error::Invalid("story paragraphs"))??)));
+                }
+                atoms.push(atom);
             }
             offset = end;
         }
@@ -251,7 +317,7 @@ impl TextReplica {
         }
         Ok(Self {
             id: story.id,
-            paragraph: paragraph.clone(),
+            first_paragraph,
             seed_typing_format: Arc::new(typing_format),
             empty_samples: Vec::new(),
             batches: Default::default(),
@@ -325,8 +391,8 @@ impl TextReplica {
         if edits.is_empty() {
             return Ok(());
         }
-        let (text, runs) = self.projection();
-        self.check_projection(story, &text, &runs)?;
+        let before = self.projection();
+        self.check_projection(story, &before)?;
         if self.batch_index(actor, sequence).is_some() {
             return Err(Error::DuplicateId);
         }
@@ -339,7 +405,7 @@ impl TextReplica {
         staged.active.push(true);
         staged.batches.entry(actor.clone()).or_default().insert(sequence, batch);
         staged.apply_edits(styles, actor, sequence, batch, edits)?;
-        staged.project_into(story, &text, &runs);
+        staged.project_into(story, &before);
         *self = staged;
         Ok(())
     }
@@ -354,15 +420,19 @@ impl TextReplica {
         if self.active[index] == active {
             return Err(Error::Invalid("text history state"));
         }
-        let (text, runs) = self.projection();
-        self.check_projection(story, &text, &runs)?;
+        let before = self.projection();
+        self.check_projection(story, &before)?;
         self.active[index] = active;
+        Paragraph::update_active(&mut self.first_paragraph, index, &self.active);
         for atom in &mut self.atoms {
+            if let Some(paragraph) = &mut atom.next_paragraph {
+                Paragraph::update_active(paragraph, index, &self.active);
+            }
             if atom.formats.as_deref().is_some_and(|writes| writes.iter().any(|write| write.position.batch == index)) {
                 atom.character.format = atom.active_format(&self.active, None);
             }
         }
-        self.project_into(story, &text, &runs);
+        self.project_into(story, &before);
         Ok(())
     }
 
@@ -370,8 +440,13 @@ impl TextReplica {
         self.batches.get(actor)?.get(&sequence).copied()
     }
 
-    fn check_projection(&self, story: &Story, text: &str, runs: &[CharRun]) -> Result<(), Error> {
-        if story.id != self.id || story.text != text || *simple_paragraph(story)? != self.paragraph || !runs_match(text, &story.chars, runs) {
+    fn check_projection(&self, story: &Story, projected: &StoryProjection) -> Result<(), Error> {
+        validate_story_shape(story)?;
+        if story.id != self.id
+            || story.text != projected.text
+            || story.paras != projected.paras
+            || !runs_match(&projected.text, &story.chars, &projected.chars)
+        {
             return Err(Error::Invalid("story projection"));
         }
         Ok(())
@@ -408,6 +483,19 @@ impl TextReplica {
                         }
                     })?;
                 }
+                TextEdit::FormatParagraph { after, change } => {
+                    change.validate(styles)?;
+                    let paragraph = match after {
+                        Some(anchor) => self
+                            .atoms
+                            .iter_mut()
+                            .find(|atom| &atom.id == anchor)
+                            .and_then(|atom| atom.next_paragraph.as_mut())
+                            .ok_or(Error::Invalid("paragraph anchor"))?,
+                        None => &mut self.first_paragraph,
+                    };
+                    Arc::make_mut(paragraph).write(batch, change);
+                }
             }
         }
         Ok(())
@@ -424,7 +512,25 @@ impl TextReplica {
             Some(anchor) => self.atoms.iter().position(|atom| &atom.id == anchor).ok_or(Error::Invalid("text anchor"))? + 1,
             None => 0,
         };
-        let atoms: Vec<_> = chars.map(|(id, scalar)| Atom::new(id, scalar, format.clone(), Some(batch))).collect();
+        let mut inherited = None;
+        let atoms: Vec<_> = chars
+            .map(|(id, scalar)| {
+                let mut atom = Atom::new(id, scalar, format.clone(), Some(batch));
+                if scalar == '\n' {
+                    let paragraph = inherited.get_or_insert_with(|| {
+                        let parent = self.atoms[..position]
+                            .iter()
+                            .rev()
+                            .filter(|atom| atom.is_visible(&self.active))
+                            .find_map(|atom| atom.next_paragraph.as_ref())
+                            .unwrap_or(&self.first_paragraph);
+                        Arc::new(Paragraph::new(parent.current.clone()))
+                    });
+                    atom.next_paragraph = Some(paragraph.clone());
+                }
+                atom
+            })
+            .collect();
         if self.atoms.len() + atoms.len() > MAX_STORY_ATOMS {
             return Err(Error::Limit);
         }
@@ -467,7 +573,16 @@ impl TextReplica {
         self.atoms.iter().filter(|atom| atom.is_visible(&self.active)).map(|atom| (&atom.id, &atom.character))
     }
 
-    fn projection(&self) -> (String, Vec<CharRun>) {
+    fn visible_paragraphs(&self) -> impl Iterator<Item = (Option<&AtomId>, &Paragraph)> {
+        std::iter::once((None, self.first_paragraph.as_ref())).chain(self.atoms.iter().filter_map(|atom| {
+            if !atom.is_visible(&self.active) {
+                return None;
+            }
+            atom.next_paragraph.as_deref().map(|paragraph| (Some(&atom.id), paragraph))
+        }))
+    }
+
+    fn projection(&self) -> StoryProjection {
         let mut text = String::new();
         let mut runs: Vec<CharRun> = Vec::new();
         let mut previous = None;
@@ -487,7 +602,8 @@ impl TextReplica {
         if runs.is_empty() {
             runs.push(CharRun { len: 0, format: self.empty_format().to_char_format() });
         }
-        (text, runs)
+        let paras = self.visible_paragraphs().map(|(_, paragraph)| paragraph.current.to_doc()).collect();
+        StoryProjection { text, chars: runs, paras }
     }
 
     fn empty_format(&self) -> Arc<BasicTextFormat> {
@@ -501,18 +617,18 @@ impl TextReplica {
             .unwrap_or_else(|| self.seed_typing_format.clone())
     }
 
-    fn project_into(&self, story: &mut Story, before: &str, old_runs: &[CharRun]) {
-        let (text, runs) = self.projection();
-        if text != before || runs != old_runs {
-            story.paras.resize(text.bytes().filter(|&byte| byte == b'\n').count() + 1, self.paragraph.clone());
+    fn project_into(&self, story: &mut Story, before: &StoryProjection) {
+        let StoryProjection { text, chars, paras } = self.projection();
+        if text != before.text || chars != before.chars || paras != before.paras {
             story.text = text;
-            story.chars = runs;
+            story.chars = chars;
+            story.paras = paras;
             story.rev = story.rev.wrapping_add(1);
         }
     }
 }
 
-fn simple_paragraph(story: &Story) -> Result<&ParaFormat, Error> {
+fn validate_story_shape(story: &Story) -> Result<(), Error> {
     if story.text.len() > MAX_STORY_ATOMS * 4 || story.chars.len() > MAX_STORY_ATOMS || story.paras.len() > MAX_STORY_ATOMS + 1 {
         return Err(Error::Limit);
     }
@@ -530,15 +646,10 @@ fn simple_paragraph(story: &Story) -> Result<&ParaFormat, Error> {
     {
         return Err(Error::UnsupportedEdit);
     }
-    let Some(paragraph) = story.paras.first() else { return Err(Error::Invalid("story paragraphs")) };
     if story.paras.len() != story.text.bytes().filter(|&byte| byte == b'\n').count() + 1 {
         return Err(Error::Invalid("story paragraphs"));
     }
-    if paragraph.table.is_some() || !paragraph.para.is_empty() || !paragraph.chars.is_empty() || story.paras.iter().any(|format| format != paragraph)
-    {
-        return Err(Error::UnsupportedEdit);
-    }
-    Ok(paragraph)
+    Ok(())
 }
 
 pub(crate) fn simple_text(text: &str) -> bool {
@@ -557,6 +668,7 @@ fn edit_count(edit: &TextEdit) -> Result<usize, Error> {
             text.chars().count()
         }
         TextEdit::Delete { atoms } | TextEdit::Format { atoms, .. } => atoms.len(),
+        TextEdit::FormatParagraph { .. } => 1,
     };
     match length {
         0 => Err(Error::Invalid("empty text edit")),

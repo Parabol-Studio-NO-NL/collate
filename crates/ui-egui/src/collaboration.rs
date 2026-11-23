@@ -654,8 +654,11 @@ impl Room {
     fn capture_edit(&mut self, session: &mut Session, edit: DeferredEdit) -> Result<(), String> {
         let local = self.local.as_ref().ok_or("The collaboration connection is still starting.")?;
         self.error = None;
-        let edits =
-            self.replica.capture(&edit.before, &edit.after, &local.actor.to_string(), self.next_sequence).map_err(|error| error.to_string())?;
+        let selections = edit.before_selection.text.zip(edit.after_selection.text);
+        let edits = self
+            .replica
+            .capture_selected(&edit.before, &edit.after, &local.actor.to_string(), self.next_sequence, selections)
+            .map_err(|error| error.to_string())?;
         self.frame_entry = typing::FrameEntry::capture(self.next_sequence, &edit, &edits);
         self.layer_entry =
             matches!(edits.as_slice(), [Operation::Layer { edit: LayerEdit::Create { .. } }]).then_some((self.next_sequence, edit.before_layer));

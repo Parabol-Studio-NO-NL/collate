@@ -9,7 +9,9 @@ use designcraft_collab::{
 use designcraft_doc::build::NewDocument;
 use designcraft_doc::color::swatch::BLACK;
 use designcraft_doc::geom::{Affine, Rect, shapes};
-use designcraft_doc::{Content, Document, Fill, Hyperlink, HyperlinkDest, HyperlinkSource, Item, ItemId, LayerId, Shape, SpreadRef, StoryId};
+use designcraft_doc::{
+    Content, Document, Fill, Hyperlink, HyperlinkDest, HyperlinkSource, Item, ItemId, LayerId, Shape, SpreadRef, StoryId, TextSel,
+};
 
 fn seed() -> Document {
     Document::new(&NewDocument::default())
@@ -253,6 +255,45 @@ fn a_page_removal_cannot_bypass_frame_reference_checks() {
     assert_eq!(replica.apply(&mut confirmed, &[Operation::Page { edit }]), Err(Error::UnsupportedObject));
     assert_eq!(confirmed, before);
     assert_eq!(replica.local_id(&shared), Some(frame));
+}
+
+#[test]
+fn deleting_around_a_text_selection_preserves_the_selected_atoms() {
+    use std::ops::Range;
+
+    let check = |text: &str, (anchor, focus): (usize, usize), before: Range<usize>, after: Range<usize>, deleted: &[u32]| {
+        let mut seed = seed();
+        let layer = seed.default_layer();
+        let (_, story) = seed.add_text_frame(SpreadRef::Doc(0), Rect::new(0.0, 0.0, 100.0, 20.0), layer, text, Default::default()).unwrap();
+        let old = TextSel { anchor, focus, ..TextSel::caret(story, 0) };
+        let new = TextSel { anchor: anchor - before.len(), focus: focus - before.len(), ..old };
+        let mut draft = seed.clone();
+        draft.story_mut(story).unwrap().delete(after);
+        draft.story_mut(story).unwrap().delete(before);
+
+        let mut replica = Replica::new(&seed);
+        let operations = replica.capture_selected(&seed, &draft, "alice", 1, Some((old, new))).unwrap();
+        let [Operation::Text { edits, .. }] = operations.as_slice() else { panic!("expected text edits, got {operations:?}") };
+        let atoms: Vec<_> = edits
+            .iter()
+            .flat_map(|edit| match edit {
+                TextEdit::Delete { atoms } => atoms.iter().cloned(),
+                _ => panic!("expected only deletions, got {edit:?}"),
+            })
+            .collect();
+        assert_eq!(atoms, deleted.iter().copied().map(AtomId::Seed).collect::<Vec<_>>());
+
+        replica.apply(&mut seed, &operations).unwrap();
+        let expected = draft.story(story).unwrap();
+        let replayed = seed.story_mut(story).unwrap();
+        replayed.rev = expected.rev;
+        assert_eq!(&*replayed, expected);
+    };
+
+    // The same text results if the second newline is removed instead, but its atom is selected.
+    check("A\n\nB", (2, 3), 1..2, 3..3, &[1]);
+    // Delete on both sides of a reverse selection with a multibyte character and a newline.
+    check("Pα\nλ\n\nαZ", (7, 4), 1..4, 7..10, &[1, 2, 5, 6]);
 }
 
 #[test]
