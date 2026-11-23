@@ -24,4 +24,4 @@ log = { workspace = true }
 # The font files CoreText has available (src/mac_fonts.rs): fonts that font services and managers
 # register from their own folders. A safe API; MIT OR Apache-2.0. 20.x shares core-foundation 0.9
 # and core-graphics 0.23 with the dependencies already locked.
-core-text = "=20.1.0"
+core-text = "=22.0.0"
