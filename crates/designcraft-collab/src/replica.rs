@@ -6,7 +6,7 @@ use designcraft_doc::{
 };
 
 use crate::artwork::Placement;
-use crate::text::{AtomId, TextEdit, TextReplica, TextSplice};
+use crate::text::{AtomId, CaptureHint, TextEdit, TextReplica, TextSplice};
 use crate::{CommentAnchor, CommentReply, CommentThread, Error, MAX_OPERATIONS, Operation, ShapeFrame, SharedId, layers, pages, validation};
 
 const MAX_ORDER_ITEMS: usize = 512;
@@ -195,9 +195,9 @@ impl Replica {
             }
             let replica = self.text.get(&id).cloned().map_or_else(|| TextReplica::new(previous, &before.styles), Ok)?;
             let hint = selection
-                .filter(|(old, new)| old.story == id && new.story == id && old.cell.is_none() && new.cell.is_none() && new.is_caret())
+                .filter(|(old, new)| old.story == id && new.story == id && old.cell.is_none() && new.cell.is_none())
                 .and_then(|(old, new)| text_splice_hint(old, new, previous.text.len(), current.text.len()));
-            let edits = replica.capture_at(previous, current, &before.styles, actor, sequence, hint)?;
+            let edits = replica.capture_with_hint(previous, current, &before.styles, actor, sequence, hint)?;
             if !edits.is_empty() {
                 operations.push(Operation::Text { story: id, actor: actor.into(), sequence, edits });
             }
@@ -689,16 +689,22 @@ fn story_is_referenced(document: &Document, id: StoryId) -> bool {
             .any(|placeholder| matches!(placeholder.anchor, PlaceholderAnchor::Text { story, .. } if story == id))
 }
 
-fn text_splice_hint(before: TextSel, after: TextSel, old_len: usize, new_len: usize) -> Option<TextSplice> {
+fn text_splice_hint(before: TextSel, after: TextSel, old_len: usize, new_len: usize) -> Option<CaptureHint> {
+    if !after.is_caret() {
+        if (before.anchor < before.focus) != (after.anchor < after.focus) {
+            return None;
+        }
+        return CaptureHint::delete_surrounding(before.range(), after.range(), old_len, new_len);
+    }
     let end = after.focus;
     if !before.is_caret() {
         let start = before.anchor.min(before.focus);
         let old_end = before.anchor.max(before.focus);
-        return (start <= end).then_some(TextSplice { old: start..old_end, new: start..end });
+        return (start <= end).then(|| TextSplice { old: start..old_end, new: start..end }.into());
     }
     if new_len >= old_len {
-        return (before.focus <= end).then_some(TextSplice { old: before.focus..before.focus, new: before.focus..end });
+        return (before.focus <= end).then(|| TextSplice { old: before.focus..before.focus, new: before.focus..end }.into());
     }
     let old_end = end.checked_add(old_len - new_len)?;
-    Some(TextSplice { old: end..old_end, new: end..end })
+    Some(TextSplice { old: end..old_end, new: end..end }.into())
 }

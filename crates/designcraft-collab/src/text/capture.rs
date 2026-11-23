@@ -14,7 +14,11 @@ pub struct TextSplice {
 
 impl TextSplice {
     fn matching_edges(&self, before: &str, after: &str) -> Option<(usize, usize)> {
-        if self.old.start > self.old.end || self.new.start > self.new.end || before == after {
+        if self.old.start > self.old.end || self.new.start > self.new.end {
+            return None;
+        }
+        // Replacing a newline with the same bytes still removes its old paragraph identity.
+        if before == after && !before.get(self.old.clone())?.contains('\n') {
             return None;
         }
         let prefix = before.get(..self.old.start)?;
@@ -23,6 +27,45 @@ impl TextSplice {
             return None;
         }
         Some((prefix.chars().count(), suffix.chars().count()))
+    }
+}
+
+pub(crate) struct CaptureHint {
+    splice: TextSplice,
+    retained: Option<Range<usize>>,
+}
+
+impl From<TextSplice> for CaptureHint {
+    fn from(splice: TextSplice) -> Self {
+        Self { splice, retained: None }
+    }
+}
+
+impl CaptureHint {
+    pub(crate) fn delete_surrounding(old: Range<usize>, new: Range<usize>, old_len: usize, new_len: usize) -> Option<Self> {
+        let removed = old_len.checked_sub(new_len)?;
+        if removed == 0 || old.is_empty() || old.len() != new.len() {
+            return None;
+        }
+        let before = old.start.checked_sub(new.start)?;
+        let after = removed.checked_sub(before)?;
+        let splice = TextSplice { old: new.start..old.end.checked_add(after)?, new };
+        Some(Self { splice, retained: Some(old) })
+    }
+
+    fn matching_text(self, before: &str, after: &str) -> Option<(usize, usize, Option<Range<usize>>)> {
+        let (prefix, suffix) = self.splice.matching_edges(before, after)?;
+        let retained = if let Some(range) = self.retained {
+            let text = before.get(range.clone())?;
+            if text != after.get(self.splice.new)? {
+                return None;
+            }
+            let start = prefix + before.get(self.splice.old.start..range.start)?.chars().count();
+            Some(start..start + text.chars().count())
+        } else {
+            None
+        };
+        Some((prefix, suffix, retained))
     }
 }
 
@@ -44,31 +87,47 @@ impl TextReplica {
         sequence: u64,
         hint: Option<TextSplice>,
     ) -> Result<Vec<TextEdit>, Error> {
+        self.capture_with_hint(before, after, styles, actor, sequence, hint.map(Into::into))
+    }
+
+    pub(crate) fn capture_with_hint(
+        &self,
+        before: &Story,
+        after: &Story,
+        styles: &Styles,
+        actor: &str,
+        sequence: u64,
+        hint: Option<CaptureHint>,
+    ) -> Result<Vec<TextEdit>, Error> {
         validation::actor(actor)?;
         if sequence == 0 {
             return Err(Error::Invalid("proposal sequence"));
         }
-        let (text, runs) = self.projection();
-        self.check_projection(before, &text, &runs)?;
+        self.check_projection(before, &self.projection())?;
         let after_replica = Self::new(after, styles)?;
         let old: Vec<_> = self.visible().collect();
         let new: Vec<_> = after_replica.visible().map(|(_, character)| character).collect();
-        let (prefix, suffix) = hint.and_then(|hint| hint.matching_edges(&before.text, &after.text)).unwrap_or_else(|| {
+        let (prefix, suffix, retained) = hint.and_then(|hint| hint.matching_text(&before.text, &after.text)).unwrap_or_else(|| {
             let prefix = old.iter().zip(&new).take_while(|((_, a), b)| a.scalar == b.scalar).count();
             let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev()).take_while(|((_, a), b)| a.scalar == b.scalar).count();
-            (prefix, suffix)
+            (prefix, suffix, None)
         });
-        let removed = &old[prefix..old.len() - suffix];
-        let added = &new[prefix..new.len() - suffix];
-        if removed.len() + added.len() > MAX_BATCH_ATOMS {
+        let old_end = old.len() - suffix;
+        let added_end = if retained.is_some() { prefix } else { new.len() - suffix };
+        let retained = retained.unwrap_or(old_end..old_end);
+        let added = &new[prefix..added_end];
+        if old_end - prefix - retained.len() + added.len() > MAX_BATCH_ATOMS {
             return Err(Error::Limit);
         }
 
-        let mut edits: Vec<_> =
-            removed.chunks(MAX_EDIT_ATOMS).map(|ids| TextEdit::Delete { atoms: ids.iter().map(|(id, _)| (*id).clone()).collect() }).collect();
+        let mut edits: Vec<_> = old[prefix..retained.start]
+            .chunks(MAX_EDIT_ATOMS)
+            .chain(old[retained.end..old_end].chunks(MAX_EDIT_ATOMS))
+            .map(|ids| TextEdit::Delete { atoms: ids.iter().map(|(id, _)| (*id).clone()).collect() })
+            .collect();
         let anchor = prefix.checked_sub(1).map(|index| old[index].0.clone());
         append_insertions(&mut edits, added, anchor, actor.into(), sequence)?;
-        let unchanged = old[..prefix].iter().zip(&new[..prefix]).chain(old[old.len() - suffix..].iter().zip(&new[new.len() - suffix..]));
+        let unchanged = old[..prefix].iter().chain(&old[retained]).chain(&old[old_end..]).zip(new[..prefix].iter().chain(&new[added_end..]));
         for ((id, previous), current) in unchanged {
             for change in current.format.changes(&previous.format) {
                 append_formatting(&mut edits, id, change)?;
@@ -76,7 +135,24 @@ impl TextReplica {
         }
 
         let mut projected = before.clone();
-        self.clone().apply(&mut projected, styles, actor, sequence, &edits)?;
+        let mut staged = self.clone();
+        staged.apply(&mut projected, styles, actor, sequence, &edits)?;
+
+        // Map the draft's paragraph formats to the stable anchors in the projected text. A
+        // separator inserted by this batch inherits its paragraph's format before local overrides.
+        let text_edit_count = edits.len();
+        for ((after, current), (_, draft)) in staged.visible_paragraphs().zip(after_replica.visible_paragraphs()) {
+            for change in draft.current.changes(&current.current) {
+                if edits.len() == MAX_OPERATIONS {
+                    return Err(Error::Limit);
+                }
+                edits.push(TextEdit::FormatParagraph { after: after.cloned(), change });
+            }
+        }
+        if edits.len() != text_edit_count {
+            projected = before.clone();
+            self.clone().apply(&mut projected, styles, actor, sequence, &edits)?;
+        }
         projected.rev = after.rev;
         if projected != *after {
             return Err(Error::UnsupportedEdit);

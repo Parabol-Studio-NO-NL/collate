@@ -1,7 +1,7 @@
 use std::{thread, time::Duration};
 
 use designcraft_collab::{CommentAnchor, Operation, SharedId};
-use designcraft_doc::{Document, ItemId, LayerId, StoryId, build::NewDocument};
+use designcraft_doc::{Align, Document, ItemId, LayerId, StoryId, build::NewDocument};
 use designcraft_engine::{DocState, Session};
 use serde_json::json;
 use web_time::Instant;
@@ -961,6 +961,70 @@ fn deleting_a_shared_text_frame_preserves_declined_and_buffered_typing() {
     assert!(guest.session.doc().unwrap().selection.text.is_none());
     assert_eq!(room(&guest).paused_typing(), Some(format!("{submitted} later").as_str()));
     assert!(guest.collaboration_blocks_close());
+}
+
+#[test]
+fn shared_paragraph_formatting_preserves_concurrent_text_in_threaded_frames() {
+    let mut host = editor(&Document::new(&NewDocument::default()), "Text host");
+    host.run("style.paragraph.create", json!({"name": "Heading", "chars": {"size": 18}})).unwrap();
+    let text = host.run("frame.create", json!({"rect": [40, 50, 300, 68], "content": "text", "text": "AB\nCD"})).unwrap();
+    let first = text["id"].as_u64().unwrap();
+    let story = text["story"].as_u64().unwrap();
+    let story_id = StoryId(story);
+    let frame = host.run("frame.create", json!({"rect": [40, 220, 300, 370], "content": "unassigned"})).unwrap();
+    let second = frame["id"].as_u64().unwrap();
+    host.run("text.thread", json!({"from": first, "to": second})).unwrap();
+    let seed = document(&host).clone();
+    let original = &seed.story(story_id).unwrap().paras[0];
+    let mut guest = editor(&seed, "Text guest");
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "text host starts", |apps| room(apps[0]).invitation.is_some() && room(apps[0]).can_edit());
+    join(&mut guest, room(&host).invitation.as_deref().unwrap());
+    wait_for(&mut [&mut host, &mut guest], "text guest joins", |apps| room(apps[1]).can_edit());
+
+    // Both proposals start from the same revision, inside the second paragraph.
+    host.run("text.select", json!({"story": story, "anchor": 4})).unwrap();
+    host.run("type.alignCenter", json!({})).unwrap();
+    guest.run("text.select", json!({"story": story, "anchor": 4})).unwrap();
+    guest.run("text.insert", json!({"text": "λ", "raw": true})).unwrap();
+    wait_for(&mut [&mut host, &mut guest], "paragraph formatting and text converge", |apps| apps.iter().all(|app| room(app).revision == 2));
+
+    guest.run("text.select", json!({"story": story, "anchor": 4})).unwrap();
+    guest.run("type.para", json!({"attrs": {"leftIndent": 4.0, "spaceAfter": 7.0}})).unwrap();
+    wait_for(&mut [&mut host, &mut guest], "guest formats the same paragraph", |apps| apps.iter().all(|app| room(app).revision == 3));
+
+    let assert_story = |host: &DesignApp, guest: &DesignApp, alignment| {
+        assert_eq!(document(host), document(guest));
+        let current = document(guest).story(story_id).unwrap();
+        assert_eq!(current.frames, [ItemId(first), ItemId(second)]);
+        assert_eq!(current.text, "AB\nCλD");
+        assert_eq!(&current.paras[0], original);
+        assert_eq!(current.paras[1].para.align, alignment);
+        assert_eq!(current.paras[1].para.left_indent, Some(4.0));
+        assert_eq!(current.paras[1].para.space_after, Some(7.0));
+    };
+    assert_story(&host, &guest, Some(Align::Center));
+    for (command, revision, alignment) in [("edit.undo", 4, original.para.align), ("edit.redo", 5, Some(Align::Center))] {
+        host.run(command, json!({})).unwrap();
+        wait_for(&mut [&mut host, &mut guest], command, |apps| apps.iter().all(|app| room(app).revision == revision));
+        assert_story(&host, &guest, alignment);
+    }
+
+    guest.run("text.select", json!({"story": story, "anchor": 0})).unwrap();
+    guest.run("style.paragraph.apply", json!({"name": "Heading"})).unwrap();
+    wait_for(&mut [&mut host, &mut guest], "named style confirmed", |apps| apps.iter().all(|app| room(app).revision == 6));
+    let styled = document(&guest).story(story_id).unwrap();
+    assert_eq!(styled.paras[0].style, "Heading");
+    assert_eq!(styled.paras[1].style, original.style);
+
+    guest.run("text.select", json!({"story": story, "anchor": 2, "focus": 3})).unwrap();
+    guest.run("text.insert", json!({"text": "\n", "raw": true})).unwrap();
+    wait_for(&mut [&mut host, &mut guest], "replaced break inherits the preceding style", |apps| apps.iter().all(|app| room(app).revision == 7));
+    assert_eq!(document(&guest).story(story_id).unwrap().paras[1].style, "Heading");
+    assert_eq!(document(&host), document(&guest));
+    let confirmed = room(&host).history.iter().map(|(commit, _)| commit.clone()).collect();
+    let recovered = super::replay::restore(&seed, &seed, confirmed).unwrap();
+    assert_eq!(&recovered.document, document(&host));
 }
 
 #[test]
