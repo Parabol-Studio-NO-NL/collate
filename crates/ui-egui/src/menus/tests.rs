@@ -3308,6 +3308,7 @@ fn start_screen_texts(app: &mut crate::DesignApp) -> Vec<String> {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_focused_dock_control_keeps_tab_and_space_out_of_selected_text() {
+    use egui::accesskit::Role;
     use egui_kittest::kittest::Queryable as _;
 
     let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
@@ -3325,7 +3326,7 @@ fn a_focused_dock_control_keeps_tab_and_space_out_of_selected_text() {
         app,
     );
     h.run_steps(4);
-    h.get_by_label("Paragraph language").focus();
+    h.get_by(|n| n.role() == Role::ComboBox && n.label().as_deref() == Some("Paragraph language")).focus();
     h.run_steps(3);
     h.key_press(egui::Key::Tab);
     h.run_steps(3);
@@ -3336,7 +3337,7 @@ fn a_focused_dock_control_keeps_tab_and_space_out_of_selected_text() {
     assert_ne!(h.state_mut().run("type.selectionAttrs", json!({})).unwrap()["para"]["hyphenate"], before);
     h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
     h.run_steps(3);
-    assert!(h.get_by_label("Paragraph language").is_focused());
+    assert!(h.get_by(|n| n.role() == Role::ComboBox && n.label().as_deref() == Some("Paragraph language")).is_focused());
     assert_eq!(h.state().ui.hidden_panels, 0);
     assert_eq!(h.state_mut().run("story.get", json!({"story":f["story"]})).unwrap()["text"], "Typesetting");
 }
