@@ -36,9 +36,14 @@ def cache_paths():
 
 def cache_size(paths):
     total = 0
-    for path in paths:
-        if path.is_dir() and not any(path != other and path.is_relative_to(other) for other in paths):
-            total += int(subprocess.check_output(["du", "-sk", path]).split()[0]) * 1024
+    try:
+        for path in paths:
+            if path.is_dir() and not any(path != other and path.is_relative_to(other) for other in paths):
+                output = subprocess.check_output(["du", "-sk", path])
+                total += int(output.split(maxsplit=1)[0]) * 1024
+    except (OSError, subprocess.CalledProcessError, IndexError, ValueError):
+        # A concurrent build can remove files during du. Discard incomplete totals.
+        return None
     return total
 
 
@@ -92,7 +97,8 @@ def main():
     volumes = [ROOT, *paths, Path(tempfile.gettempdir())]
     free = ensure_space(volumes, args.min_free_gib)
     before = cache_size(paths)
-    print(f"Cargo cache: {before / GIB:.1f} GiB ({', '.join(map(str, paths))}). "
+    size = "unavailable" if before is None else f"{before / GIB:.1f} GiB"
+    print(f"Cargo cache: {size} ({', '.join(map(str, paths))}). "
           f"Least free space across build volumes: {free / GIB:.1f} GiB.", flush=True)
     started = time.monotonic()
     try:
@@ -102,8 +108,11 @@ def main():
         return result if result >= 0 else 128 - result
     finally:
         after = cache_size(paths)
-        print(f"Cargo cache after {time.monotonic() - started:.1f}s: {after / GIB:.1f} GiB ({(after - before) / GIB:+.1f} GiB).", flush=True)
-        if after > args.warn_cache_gib:
+        size = "unavailable" if after is None else f"{after / GIB:.1f} GiB"
+        if before is not None and after is not None:
+            size += f" ({(after - before) / GIB:+.1f} GiB)"
+        print(f"Cargo cache after {time.monotonic() - started:.1f}s: {size}.", flush=True)
+        if after is not None and after > args.warn_cache_gib:
             print(f"Cargo cache exceeds {args.warn_cache_gib / GIB:g} GiB. Consider cleaning an unused profile or target.", file=sys.stderr)
 
 
