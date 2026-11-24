@@ -101,7 +101,11 @@ git config user.name 'Publish Fixture'
 git config user.email 'publish-fixture@example.invalid'
 git commit --quiet --allow-empty -m 'Common baseline'
 git branch upstream
-git commit --quiet --allow-empty -m 'Fork-specific change'
+mkdir -p tools/fork
+printf 'local implementation\n' > module.txt
+printf 'module.txt\n' > tools/fork/protected-patches
+git add module.txt tools/fork/protected-patches
+git commit --quiet -m 'Fork-specific change'
 main=$(git rev-parse main)
 
 git switch --quiet upstream
@@ -164,6 +168,7 @@ snapshot_baseline=$(git merge-base "$main" "$upstream")
 git switch --quiet --orphan snapshot
 mkdir -p tools/fork
 printf '%s\n' "$snapshot_baseline" > tools/fork/upstream-revision
+git restore --source="$main" --staged --worktree -- module.txt tools/fork/protected-patches
 git add tools/fork/upstream-revision
 git commit --quiet -m 'Independent public snapshot'
 main=$(git rev-parse HEAD)

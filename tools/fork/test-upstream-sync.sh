@@ -4,6 +4,18 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 sync_script="$script_dir/upstream-sync.sh"
 
+# Also exercise the actual PR checkout, including manually resolved imports.
+bash "$script_dir/check-protected-patches.sh"
+if [[ ${GITHUB_EVENT_NAME:-} == pull_request && ${GITHUB_HEAD_REF:-} == sync/upstream-* && ${GITHUB_REF:-} == refs/pull/*/merge ]]; then
+    # Hosted PR checkouts are shallow. Read the exact base from the merge object,
+    # so a later push to main cannot change which fork modules we compare.
+    base=$(git cat-file -p HEAD | sed -n '2s/^parent //p')
+    if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+        git fetch --no-tags --depth=1 origin "$base"
+    fi
+    bash "$script_dir/check-protected-patches.sh" "$base" HEAD
+fi
+
 # Synthetic commits and text files made for this test. No network or user Git configuration.
 for variable in $(git rev-parse --local-env-vars); do
     unset "$variable"
@@ -60,20 +72,28 @@ assert_no_candidate() {
         fail "${output##*/}: a failed or unnecessary sync produced a candidate"
 }
 
-mkdir -p .github/workflows crates/doc
+mkdir -p .github/workflows crates/doc crates/compose
+# This existing union driver can merge independent additions at the same path.
+printf 'future-module.txt merge=union\n' > .gitattributes
+printf 'render rag\n' > crates/compose/rag.rs
+printf 'start layout\nrender rag\nfinish layout\n' > crates/compose/layout.rs
 printf 'upstream baseline\n' > .github/workflows/ci.yml
 printf 'original shared line\n' > shared.txt
 printf 'original local file\n' > local.txt
 commit_all 'Common upstream baseline'
 git branch initial-upstream
 
+mkdir -p tools/fork
+printf 'crates/compose/rag.rs\ncrates/compose/layout.rs\trender rag\n' > tools/fork/protected-patches
 printf 'fork validation\n' > .github/workflows/ci.yml
 printf 'fork edit to shared line\n' > shared.txt
 printf 'fork-only content\n' > fork.txt
+printf 'fork implementation\n' > future-module.txt
 commit_all 'Fork-specific changes'
 main=$(git rev-parse HEAD)
 
 git switch --quiet -c upstream-doc initial-upstream
+printf 'another layout operation\n' >> crates/compose/layout.rs
 printf 'new document schema\n' > crates/doc/schema.txt
 printf 'upstream release note\n' > 'release notes.txt'
 commit_all 'Independent upstream changes'
@@ -87,6 +107,28 @@ upstream_next=$(git rev-parse HEAD)
 git switch --quiet -c upstream-conflict initial-upstream
 printf 'upstream edit to shared line\n' > shared.txt
 commit_all 'Conflicting upstream change'
+
+# Each change merges cleanly in Git, including deleting a hook shared with
+# the recorded upstream baseline. The feature guard must catch each loss.
+git switch --quiet -c upstream-removes-hook initial-upstream
+printf 'start layout\nfinish layout\n' > crates/compose/layout.rs
+commit_all 'Remove rag from the composition path'
+
+git switch --quiet -c upstream-new-module initial-upstream
+printf 'independently added upstream implementation\n' > future-module.txt
+commit_all 'Introduce a module with the same path as a later fork addition'
+
+git switch --quiet -c upstream-edits-module initial-upstream
+printf 'different render operation\n' > crates/compose/rag.rs
+commit_all 'Replace shared-baseline rag implementation'
+
+git switch --quiet -c upstream-removes-module initial-upstream
+git rm -q crates/compose/rag.rs
+commit_all 'Delete shared-baseline rag implementation'
+
+git switch --quiet -c fork-updates-module main
+printf 'new Collate algorithm\n' >> crates/compose/rag.rs
+commit_all 'Improve the fork module locally'
 
 git switch --quiet -c upstream-workflow upstream-doc
 printf 'unreviewed workflow\n' > .github/workflows/new-ci.yml
@@ -130,6 +172,30 @@ git diff --quiet "$upstream" "$candidate" -- crates/doc/schema.txt 'release note
 assert_report_contains "$upstream"
 assert_report_contains "crates/doc/schema.txt"
 assert_report_contains "release notes.txt"
+
+prepare unregistered-module upstream-new-module blocked 1
+assert_no_candidate
+assert_report_contains 'future-module.txt'
+
+prepare removed-hook upstream-removes-hook blocked 1
+assert_no_candidate
+assert_report_contains 'crates/compose/layout.rs'
+assert_report_contains 'render rag'
+prepare replaced-module upstream-edits-module blocked 1
+assert_no_candidate
+assert_report_contains 'crates/compose/rag.rs'
+prepare deleted-module upstream-removes-module blocked 1
+assert_no_candidate
+assert_report_contains 'crates/compose/rag.rs'
+
+# Fork maintenance establishes the new reference version. An unrelated
+# upstream edit in the shared file must survive alongside it.
+prepare updated-module upstream-doc ready 0 fork-updates-module
+updated_candidate=$(<"$output/candidate")
+git diff --quiet fork-updates-module "$updated_candidate" -- crates/compose/rag.rs ||
+    fail 'sync lost the latest local module implementation'
+git diff --quiet upstream-doc "$updated_candidate" -- crates/compose/layout.rs ||
+    fail 'sync dropped a compatible upstream change in a shared file'
 
 prepare same-merge upstream-doc ready 0
 [[ "$(git rev-parse "${candidate}^{tree}")" == "$(git rev-parse "$(<"$output/candidate")^{tree}")" ]] ||
@@ -185,6 +251,9 @@ prepare snapshot-next upstream-next ready 0 "$snapshot_candidate"
     fail 'a later snapshot import did not advance its baseline'
 prepare snapshot-rewind initial-upstream blocked 1 "$snapshot_candidate"
 assert_no_candidate
+prepare snapshot-removed-hook upstream-removes-hook blocked 1 "$snapshot"
+assert_no_candidate
+assert_report_contains 'crates/compose/layout.rs'
 prepare snapshot-conflict upstream-conflict conflict 1 "$snapshot"
 assert_no_candidate
 prepare snapshot-guard upstream-brand blocked 1 "$snapshot"
