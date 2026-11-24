@@ -17,7 +17,7 @@ fn top_bar_share_opens_collaboration_from_the_keyboard() {
     );
     harness.run_steps(4);
     assert!(harness.query_by_label("Join and receive document").is_none());
-    harness.get_by_label("Share…").focus();
+    harness.get_by_label("Share").focus();
     harness.run();
     harness.key_press(egui::Key::Enter);
     harness.run();

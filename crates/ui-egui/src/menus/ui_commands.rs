@@ -15,7 +15,7 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ("app.newDocumentDialog", "New Document…", Some("Cmd+N"), "{}"),
     ("app.openDialog", "Open…", Some("Cmd+O"), "{path?} — without a path, choose the file in a dialog"),
     #[cfg(not(target_arch = "wasm32"))]
-    ("app.shareDocument", "Share…", None, "{} opens the document collaboration window"),
+    ("app.shareDocument", "Share", None, "{} opens the document collaboration window"),
     ("app.openRecent", "Open Recent File", None, "{index} — file.openRecent, with an alert when the file can't be opened"),
     (
         "app.placeDialog",

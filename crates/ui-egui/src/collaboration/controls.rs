@@ -116,7 +116,7 @@ impl DesignApp {
     }
 
     pub(crate) fn collaboration_button(&mut self, ui: &mut Ui) {
-        let label = if self.collaboration.room.is_some() { "Sharing…" } else { "Share…" };
+        let label = if self.collaboration.room.is_some() { "Sharing…" } else { "Share" };
         let button = Button::new(crate::rtl::widget(ui, tr(&self.ui.language, label))).min_size(egui::vec2(0.0, 24.0));
         if ui.add(button).clicked() {
             let _ = self.run("app.shareDocument", serde_json::Value::Null);
