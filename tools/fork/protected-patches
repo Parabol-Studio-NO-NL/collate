@@ -1,0 +1,49 @@
+# A path by itself is a fork-owned file or directory.
+# A path followed by a tab protects that literal in a shared file.
+# Paragraph rag settings, rendering and regression tests
+crates/ui-egui/src/paragraph_rag.rs
+crates/ui-egui/src/panels/properties/typography.rs	crate::paragraph_rag::COMMAND
+crates/ui-egui/src/menus/ui_commands.rs	crate::paragraph_rag::COMMAND
+crates/ui-egui/src/menus/run.rs	crate::paragraph_rag::COMMAND
+crates/ui-egui/src/dialogs.rs	crate::paragraph_rag::show(
+crates/doc/src/attrs/enums.rs	enum RagPattern
+crates/doc/src/attrs/para_attrs.rs	rag_pattern: RagPattern
+crates/doc/src/attrs/para_attrs.rs	rag_inset:
+crates/engine/src/cmd/text/format.rs	attrs.rag_inset
+crates/compose/src/lib.rs	= rag_line_bounds(
+crates/compose/src/tests.rs	fn alternating_edges_restarts_after_an_odd_column_or_frame(
+crates/compose/src/tests.rs	fn alternating_measures_inset_short_lines_and_bound_justification(
+crates/ui-egui/src/dialogs/tests.rs	fn justification_dialog_edits_and_undoes_the_chosen_paragraphs_rag(
+crates/ui-egui/src/panels/properties/tests.rs	fn paragraph_panel_menu_opens_justification_and_rag_for_selected_text(
+
+# Room transport, editing, recovery and the Share button
+crates/collab-core
+crates/designcraft-collab
+crates/engine/src/deferred_edits.rs
+crates/engine/tests/it/deferred_edits.rs
+crates/ui-egui/src/collaboration.rs
+crates/ui-egui/src/collaboration
+crates/engine/src/lib.rs	self.check_deferred_command(
+crates/engine/src/recovery.rs	s.has_encrypted_recovery(
+crates/engine/src/cmd/file/save.rs	s.has_encrypted_recovery(
+crates/ui-egui/src/app/files.rs	Session::read_shared_placement(
+crates/ui-egui/src/app/frame.rs	self.poll_collaboration(
+crates/ui-egui/src/app.rs	self.show_collaboration(
+crates/ui-egui/src/app/quit.rs	self.collaboration_blocks_close()
+crates/ui-egui/src/canvas.rs	app.draw_collaboration_presence(
+crates/ui-egui/src/chrome/app_bar.rs	app.collaboration_button(
+crates/ui-egui/src/menus/run.rs	"app.shareDocument" =>
+crates/ui-egui/src/tests.rs	fn top_bar_share_opens_collaboration_from_the_keyboard(
+
+# Info statistics and the default text Control area
+crates/engine/src/cmd/text/statistics.rs
+crates/ui-egui/src/panels/properties/info.rs
+crates/engine/src/cmd/text.rs	query "type.statistics"
+crates/ui-egui/src/dock.rs	panels::properties::info_panel(
+crates/ui-egui/src/chrome/tests.rs	fn the_type_control_panel_shows_both_groups_by_default(
+
+# macOS updater
+apps/designcraft/src/sparkle.rs
+packaging/macos/codesign
+apps/designcraft/src/main.rs	sparkle::start()
+crates/ui-egui/src/updates_ui.rs	fn manual_checks_use_only_the_platform_updater(

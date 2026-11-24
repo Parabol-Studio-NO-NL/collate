@@ -1386,6 +1386,57 @@ fn justification_dialog_leaves_mixed_fields_alone_and_refuses_bad_values() {
     }
 }
 
+#[test]
+fn justification_dialog_edits_and_undoes_the_chosen_paragraphs_rag() {
+    use egui::accesskit::Role;
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    let (mut app, story) = two_paragraphs();
+    let original_inset = para_attr(&mut app, &story, 0, "ragInset");
+    app.run(crate::paragraph_rag::COMMAND, json!({})).unwrap();
+    let before = undo_steps(&app);
+    let mut h = Harness::builder().with_size(egui::vec2(1000.0, 800.0)).build_ui_state(
+        |ui, app: &mut DesignApp| {
+            let key = egui::Id::unique("justification_rag_fonts");
+            if ui.data(|data| data.get_temp::<bool>(key)).is_none() {
+                crate::theme::install_fonts(ui.ctx(), "");
+                ui.data_mut(|data| data.insert_temp(key, true));
+                return;
+            }
+            show(app, ui.ctx());
+        },
+        app,
+    );
+    h.run_steps(3);
+    h.get_by(|node| node.role() == Role::ComboBox && node.value().as_deref() == Some("Off")).focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::Space);
+    h.run_steps(2);
+    h.get_by_label("Stepped justification").click();
+    h.run_steps(2);
+    h.get_by(|node| node.role() == Role::TextInput && node.label().as_deref() == Some("Short-line inset")).focus();
+    h.run_steps(2);
+    assert!(
+        h.get_by(|node| node.role() == Role::TextInput && node.label().as_deref() == Some("Short-line inset")).is_focused(),
+        "the inset accepts keyboard focus after a pattern is selected"
+    );
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_by(|node| node.role() == Role::TextInput && node.is_focused()).type_text("10 mm");
+    h.run_steps(2);
+    h.key_press(egui::Key::Tab);
+    h.run_steps(2);
+    let app = h.state_mut();
+    confirm(app).unwrap();
+    assert_eq!(undo_steps(app), before + 1);
+    assert_eq!(para_attr(app, &story, 0, "ragPattern"), "stepped");
+    let inset = para_attr(app, &story, 0, "ragInset").as_f64().unwrap();
+    assert!((inset - 10.0 * designcraft_geom::units::PT_PER_MM).abs() < 1e-6);
+    assert_eq!(para_attr(app, &story, 4, "ragPattern"), "none");
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(para_attr(app, &story, 0, "ragPattern"), "none");
+    assert_eq!(para_attr(app, &story, 0, "ragInset"), original_inset);
+}
+
 /// The Justification dialog shows Auto Leading and Single Word Justification, OK sets them on the
 /// selected paragraph as one undo step, bad values keep the dialog open, and both values survive
 /// saving and opening the native file and an IDML export.
@@ -1503,10 +1554,13 @@ fn paragraph_style_options_justification_sets_auto_leading_and_single_word_justi
     assert_eq!(style(&app).auto_leading, None, "nothing saved");
     app.ui.dialog.as_mut().unwrap().fields.insert("p.autoLeading".into(), json!(1.0));
     app.ui.dialog.as_mut().unwrap().fields.insert("p.singleWordJustify".into(), json!("right"));
+    app.ui.dialog.as_mut().unwrap().fields.insert("p.ragPattern".into(), json!("alternatingEdges"));
+    app.ui.dialog.as_mut().unwrap().fields.insert("p.ragInset".into(), json!(18.0));
     draw(&mut app, &ctx);
     confirm(&mut app).unwrap();
     let para = style(&app);
     assert_eq!((para.auto_leading, para.single_word_justify), (Some(1.0), Some(designcraft_doc::Align::Right)));
+    assert_eq!((para.rag_pattern, para.rag_inset), (Some(designcraft_doc::RagPattern::AlternatingEdges), Some(18.0)));
 }
 
 /// Paragraph Style Options › Justification fits at the normal dialog width: the spacing table
@@ -1538,6 +1592,8 @@ fn paragraph_style_options_justification_fits_without_horizontal_scrolling() {
     visible_label(&labels, screen, "Maximum");
     visible_label(&labels, screen, "Single Word Justification:");
     visible_label(&labels, screen, "Composer:");
+    visible_label(&labels, screen, "Rag pattern");
+    visible_label(&labels, screen, "Short-line inset");
     visible_label(&labels, screen, "Insert Kashidas:");
     visible_label(&labels, screen, "Korean Line Breaks:");
 }

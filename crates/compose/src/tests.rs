@@ -104,6 +104,63 @@ fn justified_lines_fill_the_measure() {
 }
 
 #[test]
+fn alternating_edges_restarts_after_an_odd_column_or_frame() {
+    let para = ParaAttrs { rag_pattern: Some(RagPattern::AlternatingEdges), rag_inset: Some(28.0), ..Default::default() };
+    let (mut doc, story, first) = doc_with(LOREM, Rect::new(0.0, 0.0, 354.0, 48.0), para);
+    doc.item_mut(first).unwrap().text_frame_mut().unwrap().options.columns = 2;
+    doc.insert_pages(Some(0), 1, None).unwrap();
+    let (next, _) = doc.add_text_frame(SpreadRef::Doc(1), Rect::new(0.0, 0.0, 170.0, 400.0), doc.default_layer(), "", ParaFormat::default()).unwrap();
+    doc.thread(first, next).unwrap();
+    let composed = compose_story(&doc, story, &ComposeOptions::default());
+    assert!(!composed.is_overset());
+    let mut columns = composed.frames[0].lines.chunk_by(|a, b| a.column == b.column);
+    let first_column = columns.next().unwrap();
+    let second_column = columns.next().unwrap();
+    assert!(
+        !first_column.len().is_multiple_of(2) && !second_column.len().is_multiple_of(2),
+        "both transitions exercise an odd-numbered previous column"
+    );
+    for lines in [first_column, second_column, composed.frames[1].lines.as_slice()] {
+        for (i, line) in lines.iter().enumerate() {
+            if i.is_multiple_of(2) {
+                let left = line.glyphs.iter().find(|g| g.visible).unwrap().x;
+                assert!((left - line.x0).abs() < 0.5, "line {i} should align left in its column");
+            } else {
+                assert!((line.end_x - line.x1).abs() < 0.5, "line {i} should align right in its column");
+            }
+        }
+    }
+}
+
+#[test]
+fn alternating_measures_inset_short_lines_and_bound_justification() {
+    let text = [LOREM, LOREM].join(" ");
+    let inset = 30.0;
+    for rag_pattern in [RagPattern::Natural, RagPattern::Stepped] {
+        let para = ParaAttrs {
+            rag_pattern: Some(rag_pattern),
+            rag_inset: Some(inset),
+            word_space_min: Some(0.78),
+            word_space_desired: Some(0.90),
+            word_space_max: Some(1.0),
+            glyph_scale_min: Some(0.97),
+            glyph_scale_max: Some(1.02),
+            ..Default::default()
+        };
+        let (doc, story, _) = doc_with(&text, Rect::new(0.0, 0.0, 212.0, 700.0), para);
+        let composed = compose_story(&doc, story, &ComposeOptions::default());
+        let lines = all_lines(&composed);
+        assert!(!composed.is_overset() && lines.len() > 3);
+        assert!(lines.iter().step_by(2).any(|line| line.end_x > line.x1 - inset + 1.0), "long lines must use more of the column");
+        for (i, line) in lines.iter().enumerate() {
+            let target = if i.is_multiple_of(2) { line.x1 } else { line.x1 - inset };
+            assert!(line.end_x <= target + 0.5, "{rag_pattern:?} line {i} overflows: {} > {target}", line.end_x);
+            assert!((0.78 - 1e-6..=1.0 + 1e-6).contains(&line.spacing), "spacing went outside the selected limits");
+        }
+    }
+}
+
+#[test]
 fn small_frame_oversets() {
     let (d, sid, _) = doc_with(LOREM, Rect::new(0.0, 0.0, 200.0, 40.0), ParaAttrs::default());
     let cs = compose_story(&d, sid, &ComposeOptions::default());

@@ -373,6 +373,7 @@ fn paragraph_panel_menu(app: &mut DesignApp, ui: &mut Ui, p: &Value) {
     ui.separator();
     for (label, id) in [
         ("Justification…", "app.justificationDialog"),
+        (crate::paragraph_rag::LABEL, crate::paragraph_rag::COMMAND),
         ("Keep Options…", "app.keepOptionsDialog"),
         ("Span Columns…", "app.spanColumnsDialog"),
         ("Hyphenation…", "app.hyphenationDialog"),

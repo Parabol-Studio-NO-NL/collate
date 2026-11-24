@@ -2271,6 +2271,7 @@ pub(super) const TABLE: &[(&str, &str)] = &[
     ("Balance Columns", "Balansera spalter"),
     ("Digits:", "Siffror:"),
     ("Justification…", "Justering…"),
+    ("Justification and Rag…", "Justering och ojämn kant…"),
     ("Apply To:", "Använd på:"),
     ("Frame", "Ram"),
     ("Filters:", "Filter:"),

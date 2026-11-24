@@ -28,6 +28,7 @@ append_paths() {
         sed -n '1,200s/^/    /p; 201s/.*/    [file list truncated]/p' >> "$report"
 }
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 revision_file=tools/fork/upstream-revision
 merge_args=(--write-tree)
 parents=(-p "$main" -p "$upstream")
@@ -94,6 +95,28 @@ merged_guarded=$(git diff --name-only --no-renames "$main" "$tree" -- "${automat
 if [[ -n "$merged_guarded" ]]; then
     write_status blocked 'The result changes a guarded path and requires review before push.'
     append_paths 'Guarded paths requiring review' "$main" "$tree" -- "${automation_paths[@]}"
+    exit 1
+fi
+
+# The intersection includes fork-only files that a clean directory rename or
+# a merge driver would move or modify, including files added after this tool.
+# Git quotes unusual filenames consistently so each path sorts on one line.
+git -c core.quotePath=true diff --no-renames --name-only "$main" "$tree" -- |
+    LC_ALL=C sort > "$output/changed-paths"
+while IFS= read -r base; do
+    git -c core.quotePath=true diff --no-renames --name-only --diff-filter=A "$base" "$main" -- |
+        LC_ALL=C sort > "$output/fork-added-paths"
+    LC_ALL=C comm -12 "$output/changed-paths" "$output/fork-added-paths" > "$output/changed-fork-files"
+    if [[ -s "$output/changed-fork-files" ]]; then
+        write_status blocked 'The merge changes files added by Collate since the upstream base. Preserve the fork changes when adapting this import.'
+        sed 's/^/    /' "$output/changed-fork-files" >> "$report"
+        exit 1
+    fi
+done <<< "$bases"
+
+if ! bash "$script_dir/check-protected-patches.sh" "$main" "$tree" > "$output/patches.txt" 2>&1; then
+    write_status blocked 'The merge would change a Collate module or lose a protected integration point. Restore the feature when adapting this import.'
+    sed 's/^/    /' "$output/patches.txt" >> "$report"
     exit 1
 fi
 

@@ -30,6 +30,7 @@ pub mod package_dialog;
 mod page_history;
 mod panel_docking;
 pub mod panels;
+mod paragraph_rag;
 mod preflight_worker;
 mod prefs;
 pub mod render_worker;

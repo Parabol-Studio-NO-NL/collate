@@ -25,6 +25,28 @@ upstream brand directory without pushing a branch. An identical revision pair re
 its existing pull request, including a closed one. If only the push succeeded, a retry
 reuses that exact branch. A later revision or a new Collate base gets its own PR.
 
+## Keeping Collate patches through an import
+
+The planner compares the merged tree with Collate `main`. Any change to a file added
+by Collate since the recorded upstream base blocks publication, including a clean Git
+merge into that file. This covers new fork files automatically. A change already
+made on Collate `main` becomes the version the next import preserves.
+
+The [patch inventory](../../tools/fork/protected-patches) also protects modules
+that both projects carry, plus the hooks and regression tests in shared files.
+A path alone reserves the entire file or directory. A path followed by a tab and a
+literal requires that entry in the file. For example, the Paragraph menu must still
+call the Collate rag command. Other menu edits can merge independently. Register
+new shared hooks alongside tests that exercise them through the UI or engine.
+When intentionally moving a hook on the fork, update its entry and behaviour test in
+the same change.
+
+The workspace check validates these entries in the actual PR checkout. For sync
+PRs, it also compares the protected modules against the exact base of GitHub's test
+merge. The Rust tests exercise the features, including text composition, undo,
+sharing and the Info panel. A missing hook or a changed module identifies its path
+in the sync report so the import can be repaired on its review branch.
+
 ## GitHub setup
 
 1. Register a GitHub App for Collate sync and install it on this repository alone.

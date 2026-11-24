@@ -120,7 +120,7 @@ mod tabs;
 
 pub use enums::{
     Align, Capitalization, ChangeMark, Composer, Digits, GrepStyle, GridAlign, Kerning, Leading, NestedLineStyle, NestedStyle, NestedUntil, Position,
-    SpanColumns, StartParagraph, TextDirection,
+    RagPattern, SpanColumns, StartParagraph, TextDirection,
 };
 pub use language::{capitalizes, language_subtag, language_tag};
 use rules_lists::list_level_index;

@@ -1,7 +1,7 @@
 use std::{thread, time::Duration};
 
 use designcraft_collab::{CommentAnchor, Operation, SharedId};
-use designcraft_doc::{Align, Document, ItemId, LayerId, StoryId, build::NewDocument};
+use designcraft_doc::{Align, Document, ItemId, LayerId, RagPattern, StoryId, build::NewDocument};
 use designcraft_engine::{DocState, Session};
 use serde_json::json;
 use web_time::Instant;
@@ -1193,6 +1193,23 @@ fn shared_paragraph_formatting_preserves_concurrent_text_in_threaded_frames() {
     wait_for(&mut [&mut host, &mut guest], "replaced break inherits the preceding style", |apps| apps.iter().all(|app| room(app).revision == 7));
     assert_eq!(document(&guest).story(story_id).unwrap().paras[1].style, "Heading");
     assert_eq!(document(&host), document(&guest));
+
+    // Both writers start from the same revision. Undoing one field must preserve the other.
+    host.run("text.select", json!({"story": story, "anchor": 0})).unwrap();
+    guest.run("text.select", json!({"story": story, "anchor": 0})).unwrap();
+    host.run("type.para", json!({"attrs": {"ragPattern": "stepped"}})).unwrap();
+    guest.run("type.para", json!({"attrs": {"ragInset": 12.0}})).unwrap();
+    wait_for(&mut [&mut host, &mut guest], "rag edits converge", |apps| apps.iter().all(|app| room(app).revision == 9));
+    for (command, revision, pattern) in [("edit.undo", 10, None), ("edit.redo", 11, Some(RagPattern::Stepped))] {
+        assert_eq!(document(&host), document(&guest));
+        host.run(command, json!({})).unwrap();
+        wait_for(&mut [&mut host, &mut guest], command, |apps| apps.iter().all(|app| room(app).revision == revision));
+        for app in [&host, &guest] {
+            let attrs = &document(app).story(story_id).unwrap().paras[0].para;
+            assert_eq!(attrs.rag_pattern, pattern);
+            assert_eq!(attrs.rag_inset, Some(12.0));
+        }
+    }
     let confirmed = room(&host).history.iter().map(|(commit, _)| commit.clone()).collect();
     let recovered = super::replay::restore(&seed, &seed, confirmed).unwrap();
     assert_eq!(&recovered.document, document(&host));

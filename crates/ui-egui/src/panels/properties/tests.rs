@@ -427,6 +427,20 @@ fn paragraph_panel_menu_toggles_ignore_optical_margin() {
 }
 
 #[test]
+fn paragraph_panel_menu_opens_justification_and_rag_for_selected_text() {
+    let mut h = panel_harness(text_app(), paragraph_panel);
+    h.run_steps(3);
+    h.get_by_label("☰").click();
+    h.run_steps(3);
+    let _ = h.get_by_label_contains("Justification…");
+    h.get_by_label("Justification and Rag…").click();
+    h.run_steps(3);
+    let dialog = h.state().ui.dialog.as_ref().unwrap();
+    assert_eq!(dialog.id, "paragraphRag");
+    assert_eq!(dialog.fields["current"]["ragPattern"], "none");
+}
+
+#[test]
 fn paragraph_panel_menu_define_lists_opens_its_dialog() {
     let mut h = panel_harness(text_app(), paragraph_panel);
     h.run_steps(3);
