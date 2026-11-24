@@ -34,7 +34,7 @@ Use the same checkout and Cargo target directory for day-to-day work. The develo
 
 ```sh
 python3 tools/fork/build.py build -p designcraft
-python3 tools/fork/build.py test -p designcraft-collab-core
+python3 tools/fork/build.py test -p designcraft-collab-core --features native
 ./target/debug/designcraft
 ```
 
