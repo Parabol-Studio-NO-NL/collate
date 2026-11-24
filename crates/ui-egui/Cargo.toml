@@ -57,11 +57,11 @@ craft-dialogs = { workspace = true }
 raw-window-handle = { workspace = true }
 designcraft-collab = { path = "../designcraft-collab" }
 designcraft-collab-core = { path = "../collab-core", features = ["native"] }
-base64 = "0.22"
+base64 = "0.23"
 designcraft-format = { workspace = true }
 craft-image-codecs = { workspace = true }
 craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "33be35625e252cc4f06aa375b3b428521faea37d", version = "=0.1.0" }
-sha2 = "0.10"
+sha2 = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies.designcraft-collab-core]
 path = "../collab-core"

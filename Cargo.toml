@@ -75,13 +75,13 @@ unicode-bidi-mirroring = "0.4"
 unicode-segmentation = "1"
 caseless = "0.2"
 regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"] }
-fancy-regex = "0.19.2"
+fancy-regex = "0.20.2"
 tempfile = "3"
 same-file = "1.0.6"
 
 # text / rendering / formats
-skrifa = "0.47"
-harfrust = "0.13"
+skrifa = "0.50"
+harfrust = "0.16"
 vello_cpu = "0.2"
 vello_common = { version = "0.2", default-features = false }
 # Decoded image buffers become pixmap pixels without a copy; the version vello_common uses.
@@ -93,8 +93,8 @@ tiff = "0.11"
 flo_curves = "0.8"
 # QR codes (Object › Generate QR Code); MIT.
 qrcodegen = "1.8"
-quick-xml = "0.41"
-zip = { version = "3", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # Which paths stored in documents may be followed (craft-libs).
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "33be35625e252cc4f06aa375b3b428521faea37d" }
 # Atomic file replacement for saves and exports (craft-libs).
@@ -117,7 +117,7 @@ eframe = { version = "0.37", default-features = false }
 egui_kittest = "0.37"
 # Monotonic clock on native and web (`Instant`); screenshot settlement must not use wall time.
 web-time = "1"
-rfd = "0.17"
+rfd = "0.18"
 # Native file and message dialogs that never block the event loop (craft-libs).
 craft-dialogs = { git = "https://github.com/storytold/craft-libs", rev = "33be35625e252cc4f06aa375b3b428521faea37d" }
 raw-window-handle = "0.6"
