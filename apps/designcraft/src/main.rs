@@ -86,6 +86,9 @@ impl eframe::App for App {
             }
             #[cfg(target_os = "macos")]
             {
+                if self.app.mac_home_leading.is_none() {
+                    self.app.mac_home_leading = mac_home_leading();
+                }
                 if self.menu.is_none() && std::env::var_os("DESIGNCRAFT_NO_NATIVE_MENU").is_none() {
                     self.menu = Some(native_menu::NativeMenu::install(&mut self.app, ui.ctx()));
                 }
@@ -117,6 +120,22 @@ impl eframe::App for App {
         }
         save_prefs(&self.app);
     }
+}
+
+/// Position Home one native button gap beyond the macOS traffic lights.
+#[cfg(target_os = "macos")]
+fn mac_home_leading() -> Option<f32> {
+    use objc2_app_kit::{NSApplication, NSWindowButton};
+
+    let window = NSApplication::sharedApplication(objc2::MainThreadMarker::new()?).mainWindow()?;
+    let frame = |kind| {
+        let button = window.standardWindowButton(kind)?;
+        Some(button.convertRect_toView(button.bounds(), None))
+    };
+    let yellow = frame(NSWindowButton::MiniaturizeButton)?;
+    let green = frame(NSWindowButton::ZoomButton)?;
+    let gap = green.origin.x - (yellow.origin.x + yellow.size.width);
+    (gap > 0.0 && green.size.width > 0.0).then_some((green.origin.x + green.size.width + gap) as f32)
 }
 
 /// Tell the macOS input method to drop its composition (the Type tool kept the marked text as

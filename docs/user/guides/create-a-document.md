@@ -36,7 +36,7 @@ The start screen also shows a tile for each print preset under **Start a new doc
 
 ## See a finished layout
 
-Click **Open sample magazine** on the start screen. It opens a magazine with a cover, styled pages, threaded columns, text wrap and swatches, which is a good way to see what DesignCraft can do.
+Choose **Help > Sample Document** to open a magazine with a cover, styled pages, threaded columns, text wrap and swatches.
 
 ## Next
 

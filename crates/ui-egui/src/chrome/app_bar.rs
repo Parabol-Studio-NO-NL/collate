@@ -2,6 +2,10 @@ use super::{
     APP_BAR, APP_BAR_BAND, Color32, DesignApp, MAC_APP_BAR, MAC_CONTENT_LEFT, SEPARATOR, Sense, Stroke, Tokens, icons, json, semibold, vec2,
 };
 
+const TOOL_HEIGHT: f32 = 24.0;
+const TOOL_PADDING: i8 = 6;
+const SEARCH_ICON: f32 = 14.0;
+
 pub(super) fn search_id() -> egui::Id {
     egui::Id::unique("app_bar_search")
 }
@@ -31,9 +35,6 @@ fn search_field(app: &mut DesignApp, ui: &mut egui::Ui) {
     let id = search_id();
     let state_id = id.with("state");
     let mut st: SearchState = ui.data(|d| d.get_temp(state_id)).unwrap_or_default();
-    let (r, _) = ui.allocate_exact_size(vec2(125.0, 18.0), Sense::hover());
-    ui.painter().rect(r, 1.0, t.input, Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
-    icons::paint(ui.painter(), egui::Rect::from_min_size(r.min + vec2(3.0, 2.0), vec2(14.0, 14.0)), "search", t.icon);
     let focused = ui.memory(|m| m.has_focus(id));
     let had_focus = search_had_focus(ui.ctx());
     if !focused && !had_focus {
@@ -54,23 +55,32 @@ fn search_field(app: &mut DesignApp, ui: &mut egui::Ui) {
     };
     let lang = app.ui.language.clone();
     let hint = crate::rtl::widget(ui, egui::RichText::new(crate::i18n::tr(&lang, "Search")).color(t.text_dim));
-    let field = egui::Rect::from_min_max(r.min + vec2(19.0, 0.0), r.max - vec2(3.0, 0.0));
+    let frame = egui::Frame::NONE
+        .fill(t.input)
+        .stroke(Stroke::new(1.0, if focused { ui.visuals().selection.stroke.color } else { t.field_border }))
+        .corner_radius(1)
+        .inner_margin(egui::Margin { left: TOOL_PADDING + SEARCH_ICON as i8 + 4, right: TOOL_PADDING, top: 0, bottom: 0 });
+    let search_label = crate::i18n::tr(&lang, "Search commands");
     let resp = ui
-        .put(
-            field,
+        .add(
             egui::TextEdit::singleline(&mut st.query)
                 .id(id)
-                .frame(egui::Frame::NONE)
-                .margin(egui::Margin::ZERO)
+                .frame(frame)
                 .font(egui::FontId::proportional(11.0))
                 .text_color(t.text)
                 .hint_text(hint)
-                .desired_width(field.width())
+                .min_size(vec2(125.0, TOOL_HEIGHT))
+                .desired_width(125.0)
                 .align(egui::Align2::LEFT_CENTER)
                 // Return runs the highlighted match instead of leaving the field.
                 .return_key(None),
         )
-        .on_hover_text(crate::i18n::tr(&lang, "Search commands"));
+        .on_hover_text(search_label);
+    ui.ctx().accesskit_node_builder(id, |node| node.set_label(search_label));
+    let r = resp.rect;
+    let icon =
+        egui::Rect::from_min_size(egui::pos2(r.left() + f32::from(TOOL_PADDING), r.center().y - SEARCH_ICON / 2.0), egui::Vec2::splat(SEARCH_ICON));
+    icons::paint(ui.painter(), icon, "search", t.icon);
     if resp.changed() {
         st.highlight = 0;
         st.open = true;
@@ -156,7 +166,7 @@ fn tools_slot_width(available: f32, tools_w: f32) -> f32 {
 pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let mac = app.integrated_titlebar;
-    let left = if mac { MAC_CONTENT_LEFT as i8 } else { 8 };
+    let left = if mac { 0 } else { 8 };
     let bar = if mac { MAC_APP_BAR } else { APP_BAR };
     // The tallest control keeps a margin above and below it in the shorter macOS bar.
     let home = if mac { 22.0 } else { 24.0 };
@@ -214,7 +224,10 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                     caption_buttons(app, ui);
                 });
             }
-            let scrolled = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x - caption_w, full.max.y));
+            // Native buttons stay in AppKit points even when the editor's interface zoom changes.
+            // Reserve them outside the scroll area so scrolling cannot move Home underneath them.
+            let native_inset = if mac { app.mac_home_leading.unwrap_or(MAC_CONTENT_LEFT) / ui.ctx().zoom_factor() } else { 0.0 };
+            let scrolled = egui::Rect::from_min_max(full.min + vec2(native_inset, 0.0), egui::pos2(full.max.x - caption_w, full.max.y));
             ui.scope_builder(egui::UiBuilder::new().max_rect(scrolled), |ui| {
                 // The right-hand controls' width, measured last frame: in a window too narrow for them
                 // and the menus they follow the menus, and the bar scrolls sideways.
@@ -240,9 +253,9 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                         ui.data_mut(|d| d.insert_temp(egui::Id::unique("app_bar_menus_end"), menus_end));
                         let size = vec2(tools_slot_width(ui.available_width(), tools_w), ui.available_height());
                         let tools = ui.allocate_ui_with_layout(size, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(4.0);
+                            ui.spacing_mut().interact_size.y = TOOL_HEIGHT;
+                            ui.spacing_mut().button_padding = vec2(f32::from(TOOL_PADDING), 2.0);
                             search_field(app, ui);
-                            ui.add_space(8.0);
                             let current = app.ui.workspace.clone();
                             let shown = crate::i18n::workspace_name(&app.ui.language, &current);
                             crate::menus::menu_button(
@@ -296,7 +309,6 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                             );
                             #[cfg(not(target_arch = "wasm32"))]
                             {
-                                ui.add_space(6.0);
                                 app.collaboration_button(ui);
                             }
                             tools_start = ui.min_rect().min.x;

@@ -91,6 +91,7 @@ fn take_keys(app: &mut DesignApp, input: &mut egui::InputState, typing: bool) ->
     let contexts: &[&str] = if typing { &[crate::keys::TEXT_CONTEXT] } else { &[] };
     let active = craft_keymap::Active { panel: None, contexts, typing };
     let native = &app.native_shortcuts;
+    let home = app.session.active().is_none();
     // Presses the dispatcher leaves alone: Clear (the active tool deletes) and the keys the
     // native menu's accelerators already handled. An item holds one key equivalent, its
     // command's first shortcut in effect, and fires only for it exactly: the Plus key standing
@@ -98,6 +99,12 @@ fn take_keys(app: &mut DesignApp, input: &mut egui::InputState, typing: bool) ->
     // Copy, Cut and Paste stay too (the dispatcher's default): the canvas and text tools
     // handle them, and Paste carries the text.
     let accept = |hit: &craft_keymap::egui::Hit| {
+        // Tab and Shift+Tab move focus between Home's actions. Toggling the panels here
+        // would rebuild Home under a different parent, losing the focused button.
+        let chord = hit.trigger.chord;
+        if home && chord.key == craft_keymap::Key::Tab && matches!(chord.mods, craft_keymap::Mods::NONE | craft_keymap::Mods::SHIFT) {
+            return false;
+        }
         let c = &hit.command;
         let on_bar =
             || c.params.is_null() && native.get(&c.id).and_then(|sc| craft_keymap::Binding::parse(sc).ok()).is_some_and(|b| b.trigger == hit.trigger);
