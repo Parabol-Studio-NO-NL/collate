@@ -1077,6 +1077,8 @@ fn tab_hides_panels_and_documents_cycle() {
         app.session.execute("file.new", &json!({})).unwrap();
     }
     let ctx = egui::Context::default();
+    // The startup frame installs fonts before the window starts reading keyboard input.
+    native_frame(&mut app, &ctx, vec![], None);
     press(&mut app, &ctx, egui::Key::Tab, egui::Modifiers::NONE);
     assert_eq!(app.ui.hidden_panels, 1, "Tab still hides panels when a document is open");
     press(&mut app, &ctx, egui::Key::Tab, egui::Modifiers::SHIFT);
