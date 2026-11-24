@@ -40,8 +40,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use designcraft_doc::{
-    Align, Content, Document, FirstBaseline, GridAlign, Item, ItemId, ListAlign, ListCounter, ParaProps, SpanColumns, StartParagraph, Story, StoryId,
-    TabAlign, TextFrameOptions, VerticalJustification, WrapMode, WrapSide, story,
+    Align, Content, Document, FirstBaseline, GridAlign, Item, ItemId, ListAlign, ListCounter, ParaProps, RagPattern, SpanColumns, StartParagraph,
+    Story, StoryId, TabAlign, TextFrameOptions, VerticalJustification, WrapMode, WrapSide, story,
 };
 use designcraft_fonts::{FontDb, ScopedFonts};
 use designcraft_geom::{Affine, Point, Rect};
@@ -1709,7 +1709,8 @@ fn apply_nested_line_styles(input: NestedLineStyleInput<'_, '_, '_>) {
                     _ if j == 0 => pp.first_line_indent,
                     _ => 0.0,
                 };
-                (col.width() - pp.left_indent - pp.right_indent - ind).max(1.0)
+                let measure = (col.width() - pp.left_indent - pp.right_indent - ind).max(1.0);
+                measure - rag_inset(pp, j, measure)
             };
             apply_desired_spacing(&mut gl, pp);
             mojikumi::apply(&mut gl, &doc.styles, &pp.mojikumi);
@@ -1721,7 +1722,7 @@ fn apply_nested_line_styles(input: NestedLineStyleInput<'_, '_, '_>) {
                     tab_advance(&pp.tabs, pp.left_indent, ind + x, gl.get(i + 1..).unwrap_or_default()).0
                 };
                 breaker::greedy(&gl, &hy, &spacing, &width, &tab)
-            } else if pp.balance_ragged && !spacing.justify {
+            } else if pp.balance_ragged && !spacing.justify && pp.rag_pattern == RagPattern::None {
                 breaker::balanced(&gl, &hy, &spacing, &width)
             } else {
                 breaker::knuth_plass(&gl, &hy, &spacing, &width)
@@ -2020,6 +2021,28 @@ struct BreakInput<'a> {
     spacing: &'a Spacing,
 }
 
+/// Bound the inset wherever wrapping or indents leave less room than the full column.
+/// Smaller slots keep all the measure they have.
+fn rag_inset(pp: &ParaProps, line_in_column: usize, measure: f64) -> f64 {
+    let inset_line = match pp.rag_pattern {
+        RagPattern::None => false,
+        RagPattern::Natural | RagPattern::Stepped => !line_in_column.is_multiple_of(2),
+        RagPattern::AlternatingEdges => true,
+    };
+    if inset_line && pp.rag_inset.is_finite() { pp.rag_inset.clamp(0.0, (measure - 12.0).max(0.0)) } else { 0.0 }
+}
+
+fn rag_line_bounds(pp: &ParaProps, line_in_column: usize, x0: f64, x1: f64, left_page: bool) -> (f64, f64, Align) {
+    let inset = rag_inset(pp, line_in_column, x1 - x0);
+    match pp.rag_pattern {
+        RagPattern::None => (x0, x1, page_alignment(pp.align, left_page)),
+        RagPattern::Natural => (x0, x1 - inset, Align::Left),
+        RagPattern::Stepped => (x0, x1 - inset, Align::LeftJustified),
+        RagPattern::AlternatingEdges if !line_in_column.is_multiple_of(2) => (x0 + inset, x1, Align::Right),
+        RagPattern::AlternatingEdges => (x0, x1 - inset, Align::Left),
+    }
+}
+
 fn choose_paragraph_breaks(input: BreakInput<'_>) -> Vec<Break> {
     let BreakInput { glyphs, hyphens, props: pp, slots, column: col, drop_cap, line_no, col_first_line, rtl, has_tabs, spacing } = input;
     let width = |j: usize| -> f64 {
@@ -2031,7 +2054,8 @@ fn choose_paragraph_breaks(input: BreakInput<'_>) -> Vec<Break> {
                 _ if line_no + j == 0 => pp.first_line_indent,
                 _ => 0.0,
             };
-        (x1 - x0 - indent).max(1.0)
+        let measure = (x1 - x0 - indent).max(1.0);
+        measure - rag_inset(pp, line_no + j - col_first_line, measure)
     };
     if pp.composer.single_line() || has_tabs || glyphs.len() > 4000 {
         let tab = |j: usize, x: f64, i: usize| {
@@ -2051,7 +2075,7 @@ fn choose_paragraph_breaks(input: BreakInput<'_>) -> Vec<Break> {
             tab_advance(&pp.tabs, pp.left_indent, x0 + indent + x - col.x0, glyphs.get(i + 1..).unwrap_or_default()).0
         };
         breaker::greedy(glyphs, hyphens, spacing, &width, &tab)
-    } else if pp.balance_ragged && !spacing.justify {
+    } else if pp.balance_ragged && !spacing.justify && pp.rag_pattern == RagPattern::None {
         breaker::balanced(glyphs, hyphens, spacing, &width)
     } else {
         breaker::knuth_plass(glyphs, hyphens, spacing, &width)
@@ -2592,8 +2616,8 @@ fn place_paragraph_lines(shared: PlacementShared<'_, '_>, paragraph: ParagraphLi
                 None if rtl => (pp.left_indent, pp.right_indent + first_line),
                 None => (pp.left_indent + first_line, pp.right_indent),
             };
-            let lx0 = x0 + ind_l;
-            let lx1 = x1 - ind_r;
+            let line_in_column = line_no - col_first_line;
+            let (lx0, lx1, align) = rag_line_bounds(pp, line_in_column, x0 + ind_l, x1 - ind_r, f.left_page);
             let last = k + 1 == breaks.len();
             // The break character that ends this line, if any (it is the line's last glyph).
             let brk =
@@ -2603,7 +2627,7 @@ fn place_paragraph_lines(shared: PlacementShared<'_, '_>, paragraph: ParagraphLi
             let ends_para = last || brk.is_some_and(story::is_break_char);
             let forced_mid = brk == Some(story::FORCED_LINE_BREAK) && !last;
             let (mut placed, end_x, ratio) =
-                layout_line(glyphs, s, e, b.hyphen, lx0, lx1, col.x0, pp, spacing, ends_para, forced_mid, f.left_page, bidi_info);
+                layout_line(glyphs, s, e, b.hyphen, lx0, lx1, col.x0, pp, spacing, ends_para, forced_mid, align, bidi_info);
             let end_x = if line_no == 0 && s == 0 { align_label(&mut placed, label_aligned, label_tab, list_align, end_x) } else { end_x };
             // Warichu runs before ruby so a reading is placed over the stacked note, and before
             // the trimmed spaces and the drop cap join the line, so neither is stacked.
@@ -3964,8 +3988,14 @@ fn optical_for(pp: &ParaProps, story: &Story) -> (bool, Option<f64>) {
 /// its 禁則 priority applies).
 fn spacing_for(pp: &ParaProps, base_size: f64, story: &Story, cjk: bool) -> Spacing {
     let (optical, optical_size) = optical_for(pp, story);
+    let justify = match pp.rag_pattern {
+        RagPattern::None => pp.align.is_justified(),
+        RagPattern::Stepped => true,
+        RagPattern::Natural | RagPattern::AlternatingEdges => false,
+    };
     Spacing {
-        justify: pp.align.is_justified(),
+        justify,
+        rag_pattern: pp.rag_pattern,
         word_min: pp.word_space_min,
         word_desired: pp.word_space_desired,
         word_max: pp.word_space_max,
@@ -3980,7 +4010,7 @@ fn spacing_for(pp: &ParaProps, base_size: f64, story: &Story, cjk: bool) -> Spac
         ragged_stretch: base_size * 2.0,
         // The zone is the Single-line Composer's (unjustified text only), as in InDesign: the
         // Paragraph Composer weighs every break of the paragraph instead.
-        hyph_zone: if pp.align.is_justified() || !pp.composer.single_line() { 0.0 } else { pp.hyph_zone },
+        hyph_zone: if justify || !pp.composer.single_line() { 0.0 } else { pp.hyph_zone },
         optical,
         optical_size,
         korean_char_breaks: pp.korean_char_breaks,
@@ -5224,7 +5254,7 @@ fn layout_line(
     sp: &Spacing,
     last: bool,
     forced_mid: bool,
-    left_page: bool,
+    align: Align,
     bidi_info: &unicode_bidi::BidiInfo<'_>,
 ) -> (Vec<PlacedGlyph>, f64, f64) {
     let mut line: Vec<Glyph> = glyphs[s..e.max(s)].to_vec();
@@ -5268,23 +5298,24 @@ fn layout_line(
     let seg_justifies = last_tab.is_none_or(|(_, left)| left);
     // Spaces inside a jidori run keep the run's fitted width, as in the breaker.
     let spaces: Vec<usize> = line.iter().enumerate().skip(seg).filter(|(_, g)| g.is_justify_space() && !g.locked_advance).map(|(i, _)| i).collect();
-    let align = page_alignment(pp.align, left_page);
     let justify_this = align.is_justified() && (!last || align == Align::FullyJustified || forced_mid) && seg_justifies;
-    // A justified paragraph's last line may have been composed with shrunk spaces: shrink it too.
-    let squeeze_last = !justify_this
+    // A line can have been composed with shrink even when it is not justified.
+    let squeeze = !justify_this
         && seg_justifies
         && extra < 0.0
-        && (align.is_justified() || line.iter().any(|g| g.moji.shrink > 0.0 || mojikumi::start_elastic(g, false, true)[1] > 0.0));
+        && (align.is_justified()
+            || sp.rag_pattern != RagPattern::None
+            || line.iter().any(|g| g.moji.shrink > 0.0 || mojikumi::start_elastic(g, false, true)[1] > 0.0));
     // Extra advance per glyph (word spaces and letter gaps) and horizontal scale per glyph.
     let mut add = vec![0.0; line.len()];
     let mut scale = vec![1.0; line.len()];
     let mut offset = 0.0;
     // Kashidas: in justified Arabic, the joins of words take the extra length first.
     let kashidas = if justify_this { allocate_kashidas(&line, &mut add, pp, seg, &mut extra) } else { Vec::new() };
-    if (justify_this || squeeze_last) && (extra >= 0.0 || !sp.push_out_only()) {
+    if (justify_this || squeeze) && (extra >= 0.0 || !sp.push_out_only()) {
         extra = mojikumi::distribute(line.get_mut(seg..).unwrap_or_default(), extra, add.get_mut(seg..).unwrap_or_default());
     }
-    if (justify_this || squeeze_last) && !spaces.is_empty() {
+    if (justify_this || squeeze) && (!spaces.is_empty() || sp.rag_pattern != RagPattern::None) {
         let rebased: Vec<usize> = spaces.iter().map(|&i| i - seg).collect();
         let (seg_line, seg_add, seg_scale) =
             (line.get(seg..).unwrap_or(&[]), add.get_mut(seg..).unwrap_or(&mut []), scale.get_mut(seg..).unwrap_or(&mut []));
@@ -5340,6 +5371,10 @@ fn layout_line(
         if offset < 0.0 {
             offset = 0.0;
         }
+    }
+    if squeeze && sp.rag_pattern == RagPattern::AlternatingEdges && align == Align::Right {
+        let width = line.iter().zip(&add).zip(&scale).map(|((g, a), s)| g.adv * s + a).sum::<f64>();
+        offset = (measure - width).max(0.0);
     }
     let ratio = word_space_ratio(&line, &add, &spaces);
     let mut out = Vec::with_capacity(line.len());
@@ -5571,7 +5606,7 @@ fn distribute(line: &[Glyph], spaces: &[usize], extra: f64, sp: &Spacing, add: &
     // overlap glyphs), so an overfull line stays overfull.
     let elastic = spaces.iter().filter(|&&i| line[i].is_word_space()).count();
     let gaps = line.iter().enumerate().filter(|&(i, g)| is_box(i, g)).count();
-    let (over, over_gap) = match (stretch && rem > 0.0, elastic, gaps) {
+    let (over, over_gap) = match (stretch && rem > 0.0 && sp.rag_pattern == RagPattern::None, elastic, gaps) {
         (false, _, _) => (0.0, 0.0),
         (true, 0, 0) => (0.0, 0.0),
         (true, 0, n) => (0.0, rem / n as f64),

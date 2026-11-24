@@ -186,7 +186,7 @@ pub fn menu_enabled(app: &DesignApp, id: &str) -> bool {
     if is_window_control(id) {
         return window_control_available(app, id);
     }
-    if matches!(id, "app.justificationDialog" | "app.hyphenationDialog") {
+    if matches!(id, "app.justificationDialog" | crate::paragraph_rag::COMMAND | "app.hyphenationDialog") {
         return enabled(app, "type.para");
     }
     if matches!(id, "app.cellOptionsDialog" | "app.diagonalLinesDialog") {

@@ -205,6 +205,17 @@ impl Composer {
     }
 }
 
+/// A repeating line pattern within each column of a paragraph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RagPattern {
+    #[default]
+    None,
+    Natural,
+    Stepped,
+    AlternatingEdges,
+}
+
 /// What a nested style runs to (Drop Caps and Nested Styles).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind", content = "chars")]

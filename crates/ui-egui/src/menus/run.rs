@@ -513,7 +513,7 @@ fn run_ui_part2(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
             app.ui.dialog = Some(crate::dialogs::Dialog::new("hyphenation", json!({"current": current})));
             Ok(Value::Null)
         }
-        "app.justificationDialog" => {
+        "app.justificationDialog" | crate::paragraph_rag::COMMAND => {
             let Some(a) = app.session.execute("type.selectionAttrs", &json!({"mixed": true})).ok().filter(|a| !a.is_null()) else {
                 return Some(Err("select text or a text frame".into()));
             };
@@ -522,7 +522,8 @@ fn run_ui_part2(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
                 .iter()
                 .map(|k| (k.to_string(), if mixed.contains(k) { Value::Null } else { a["para"][*k].clone() }))
                 .collect();
-            app.ui.dialog = Some(crate::dialogs::Dialog::new("justification", json!({"current": current})));
+            let dialog = if id == crate::paragraph_rag::COMMAND { "paragraphRag" } else { "justification" };
+            app.ui.dialog = Some(crate::dialogs::Dialog::new(dialog, json!({"current": current})));
             Ok(Value::Null)
         }
         "app.footnoteOptionsDialog" => {

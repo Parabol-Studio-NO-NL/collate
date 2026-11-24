@@ -3306,6 +3306,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                 _ => "Paragraph Borders and Shading",
             },
         ),
+        "paragraphRag" => crate::i18n::tr(&app.ui.language, crate::paragraph_rag::LABEL).trim_end_matches('…'),
         "justification" => crate::i18n::tr(&app.ui.language, "Justification"),
         "hyphenation" => crate::i18n::tr(&app.ui.language, "Hyphenation Settings"),
         "insertXref" => crate::i18n::tr(&app.ui.language, "New Cross-Reference"),
@@ -3683,9 +3684,10 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                         paragraph_rules(app, ui, &mut d, "", &current);
                     }
                     "paragraphLocal" => paragraph_local(app, ui, &mut d),
-                    "justification" => {
+                    "justification" | "paragraphRag" => {
                         let current = d.fields.get("current").cloned().unwrap_or_default();
-                        justification(&app.ui.language, ui, &mut d, "", &current);
+                        let units = app.session.active().map_or(Unit::Picas, |st| st.doc.settings.horizontal_units);
+                        justification(&app.ui.language, ui, &mut d, "", &current, units);
                     }
                     "hyphenation" => {
                         let current = d.fields.get("current").cloned().unwrap_or_default();
@@ -5133,7 +5135,7 @@ fn confirm_part2(app: &mut DesignApp, d: Dialog) -> Result<Value, String> {
                 app.ui.dialog = Some(d);
             })
         }
-        "justification" => {
+        "justification" | "paragraphRag" => {
             let current = d.fields.get("current").cloned().unwrap_or_default();
             if let Err(e) = check_justification(&d, "", &current) {
                 // The dialog stays open to be corrected.
@@ -5147,7 +5149,11 @@ fn confirm_part2(app: &mut DesignApp, d: Dialog) -> Result<Value, String> {
             if attrs.is_empty() {
                 return Ok(Value::Null);
             }
-            app.run("type.para", json!({"attrs": attrs}))
+            app.run("type.para", json!({"attrs": attrs})).inspect_err(|e| {
+                let mut d = d;
+                d.fields.insert("justifyError".into(), json!(e));
+                app.ui.dialog = Some(d);
+            })
         }
         "paragraphRules" => {
             let attrs = rule_edits(&d, "");
@@ -6206,7 +6212,7 @@ fn paragraph_style_options(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialo
             "tabs" => style_tabs(&app.ui.language, ui, d, &pv, &doc),
             "rules" => paragraph_rules(app, ui, d, "p.", &pv),
             "hyph" => hyphenation(&app.ui.language, ui, d, "p.", &pv, units),
-            "justify" => justification(&app.ui.language, ui, d, "p.", &pv),
+            "justify" => justification(&app.ui.language, ui, d, "p.", &pv, units),
             "color" => character_color(&app.ui.language, ui, d, &CharFields { base: &cv, sparse: false }, &doc),
             "advanced" => advanced_character_formats(&app.ui.language, ui, d, &CharFields { base: &cv, sparse: false }),
             "openType" => open_type_features(&app.ui.language, ui, d, &CharFields { base: &cv, sparse: false }),
@@ -8335,7 +8341,7 @@ fn shown_rule(d: &Dialog, prefix: &str, which: &str, current: &Value) -> Value {
 }
 
 /// The paragraph attributes of the Justification controls.
-pub const JUSTIFY_ATTRS: [&str; 14] = [
+pub const JUSTIFY_ATTRS: [&str; 16] = [
     "wordSpaceMin",
     "wordSpaceDesired",
     "wordSpaceMax",
@@ -8348,6 +8354,8 @@ pub const JUSTIFY_ATTRS: [&str; 14] = [
     "autoLeading",
     "singleWordJustify",
     "composer",
+    "ragPattern",
+    "ragInset",
     "kashidas",
     "koreanCharBreaks",
 ];
@@ -8376,6 +8384,7 @@ const SINGLE_WORD_CHOICES: [(&str, &str); 4] =
 /// (values left mixed are not compared); an edited Auto Leading within its range, and an edited
 /// Single Word Justification one of its choices.
 fn check_justification(d: &Dialog, prefix: &str, current: &Value) -> Result<(), String> {
+    crate::paragraph_rag::validate(d, prefix)?;
     if let Some(v) = d.fields.get(&format!("{prefix}autoLeading")) {
         let (lo, hi) = AUTO_LEADING_RANGE;
         let pct = v.as_f64().map(|x| x * 100.0).filter(|x| x.is_finite()).ok_or("Justification: Auto Leading is not a number")?;
@@ -8571,7 +8580,7 @@ const PREVIEW_FAILED: &str = "previewFailed";
 /// `current` holds the resolved paragraph attributes, `null` where the selected paragraphs differ
 /// (the field shows empty); each edit is stored as `{prefix}{attr}`, so OK changes only the fields
 /// edited.
-fn justification(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, prefix: &str, current: &Value) {
+fn justification(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, prefix: &str, current: &Value, units: Unit) {
     let cur = |d: &Dialog, k: &str| d.fields.get(&format!("{prefix}{k}")).cloned().unwrap_or_else(|| current[k].clone());
     // The spacing table keeps its own grid: its columns are only as wide as the percent fields.
     // The rows below (a wide menu, composer buttons, long checkboxes) sit outside it, so they
@@ -8637,6 +8646,9 @@ fn justification(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, prefix: &str, cu
             d.fields.insert(format!("{prefix}composer"), json!(single_line));
         }
     });
+    if d.id != "justification" {
+        crate::paragraph_rag::show(lang, ui, d, prefix, current, units);
+    }
     for (label, key, text, default) in [
         ("Insert Kashidas:", "kashidas", "In justified Arabic text", true),
         ("Korean Line Breaks:", "koreanCharBreaks", "Between syllables (not only at spaces)", false),
@@ -8652,7 +8664,7 @@ fn justification(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, prefix: &str, cu
     }
     if let Some(e) = d.fields.get("justifyError").and_then(Value::as_str) {
         ui.add_space(6.0);
-        crate::rtl::label(ui, egui::RichText::new(e).color(ui.visuals().error_fg_color));
+        crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(lang, e)).color(ui.visuals().error_fg_color));
     }
 }
 

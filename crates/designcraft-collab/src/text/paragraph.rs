@@ -1,4 +1,4 @@
-use designcraft_doc::{Align, BASIC_PARAGRAPH, MAX_MEASURE, ParaAttrs, ParaFormat, Styles};
+use designcraft_doc::{Align, BASIC_PARAGRAPH, MAX_MEASURE, ParaAttrs, ParaFormat, RagPattern, Styles};
 use serde::{Deserialize, Serialize};
 
 use super::{Error, validate_format_name};
@@ -15,6 +15,8 @@ pub(super) struct ParagraphFormat {
     space_before: Option<f64>,
     space_after: Option<f64>,
     hyphenate: Option<bool>,
+    rag_pattern: Option<RagPattern>,
+    rag_inset: Option<f64>,
 }
 
 impl ParagraphFormat {
@@ -30,6 +32,8 @@ impl ParagraphFormat {
             space_before: attrs.space_before,
             space_after: attrs.space_after,
             hyphenate: attrs.hyphenate,
+            rag_pattern: attrs.rag_pattern,
+            rag_inset: attrs.rag_inset,
         };
         resolve_style(styles, &shared.style)?;
         for change in [
@@ -39,6 +43,7 @@ impl ParagraphFormat {
             ParagraphFormatChange::LastLineIndent(shared.last_line_indent),
             ParagraphFormatChange::SpaceBefore(shared.space_before),
             ParagraphFormatChange::SpaceAfter(shared.space_after),
+            ParagraphFormatChange::RagInset(shared.rag_inset),
         ] {
             change.validate(styles)?;
         }
@@ -60,6 +65,8 @@ impl ParagraphFormat {
                 space_before: self.space_before,
                 space_after: self.space_after,
                 hyphenate: self.hyphenate,
+                rag_pattern: self.rag_pattern,
+                rag_inset: self.rag_inset,
                 ..Default::default()
             },
             chars: Default::default(),
@@ -78,6 +85,8 @@ impl ParagraphFormat {
             (self.space_before != before.space_before).then_some(ParagraphFormatChange::SpaceBefore(self.space_before)),
             (self.space_after != before.space_after).then_some(ParagraphFormatChange::SpaceAfter(self.space_after)),
             (self.hyphenate != before.hyphenate).then_some(ParagraphFormatChange::Hyphenate(self.hyphenate)),
+            (self.rag_pattern != before.rag_pattern).then_some(ParagraphFormatChange::RagPattern(self.rag_pattern)),
+            (self.rag_inset != before.rag_inset).then_some(ParagraphFormatChange::RagInset(self.rag_inset)),
         ]
         .into_iter()
         .flatten()
@@ -97,6 +106,8 @@ pub enum ParagraphFormatChange {
     SpaceBefore(Option<f64>),
     SpaceAfter(Option<f64>),
     Hyphenate(Option<bool>),
+    RagPattern(Option<RagPattern>),
+    RagInset(Option<f64>),
 }
 
 impl ParagraphFormatChange {
@@ -112,7 +123,8 @@ impl ParagraphFormatChange {
             Self::LastLineIndent(value) => validate_measure(*value, -MAX_MEASURE, "last-line indent"),
             Self::SpaceBefore(value) => validate_measure(*value, 0.0, "space before paragraph"),
             Self::SpaceAfter(value) => validate_measure(*value, 0.0, "space after paragraph"),
-            Self::Align(_) | Self::Hyphenate(_) => Ok(()),
+            Self::RagInset(value) => validate_measure(*value, 0.0, "short-line inset"),
+            Self::Align(_) | Self::Hyphenate(_) | Self::RagPattern(_) => Ok(()),
         }
     }
 
@@ -127,6 +139,8 @@ impl ParagraphFormatChange {
             Self::SpaceBefore(value) => format.space_before = *value,
             Self::SpaceAfter(value) => format.space_after = *value,
             Self::Hyphenate(value) => format.hyphenate = *value,
+            Self::RagPattern(value) => format.rag_pattern = *value,
+            Self::RagInset(value) => format.rag_inset = *value,
         }
     }
 }

@@ -190,6 +190,12 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         Some("Cmd+Alt+Shift+J"),
         "{} — word and letter spacing, glyph scaling and composer of the selected paragraphs (type.para)",
     ),
+    (
+        crate::paragraph_rag::COMMAND,
+        crate::paragraph_rag::LABEL,
+        None,
+        "{} opens spacing, rag pattern and short-line inset for the selected paragraphs",
+    ),
     ("app.findFontDialog", "Find/Replace Font…", None, "{} — fonts used (missing ones flagged) and replacing them"),
     ("app.insertXrefDialog", "Insert Cross-Reference…", None, "{} — New Cross-Reference dialog (paragraph or text anchor, format)"),
     ("app.deleteAllGuides", "Delete All Guides on Spread", None, "{} — the spread in view"),

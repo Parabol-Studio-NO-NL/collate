@@ -10,7 +10,7 @@ Collate is an open-source collaborative desktop publishing fork of DesignCraft. 
 4. Draw, move, resize and rotate unassigned frames with the standard tools. Supported edits include fill, stroke, basic appearance, layer assignment and stacking order. The host confirms each edit. Comments can attach to a page, a selected frame, or up to 512 selected Unicode characters in a supported text story. Open **Share** with the text selected to post. Choose **Select text** on a thread to return to its surviving selection. Replies and resolution travel with the room history.
 5. Save normally to keep the confirmed document in the DesignCraft format. Use **Save a Copy** to write a separate snapshot. On macOS, reopen the original local file path to recover its room. A restarted host shares a fresh invitation. Guests can use **Reconnect** without discarding a queued edit. Guests who download a seed should save a local copy to enable encrypted room recovery.
 
-Draw a new frame with the Type tool or click an unassigned frame to start a story. The creator's caret follows the confirmed frame, and typing entered while confirmation is pending is buffered for that frame. Simple stories, including stories in already threaded frames, support concurrent insertion, deletion, and basic character and paragraph formatting. Apply an existing paragraph style or change alignment, indents, spacing and hyphenation. A single unthreaded text frame with a simple story can be deleted. If a deletion wins a conflict with typing, the author can use **Copy queued typing** in the Share window to salvage the submitted and buffered text. Changing frame threads remains a standalone edit.
+Draw a new frame with the Type tool or click an unassigned frame to start a story. The creator's caret follows the confirmed frame, and typing entered while confirmation is pending is buffered for that frame. Simple stories, including stories in already threaded frames, support concurrent insertion, deletion, and basic character and paragraph formatting. Apply an existing paragraph style or change alignment, indents, spacing, hyphenation and the paragraph rag. A single unthreaded text frame with a simple story can be deleted. If a deletion wins a conflict with typing, the author can use **Copy queued typing** in the Share window to salvage the submitted and buffered text. Changing frame threads remains a standalone edit.
 
 Use **Insert Pages…** or **Delete Pages** in standard facing-page and single-sided documents. Retained frames and selections follow their pages as spreads change. Deleting a page can remove its unreferenced supported frames, and comments on removed pages or frames remain available as orphaned threads. Page edits are declined if they would move artwork to a different page or change where a bookmark or page link points.
 
@@ -21,6 +21,12 @@ Use the existing **Layers** panel to create or reorder shared layers, change opt
 Shared undo and redo apply to your own simple text edits while preserving other collaborators' typing, deletions and formatting. They also cover frame properties, order and comment resolution when no teammate has since changed the same target. Artwork and structural edits remain outside shared undo.
 
 Font files stay on each Mac. Collate uses DesignCraft's local missing-font fallback, which can change line breaks and output. Participants should install the same licensed fonts before reviewing page composition or exporting. Embed supported linked images before starting a room so their appearance travels with the document.
+
+## Shape the paragraph rag
+
+Select text or a text frame, open the **Paragraph** panel menu, and choose **Justification and Rag…**. The spacing controls and short-line inset work together. Choose **Natural rag** for alternating full and shorter measures, **Stepped justification** to justify those lines within your spacing limits, or **Alternating edges** to alternate left- and right-aligned lines. The pattern starts again in each column or threaded frame. Choose **Off** to return to the paragraph’s usual alignment.
+
+To reuse a rag across paragraphs, set it in **Paragraph Style Options > Justification**. Collate saves the pattern and inset in the native document.
 
 ## Develop
 

@@ -8,6 +8,8 @@
 //! ([`TIER_COST`]), so the composer prefers word-space changes, then hyphenation, then letter
 //! spacing, then glyph scaling.
 
+use designcraft_doc::RagPattern;
+
 use crate::shape::{Glyph, SOFT_HYPHEN};
 
 /// One line chosen by a breaker: glyphs `start..end` are visible; `next` is where the next line starts.
@@ -26,6 +28,8 @@ pub struct Break {
 #[derive(Clone, Copy, Debug)]
 pub struct Spacing {
     pub justify: bool,
+    /// Rag patterns fit within the paragraph's spacing limits, including on ragged lines.
+    pub rag_pattern: RagPattern,
     pub word_min: f64,
     pub word_desired: f64,
     pub word_max: f64,
@@ -65,6 +69,7 @@ impl Default for Spacing {
     fn default() -> Self {
         Spacing {
             justify: false,
+            rag_pattern: RagPattern::None,
             word_min: 0.8,
             word_desired: 1.0,
             word_max: 1.33,
@@ -88,6 +93,10 @@ impl Default for Spacing {
 }
 
 impl Spacing {
+    fn elastic(&self) -> bool {
+        self.justify || self.rag_pattern != RagPattern::None
+    }
+
     /// Push out only: the 追い込み (compression that would pull the next character in) is
     /// unavailable, so every line end is pushed out (and no line is compressed at its end).
     pub(crate) fn push_out_only(&self) -> bool {
@@ -100,19 +109,22 @@ impl Spacing {
         }
         let moji_stretch = if self.justify { g.moji.stretch } else { 0.0 };
         let moji_shrink = if self.push_out_only() { 0.0 } else { g.moji.shrink };
-        if !self.justify {
+        if !self.elastic() {
             return ([0.0; 3], [moji_shrink, 0.0, 0.0]);
         }
         // A space that is no break opportunity (No Break, U+00A0) is a box with word-space elasticity.
         if g.is_justify_space() {
             let (st, sh) = self.space_elastic(g);
-            return ([moji_stretch + st, 0.0, 0.0], [moji_shrink + sh, 0.0, 0.0]);
+            let stretch = if self.justify { moji_stretch + st } else { 0.0 };
+            return ([stretch, 0.0, 0.0], [moji_shrink + sh, 0.0, 0.0]);
         }
         let natural = g.adv / self.glyph_desired.max(0.01);
-        (
-            [moji_stretch, g.space * (self.letter_max - self.letter_desired).max(0.0), natural * (self.glyph_max - self.glyph_desired).max(0.0)],
-            [moji_shrink, g.space * (self.letter_desired - self.letter_min).max(0.0), natural * (self.glyph_desired - self.glyph_min).max(0.0)],
-        )
+        let stretch = if self.justify {
+            [moji_stretch, g.space * (self.letter_max - self.letter_desired).max(0.0), natural * (self.glyph_max - self.glyph_desired).max(0.0)]
+        } else {
+            [0.0; 3]
+        };
+        (stretch, [moji_shrink, g.space * (self.letter_desired - self.letter_min).max(0.0), natural * (self.glyph_desired - self.glyph_min).max(0.0)])
     }
     /// Word-space stretch and shrink of space glyph `g` (see [`Glyph::is_word_space`]); none
     /// inside a jidori run, whose width is fitted.
@@ -460,7 +472,8 @@ fn items(glyphs: &[Glyph], hyph_after: &[bool], emergency_after: &[bool], sp: &S
                 last_space = it.len();
                 it.push(p);
                 ig.push(i);
-                it.push(Item::glue(w, -sp.ragged_stretch, 0.0));
+                let shrink = if sp.elastic() { sp.space_elastic(g).1 } else { 0.0 };
+                it.push(Item::glue(w, -sp.ragged_stretch, shrink));
                 ig.push(i);
             }
             continue;
@@ -722,6 +735,16 @@ fn prefix_sums(items: &[Item]) -> PrefixSums {
     PrefixSums { sw, sy, sz, so }
 }
 
+fn min_demerits_by_phase(best: &[Option<(f64, usize)>], phases: usize) -> [f64; 2] {
+    let mut min_d = [f64::INFINITY; 2];
+    for (i, value) in best.iter().enumerate() {
+        if let Some((d, _)) = value {
+            min_d[i % phases] = min_d[i % phases].min(*d);
+        }
+    }
+    min_d
+}
+
 fn kp_pass(input: PassInput<'_>) -> Option<Vec<Break>> {
     let PassInput { items, item_glyphs, glyphs, spacing: sp, width, tolerance: tol, emergency } = input;
     let m = items.len();
@@ -744,8 +767,11 @@ fn kp_pass(input: PassInput<'_>) -> Option<Vec<Break>> {
     }];
     let limit = sp.hyphen_limit as usize;
     let states = if limit == 0 { 2 } else { (limit + 1).min(MAX_HYPHEN_STATES) };
+    // A break reached after a different number of lines can have a different next
+    // measure. Keep both alternatives for patterns with an alternating inset.
+    let phases = if matches!(sp.rag_pattern, RagPattern::Natural | RagPattern::Stepped) { 2 } else { 1 };
     let mut active: Vec<usize> = vec![0];
-    let mut best: Vec<Option<(f64, usize)>> = vec![None; 4 * states];
+    let mut best: Vec<Option<(f64, usize)>> = vec![None; 4 * states * phases];
     let mut keep = Vec::new();
     for b in 0..m {
         let it = items[b];
@@ -795,7 +821,7 @@ fn kp_pass(input: PassInput<'_>) -> Option<Vec<Break>> {
             }
             let (fit, total) = break_demerits(n, r, pp, flagged, sp.kinsoku_priority, sp.kinsoku_cjk);
             let hs = if flagged { (n.hyphens as usize + 1).min(states - 1) } else { 0 };
-            let slot = &mut best[fit * states + hs];
+            let slot = &mut best[(fit * states + hs) * phases + (n.line + 1) % phases];
             if slot.is_none_or(|(bd, _)| total < bd) {
                 *slot = Some((total, a));
             }
@@ -841,16 +867,16 @@ fn kp_pass(input: PassInput<'_>) -> Option<Vec<Break>> {
             i += 1;
         }
         // Knuth's pruning: a class is only worth a node if it is within the fitness demerit of the best.
-        let min_d = best.iter().flatten().map(|x| x.0).fold(f64::INFINITY, f64::min);
+        let min_d = min_demerits_by_phase(&best, phases);
         for (k, c) in best.iter().enumerate() {
             if let Some((d, a)) = *c
-                && d <= min_d + 3000.0
+                && d <= min_d[k % phases] + 3000.0
             {
                 let prev = arena[a];
                 arena.push(Node {
                     pos: b,
                     line: prev.line + 1,
-                    fitness: (k / states) as u8,
+                    fitness: (k / phases / states) as u8,
                     tw,
                     ty,
                     tz,
@@ -961,7 +987,7 @@ pub fn greedy(
                 break;
             }
             if g.is_space() && !g.no_break && g.break_after != Some(false) {
-                if sp.justify {
+                if sp.elastic() {
                     shrink += sp.space_elastic(g).1;
                 }
                 last_ok = Some((i, false));

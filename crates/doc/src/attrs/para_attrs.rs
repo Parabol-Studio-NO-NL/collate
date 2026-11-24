@@ -1,6 +1,6 @@
 use super::{
     Align, BoxBottom, BoxTop, BoxWidth, Composer, Deserialize, GrepStyle, GridAlign, ListAlign, ListCounter, ListType, MAX_TAB_STOPS,
-    NestedLineStyle, NestedStyle, NumberStyle, Rule, Serialize, SpanColumns, StartParagraph, TabStop, TextDirection, attr_key,
+    NestedLineStyle, NestedStyle, NumberStyle, RagPattern, Rule, Serialize, SpanColumns, StartParagraph, TabStop, TextDirection, attr_key,
     deserialize_explicit_value, expand_list_levels, expand_list_text, list_level_index, sanitized_tabs, unknown_attribute,
 };
 
@@ -62,6 +62,9 @@ attr_set! {
         glyph_scale_max: f64 = 1.0,
         auto_leading: f64 = 1.2,
         single_word_justify: Align = Align::FullyJustified,
+        rag_pattern: RagPattern = RagPattern::None,
+        /// Distance in points to inset the short edge.
+        rag_inset: f64 = 5.0 * 72.0 / 25.4,
         /// Insert Kashidas (World-Ready): justified Arabic lines stretch at joins before spaces.
         kashidas: bool = true,
         /// Preserved vendor policy; non-default policies require a dedicated composer.

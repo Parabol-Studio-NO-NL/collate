@@ -179,6 +179,7 @@ pub(crate) fn validate_para_values(attrs: &ParaAttrs, command_id: &str) -> Resul
         ("lastLineIndent", attrs.last_line_indent, -MAX_PARA_SPACE),
         ("spaceBefore", attrs.space_before, 0.0),
         ("spaceAfter", attrs.space_after, 0.0),
+        ("ragInset", attrs.rag_inset, 0.0),
         ("sameParaStyleSpacing", attrs.same_para_style_spacing.flatten(), 0.0),
     ];
     for (key, v, lo) in spaces {
@@ -1294,6 +1295,7 @@ mod size_bounds_tests {
             (json!({"sameParaStyleSpacing": -2}), "sameParaStyleSpacing -2: 0 to 15552 pt"),
             (json!({"leftIndent": -50}), "leftIndent -50: 0 to 15552 pt"),
             (json!({"rightIndent": -20}), "rightIndent -20: 0 to 15552 pt"),
+            (json!({"ragInset": -1}), "ragInset -1: 0 to 15552 pt"),
             (json!({"rightIndent": 1e300}), "rightIndent 1"),
             (json!({"firstLineIndent": -15553}), "firstLineIndent -15553: -15552 to 15552 pt"),
             (json!({"lastLineIndent": 15553}), "lastLineIndent 15553: -15552 to 15552 pt"),
