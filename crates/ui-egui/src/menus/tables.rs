@@ -14,6 +14,8 @@ pub const MENUS: &[(&str, &[&str])] = &[
             "ui:app.saveDialog",
             "ui:app.saveCopyDialog",
             "cmd:file.revert",
+            #[cfg(not(target_arch = "wasm32"))]
+            "ui:app.shareDocument",
             "-",
             "ui:app.placeDialog",
             "ui:app.contactSheetDialog",
@@ -643,8 +645,6 @@ pub const MENUS: &[(&str, &[&str])] = &[
     (
         "Help",
         &[
-            "ui:help.discord",
-            "-",
             "ui:help.appPage",
             "ui:help.github",
             "ui:help.issues",

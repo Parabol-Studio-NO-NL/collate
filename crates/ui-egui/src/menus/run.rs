@@ -106,6 +106,11 @@ fn flag(b: &mut bool) -> Result<Value, String> {
 /// One slice of the UI commands: `None` if `id` isn't one of them.
 fn run_ui_part1(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
     Some(match id {
+        #[cfg(not(target_arch = "wasm32"))]
+        "app.shareDocument" => {
+            app.open_collaboration_dialog();
+            Ok(Value::Null)
+        }
         "window.minimize" => {
             app.pending_window_commands.push(egui::ViewportCommand::Minimized(true));
             Ok(Value::Null)
@@ -1135,7 +1140,7 @@ fn run_ui_part5(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
             }
             _ => Err("help.app: give `app` (e.g. \"photocraft\")".into()),
         },
-        h if h.starts_with("help.") && designcraft_engine::links::get(&h[5..]).is_some() => {
+        h @ ("help.appPage" | "help.github" | "help.issues" | "help.website") => {
             let url = designcraft_engine::links::get(&h[5..]).unwrap_or_default().to_string();
             app.ui.pending_urls.push(url.clone());
             Ok(json!({"url": url}))

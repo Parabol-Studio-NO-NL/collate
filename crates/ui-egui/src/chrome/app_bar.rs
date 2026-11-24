@@ -294,14 +294,10 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                                     }
                                 },
                             );
-                            ui.add_space(6.0);
-                            if icons::button(ui, "share", 22.0, false, crate::i18n::tr(&app.ui.language, "Share")).clicked() {
-                                app.status(crate::i18n::tr(&app.ui.language, "Export a PDF, IDML or package to share — no cloud account needed."));
-                            }
-                            ui.add_space(8.0);
-                            // Always one click away: the ArtCraft community Discord.
-                            if crate::about::discord_button(ui, "Discord", vec2(78.0, 22.0)) {
-                                let _ = app.run("help.discord", json!({}));
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                ui.add_space(6.0);
+                                app.collaboration_button(ui);
                             }
                             tools_start = ui.min_rect().min.x;
                             ui.data_mut(|d| d.insert_temp(egui::Id::unique("app_bar_tools_start"), tools_start));

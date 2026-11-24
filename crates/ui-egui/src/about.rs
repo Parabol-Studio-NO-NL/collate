@@ -1,14 +1,11 @@
 //! About Collate and credits for the upstream project.
 
 use designcraft_engine::links;
-use egui::{Color32, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Color32, Rect, Sense, pos2, vec2};
 use serde_json::json;
 
 use crate::DesignApp;
 use crate::theme::{Tokens, semibold};
-
-/// Discord’s brand colour, used for the upstream Discord link.
-pub const DISCORD: Color32 = Color32::from_rgb(0x58, 0x65, 0xf2);
 
 /// The other ArtCraft apps (app-page slug, name, what it is) — same list as the README.
 pub const SIBLINGS: &[(&str, &str, &str)] = &[
@@ -22,46 +19,6 @@ pub const SIBLINGS: &[(&str, &str, &str)] = &[
 
 /// The About window's tabs, in `UiState::about_tab` order (`help.about {tab}` names them in lowercase).
 pub const ABOUT_TABS: [&str; 3] = ["About", "Contributors", "Models"];
-
-/// A speech-bubble glyph (drawn in code) for Discord buttons.
-pub fn paint_chat_icon(p: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
-    let body = Rect::from_center_size(c - vec2(0.0, s * 0.06), vec2(s, s * 0.72));
-    p.rect_filled(body, s * 0.24, color);
-    let tail = vec![
-        pos2(body.left() + s * 0.22, body.bottom() - 1.0),
-        pos2(body.left() + s * 0.12, body.bottom() + s * 0.24),
-        pos2(body.left() + s * 0.44, body.bottom() - 1.0),
-    ];
-    p.add(egui::Shape::convex_polygon(tail, color, Stroke::NONE));
-    let eye = s * 0.09;
-    let bg = if color.r() as u32 + color.g() as u32 + color.b() as u32 > 380 { DISCORD } else { Color32::WHITE };
-    p.circle_filled(body.center() - vec2(s * 0.18, 0.0), eye, bg);
-    p.circle_filled(body.center() + vec2(s * 0.18, 0.0), eye, bg);
-}
-
-/// The Discord button's size for `label`: `min`, widened when the label would not fit inside it.
-pub fn discord_button_size(ctx: &egui::Context, label: &str, min: egui::Vec2) -> egui::Vec2 {
-    let galley = crate::rtl::plain(ctx, label, semibold((min.y * 0.42).max(11.0)), Color32::WHITE);
-    egui::vec2(min.x.max(min.y * 0.5 + 8.0 + galley.size().x + min.y), min.y)
-}
-
-/// The big "Join our Discord" button. Returns true when clicked. `size` is the minimum: a longer label
-/// widens the button (see `discord_button_size`) rather than spilling out of it.
-pub fn discord_button(ui: &mut egui::Ui, label: &str, size: egui::Vec2) -> bool {
-    let size = discord_button_size(ui.ctx(), label, size);
-    let icon = size.y * 0.5;
-    let font = semibold((size.y * 0.42).max(11.0));
-    let galley = crate::rtl::plain(ui.ctx(), label, font, Color32::WHITE);
-    let total = icon + 8.0 + galley.size().x;
-    let (r, resp) = ui.allocate_exact_size(size, Sense::click());
-    let resp = resp.on_hover_text(links::DISCORD).on_hover_cursor(egui::CursorIcon::PointingHand);
-    let fill = if resp.hovered() { Color32::from_rgb(0x47, 0x52, 0xc4) } else { DISCORD };
-    ui.painter().rect_filled(r, size.y / 2.0, fill);
-    let x0 = r.center().x - total / 2.0;
-    paint_chat_icon(ui.painter(), pos2(x0 + icon / 2.0, r.center().y), icon, Color32::WHITE);
-    ui.painter().galley(pos2(x0 + icon + 8.0, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
-    resp.clicked()
-}
 
 /// A text link that opens `url`. Returns true when clicked.
 fn link(ui: &mut egui::Ui, text: &str, url: &str, color: Color32) -> bool {
@@ -141,15 +98,6 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                 egui::RichText::new(crate::i18n::tr(&app.ui.language, "Based on DesignCraft by the ArtCraft team.")).size(12.0).color(t.text_dim),
             ));
             ui.add_space(16.0);
-            if discord_button(ui, crate::i18n::tr(&app.ui.language, "Join the ArtCraft Discord"), vec2(300.0, 40.0)) {
-                open = Some("discord");
-            }
-            ui.add_space(4.0);
-            ui.label(crate::rtl::widget(
-                ui,
-                egui::RichText::new(crate::i18n::tr(&app.ui.language, "DesignCraft support and discussion")).size(11.0).color(t.text_dim),
-            ));
-            ui.add_space(14.0);
             ui.horizontal(|ui| {
                 // Centre the row of links.
                 let w = 330.0;

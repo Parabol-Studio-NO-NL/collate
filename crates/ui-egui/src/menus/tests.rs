@@ -3391,7 +3391,8 @@ fn help_links_are_enabled_without_a_document() {
     let app = crate::DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
     assert!(app.session.active().is_none());
     let ids: Vec<&str> = UI_COMMANDS.iter().map(|c| c.0).filter(|id| id.starts_with("help.")).collect();
-    assert!(ids.contains(&"help.discord") && ids.contains(&"help.github"), "{ids:?}");
+    assert!(ids.contains(&"help.appPage") && ids.contains(&"help.github"), "{ids:?}");
+    assert!(!ids.contains(&"help.discord"), "{ids:?}");
     for id in ids {
         assert!(menu_enabled(&app, id), "{id} must work from the start screen");
     }
