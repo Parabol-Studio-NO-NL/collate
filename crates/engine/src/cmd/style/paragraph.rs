@@ -103,6 +103,27 @@ mod redefine_tests {
 mod application_inheritance_tests {
     use super::*;
 
+    #[test]
+    fn partial_rag_stop_edits_take_unspecified_distances_from_the_parent_or_selection() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name":"Base","para":{"ragLineInsets":[1,2,3,4]}})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name":"Child","basedOn":"Base","para":{"ragLineInsets":[null,7,null,null]}})).unwrap();
+        let stops = |s: &Session, name: &str| s.doc().unwrap().doc.styles.resolve_para_style(name).0.rag_line_insets;
+        assert_eq!(stops(&s, "Child"), [1.0, 7.0, 3.0, 4.0]);
+
+        s.execute("style.paragraph.create", &json!({"name":"Other"})).unwrap();
+        s.execute("style.paragraph.edit", &json!({"name":"Other","basedOn":"Child","para":{"ragLineInsets":[null,null,8,null]}})).unwrap();
+        assert_eq!(stops(&s, "Other"), [1.0, 7.0, 8.0, 4.0]);
+
+        let f = s.execute("frame.create", &json!({"rect":[0,0,200,200],"content":"text","text":"A"})).unwrap();
+        s.execute("text.select", &json!({"story":f["story"],"anchor":0,"focus":0})).unwrap();
+        s.execute("style.paragraph.apply", &json!({"name":"Other"})).unwrap();
+        s.execute("type.para", &json!({"attrs":{"ragLineInsets":[null,null,null,9]}})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name":"Captured","fromSelection":true,"para":{"ragLineInsets":[5,null,null,null]}})).unwrap();
+        assert_eq!(stops(&s, "Captured"), [5.0, 7.0, 8.0, 9.0]);
+    }
+
     fn setup(text: &str) -> (Session, Value) {
         let mut s = Session::new();
         s.execute("file.new", &json!({})).unwrap();
@@ -490,8 +511,12 @@ pub(super) fn create_para(s: &mut Session, p: &Value) -> Result<Value> {
     let base = str_param(p, "name").unwrap_or("Paragraph Style 1").to_string();
     let based_on = style_name_param("style.paragraph.create", p, "basedOn")?;
     let next = style_name_param("style.paragraph.create", p, "nextStyle")?;
-    let mut para: ParaAttrs =
-        attrs("style.paragraph.create", "para", p, |a: &mut ParaAttrs, k, v| a.set_json_over(k, v, &designcraft_doc::ParaProps::default()))?;
+    let selection =
+        if p.get("fromSelection").and_then(Value::as_bool) == Some(true) { s.execute("type.selectionAttrs", &json!({})).ok() } else { None };
+    let selected_para = selection.as_ref().and_then(|attrs| serde_json::from_value::<designcraft_doc::ParaProps>(attrs["para"].clone()).ok());
+    let (parent, _) = s.doc()?.doc.styles.resolve_para_style(based_on.as_deref().unwrap_or(designcraft_doc::NO_PARA_STYLE));
+    let current = selected_para.as_ref().unwrap_or(&parent);
+    let mut para: ParaAttrs = attrs("style.paragraph.create", "para", p, |a: &mut ParaAttrs, k, v| a.set_json_over(k, v, current))?;
     continue_numbering(p.get("para"), &mut para);
     explicit_default_kinsoku(&mut para, p.get("para"));
     check_grep_styles("style.paragraph.create", &para)?;
@@ -499,21 +524,18 @@ pub(super) fn create_para(s: &mut Session, p: &Value) -> Result<Value> {
     let mut chars: CharAttrs = attrs("style.paragraph.create", "chars", p, |a: &mut CharAttrs, k, v| a.set_json(k, v))?;
     // Validate caller-supplied fills, not selection fills retained after a swatch is deleted.
     crate::cmd::text::validate_char_fill(&s.doc()?.doc, &chars, "style.paragraph.create")?;
-    if p.get("fromSelection").and_then(Value::as_bool).unwrap_or(false)
-        && let Ok(cur) = s.execute("type.selectionAttrs", &json!({}))
-        && !cur.is_null()
+    if let Some(pp) = selected_para {
+        let mut full = ParaProps_to_attrs(&pp);
+        full.merge(&para);
+        para = full;
+        rows = [true; 3];
+    }
+    if let Some(cur) = selection
+        && let Ok(cp) = serde_json::from_value::<designcraft_doc::CharProps>(cur["chars"].clone())
     {
-        if let Ok(pp) = serde_json::from_value::<designcraft_doc::ParaProps>(cur["para"].clone()) {
-            let mut full = ParaProps_to_attrs(&pp);
-            full.merge(&para);
-            para = full;
-            rows = [true; 3];
-        }
-        if let Ok(cp) = serde_json::from_value::<designcraft_doc::CharProps>(cur["chars"].clone()) {
-            let mut full = CharProps_to_attrs(&cp);
-            full.merge(&chars);
-            chars = full;
-        }
+        let mut full = CharProps_to_attrs(&cp);
+        full.merge(&chars);
+        chars = full;
     }
     // The values taken from the selection are checked with the given ones.
     crate::cmd::text::validate_para_values(&para, "style.paragraph.create")?;

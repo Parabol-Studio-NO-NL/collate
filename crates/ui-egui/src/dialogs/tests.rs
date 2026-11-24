@@ -1563,6 +1563,75 @@ fn paragraph_style_options_justification_sets_auto_leading_and_single_word_justi
     assert_eq!((para.rag_pattern, para.rag_inset), (Some(designcraft_doc::RagPattern::AlternatingEdges), Some(18.0)));
 }
 
+#[test]
+fn ragtime_style_from_a_frame_keeps_inheritance_and_language_overrides_when_reopened() {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::Queryable;
+
+    let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+    app.run("file.new", json!({})).unwrap();
+    let frame = app.run("frame.create", json!({"rect": [36, 36, 300, 200], "content": "text", "text": "Uno deux"})).unwrap();
+    let story = &frame["story"];
+    app.run("style.paragraph.create", json!({"name": "Body", "para": {"hyphMinWord": 7}, "chars": {"language": "Norwegian: Bokmål"}})).unwrap();
+    app.run("selection.set", json!({"ids": [frame["id"]]})).unwrap();
+    app.run("style.paragraph.apply", json!({"name": "Body"})).unwrap();
+    let stops = json!([0.0, 11.0, 3.0, 18.0]);
+    app.run("type.para", json!({"attrs": {"ragPattern": "fourStop", "ragLineInsets": stops, "ragNearThreshold": 5.0, "wordSpaceMin": 0.82}}))
+        .unwrap();
+    app.run("text.select", json!({"story": story, "anchor": 0, "focus": 3})).unwrap();
+    app.run("type.char", json!({"attrs": {"language": "Spanish"}})).unwrap();
+    open_new_rag_style(&mut app);
+    let from_word = app.ui.dialog.take().unwrap();
+    assert_eq!(from_word.s("basedOn"), "Body");
+    assert!(!from_word.fields.contains_key("c.language"), "a selected word cannot replace the paragraph's language");
+    app.run("selection.set", json!({"ids": [frame["id"]]})).unwrap();
+
+    open_new_rag_style(&mut app);
+    let d = app.ui.dialog.as_mut().unwrap();
+    assert!(d.b("apply"));
+    assert_eq!(d.s("basedOn"), "Body");
+    assert!(!d.fields.contains_key("c.language"), "the first word's language is local to its run");
+    d.fields.insert("rename".into(), json!("Ragged body"));
+    d.fields.insert("section".into(), json!("ragtime"));
+    let mut h = crate::test_window::open(app, egui::vec2(1200.0, 850.0));
+    let language = h.get_by(|n| n.role() == Role::ComboBox && n.label().as_deref() == Some("Paragraph language"));
+    assert_eq!(language.value().as_deref(), Some("Norwegian: Bokmål"));
+    language.click();
+    h.run_steps(2);
+    h.get_by_label("French").click();
+    h.run_steps(2);
+    let app = &mut h.state_mut().app;
+    confirm(app).unwrap();
+    assert_eq!(app.run("type.selectionAttrs", json!({})).unwrap()["paragraphStyle"], "Ragged body");
+    app.run("style.paragraph.edit", json!({"name": "Body", "para": {"hyphMinWord": 9}})).unwrap();
+
+    let saved = app.run("file.serialize", json!({})).unwrap();
+    app.run("file.openBytes", json!({"name": "ragged.designcraft", "base64": saved["base64"]})).unwrap();
+    for (start, end, language) in [(0, 3, "Spanish"), (4, 8, "French")] {
+        app.run("text.select", json!({"story": story, "anchor": start, "focus": end})).unwrap();
+        let attrs = app.run("type.selectionAttrs", json!({})).unwrap();
+        assert_eq!(attrs["chars"]["language"], language);
+        assert_eq!(attrs["paragraphLanguage"], "French");
+        assert_eq!(attrs["para"]["ragPattern"], "fourStop");
+        assert_eq!(attrs["para"]["ragLineInsets"], stops);
+        assert_eq!(attrs["para"]["ragNearThreshold"], 5.0);
+        assert_eq!(attrs["para"]["wordSpaceMin"], 0.82);
+        assert_eq!(attrs["para"]["hyphMinWord"], 9, "continues to follow the parent style");
+    }
+}
+
+#[test]
+fn ragtime_style_from_mixed_paragraphs_keeps_their_differences() {
+    let (mut app, story) = two_paragraphs();
+    app.run("text.select", json!({"story": story, "anchor": 0, "focus": 7})).unwrap();
+    open_new_rag_style(&mut app);
+    let dialog = app.ui.dialog.as_ref().unwrap();
+    assert!(!dialog.fields.contains_key("p.wordSpaceMin"));
+    assert!(!dialog.b("apply"));
+    confirm(&mut app).unwrap();
+    assert_ne!(para_attr(&mut app, &story, 0, "wordSpaceMin"), para_attr(&mut app, &story, 4, "wordSpaceMin"));
+}
+
 /// Paragraph Style Options › Justification fits at the normal dialog width: the spacing table
 /// keeps its own narrow columns (the wide Single Word Justification menu must not stretch
 /// them), so Minimum/Desired sit close together and Maximum stays in view with no horizontal

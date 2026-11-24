@@ -93,8 +93,8 @@ impl Default for Spacing {
 }
 
 impl Spacing {
-    fn elastic(&self) -> bool {
-        self.justify || self.rag_pattern != RagPattern::None
+    pub(super) fn elastic(&self) -> bool {
+        self.justify || matches!(self.rag_pattern, RagPattern::Natural | RagPattern::AlternatingEdges | RagPattern::Stepped | RagPattern::FourStop)
     }
 
     /// Push out only: the 追い込み (compression that would pull the next character in) is
@@ -735,8 +735,8 @@ fn prefix_sums(items: &[Item]) -> PrefixSums {
     PrefixSums { sw, sy, sz, so }
 }
 
-fn min_demerits_by_phase(best: &[Option<(f64, usize)>], phases: usize) -> [f64; 2] {
-    let mut min_d = [f64::INFINITY; 2];
+fn min_demerits_by_phase(best: &[Option<(f64, usize)>], phases: usize) -> [f64; 4] {
+    let mut min_d = [f64::INFINITY; 4];
     for (i, value) in best.iter().enumerate() {
         if let Some((d, _)) = value {
             min_d[i % phases] = min_d[i % phases].min(*d);
@@ -768,8 +768,12 @@ fn kp_pass(input: PassInput<'_>) -> Option<Vec<Break>> {
     let limit = sp.hyphen_limit as usize;
     let states = if limit == 0 { 2 } else { (limit + 1).min(MAX_HYPHEN_STATES) };
     // A break reached after a different number of lines can have a different next
-    // measure. Keep both alternatives for patterns with an alternating inset.
-    let phases = if matches!(sp.rag_pattern, RagPattern::Natural | RagPattern::Stepped) { 2 } else { 1 };
+    // measure. Keep one alternative per phase of a repeating inset pattern.
+    let phases = match sp.rag_pattern {
+        RagPattern::Natural | RagPattern::Stepped => 2,
+        RagPattern::FourStop => 4,
+        _ => 1,
+    };
     let mut active: Vec<usize> = vec![0];
     let mut best: Vec<Option<(f64, usize)>> = vec![None; 4 * states * phases];
     let mut keep = Vec::new();

@@ -518,10 +518,13 @@ fn run_ui_part2(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
                 return Some(Err("select text or a text frame".into()));
             };
             let mixed: Vec<&str> = a["paraMixed"].as_array().map(|m| m.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-            let current: serde_json::Map<String, Value> = crate::dialogs::JUSTIFY_ATTRS
+            let mut current: serde_json::Map<String, Value> = crate::dialogs::JUSTIFY_ATTRS
                 .iter()
                 .map(|k| (k.to_string(), if mixed.contains(k) { Value::Null } else { a["para"][*k].clone() }))
                 .collect();
+            if let Some(stops) = a.get("ragLineInsets") {
+                current.insert("ragLineInsets".into(), stops.clone());
+            }
             let dialog = if id == crate::paragraph_rag::COMMAND { "paragraphRag" } else { "justification" };
             app.ui.dialog = Some(crate::dialogs::Dialog::new(dialog, json!({"current": current})));
             Ok(Value::Null)

@@ -38,7 +38,8 @@ pub fn shortcuts(app: &mut DesignApp, ctx: &egui::Context) {
         return;
     }
     let typing = app.session.wants_text();
-    let keys = ctx.input_mut(|i| take_keys(app, i, typing));
+    let panel_focus = crate::panel_docking::control_focused(ctx);
+    let keys = ctx.input_mut(|i| take_keys(app, i, typing, panel_focus));
     run_keys(app, ctx, keys, typing);
 }
 
@@ -58,7 +59,8 @@ pub fn forwarded_shortcuts(app: &mut DesignApp, ctx: &egui::Context, events: Vec
     let mut input = ctx.input(|i| i.clone());
     input.events = events;
     input.modifiers = modifiers;
-    let keys = take_keys(app, &mut input, typing);
+    // The floating viewport forwards only keys left over when its controls have no focus.
+    let keys = take_keys(app, &mut input, typing, false);
     run_keys(app, ctx, keys, typing);
     crate::canvas::forwarded_keys(app, input.events, modifiers);
 }
@@ -86,12 +88,12 @@ struct Keys {
 
 /// Takes the presentation keys and the command, panel and tool shortcuts out of `input`'s key
 /// presses.
-fn take_keys(app: &mut DesignApp, input: &mut egui::InputState, typing: bool) -> Keys {
+fn take_keys(app: &mut DesignApp, input: &mut egui::InputState, typing: bool, panel_focus: bool) -> Keys {
     let presentation = if app.ui.screen_mode == ScreenMode::Presentation { presentation_keys(input) } else { Vec::new() };
     let contexts: &[&str] = if typing { &[crate::keys::TEXT_CONTEXT] } else { &[] };
     let active = craft_keymap::Active { panel: None, contexts, typing };
     let native = &app.native_shortcuts;
-    let home = app.session.active().is_none();
+    let navigate = app.session.active().is_none() || panel_focus;
     // Presses the dispatcher leaves alone: Clear (the active tool deletes) and the keys the
     // native menu's accelerators already handled. An item holds one key equivalent, its
     // command's first shortcut in effect, and fires only for it exactly: the Plus key standing
@@ -99,10 +101,9 @@ fn take_keys(app: &mut DesignApp, input: &mut egui::InputState, typing: bool) ->
     // Copy, Cut and Paste stay too (the dispatcher's default): the canvas and text tools
     // handle them, and Paste carries the text.
     let accept = |hit: &craft_keymap::egui::Hit| {
-        // Tab and Shift+Tab move focus between Home's actions. Toggling the panels here
-        // would rebuild Home under a different parent, losing the focused button.
+        // Home and focused panel controls use Tab and Shift+Tab to navigate.
         let chord = hit.trigger.chord;
-        if home && chord.key == craft_keymap::Key::Tab && matches!(chord.mods, craft_keymap::Mods::NONE | craft_keymap::Mods::SHIFT) {
+        if navigate && chord.key == craft_keymap::Key::Tab && matches!(chord.mods, craft_keymap::Mods::NONE | craft_keymap::Mods::SHIFT) {
             return false;
         }
         let c = &hit.command;

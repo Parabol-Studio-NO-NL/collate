@@ -5907,7 +5907,9 @@ fn confirm_paragraph_style_options(app: &mut DesignApp, d: &mut Dialog) -> Resul
     let name = d.s("name");
     if let Err(e) = check_paragraph_style_justification(app, d) {
         // The caller shows the reason in the dialog's status line.
-        d.fields.insert("section".into(), json!("justify"));
+        if d.s("section") != "ragtime" {
+            d.fields.insert("section".into(), json!("justify"));
+        }
         return Err(e);
     }
     let (para, chars) = style_option_maps(d);
@@ -5955,7 +5957,7 @@ fn confirm_paragraph_style_options(app: &mut DesignApp, d: &mut Dialog) -> Resul
     d.fields.insert("name".into(), json!(&style));
     d.fields.insert("rename".into(), json!(&style));
     // Apply Style to Selection.
-    if created && d.b("apply") && app.session.active().is_some_and(|st| st.selection.text.is_some()) {
+    if created && d.b("apply") && designcraft_engine::cmd::has_text_or_frames(&app.session).is_ok() {
         app.run("style.paragraph.apply", json!({"name": style}))?;
     }
     if d.fields.contains_key("x.tag") {
@@ -6102,6 +6104,7 @@ fn paragraph_style_options(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialo
                 ("border", "Paragraph Border"),
                 ("shading", "Paragraph Shading"),
                 ("keep", "Keep Options"),
+                ("ragtime", "Rag Options"),
                 ("hyph", "Hyphenation"),
                 ("justify", "Justification"),
                 ("span", "Span Columns"),
@@ -6211,6 +6214,11 @@ fn paragraph_style_options(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialo
             }
             "tabs" => style_tabs(&app.ui.language, ui, d, &pv, &doc),
             "rules" => paragraph_rules(app, ui, d, "p.", &pv),
+            "ragtime" => {
+                egui::ScrollArea::vertical().id_salt("style_ragtime").auto_shrink([false, true]).show(ui, |ui| {
+                    crate::paragraph_rag::style_fields(&app.ui.language, ui, d, &pv, &cv, units);
+                });
+            }
             "hyph" => hyphenation(&app.ui.language, ui, d, "p.", &pv, units),
             "justify" => justification(&app.ui.language, ui, d, "p.", &pv, units),
             "color" => character_color(&app.ui.language, ui, d, &CharFields { base: &cv, sparse: false }, &doc),
@@ -7669,28 +7677,48 @@ pub fn open_style_options(app: &mut DesignApp, para: bool, name: &str) {
 /// New Paragraph Style… / New Character Style…: the style options for a style made on OK, named
 /// with the next free "Paragraph Style n" / "Character Style n".
 pub fn open_new_style(app: &mut DesignApp, para: bool) {
+    new_style_options(app, para, false);
+}
+
+/// Capture paragraph settings from the rag panel, even at a caret inside a language override.
+pub(crate) fn open_new_rag_style(app: &mut DesignApp) {
+    new_style_options(app, true, true);
+}
+
+fn new_style_options(app: &mut DesignApp, para: bool, from_rag_panel: bool) {
     let Some(st) = app.session.active() else { return };
     let name = next_style_name(&st.doc.styles, para);
     let has_text = st.selection.text.is_some();
-    let (bp, bc) = st.doc.styles.resolve_para_style(designcraft_doc::NO_PARA_STYLE);
+    let styles = st.doc.styles.clone();
     let id = if para { "paragraphStyleOptions" } else { "characterStyleOptions" };
     let mut fields = json!({"new": true, "rename": name});
-    // New Paragraph Style with text selected starts from it, as InDesign's: Based On [No Paragraph
-    // Style] and every setting of the text that differs, applied to the selection on OK.
+    // The regular style editor takes character formatting from the selected text. The rag
+    // panel starts from the paragraphs, which may contain several differently formatted runs.
     if para
-        && has_text
-        && let Some(sel) = app.session.execute("type.selectionAttrs", &json!({})).ok().filter(|v| !v.is_null())
+        && (has_text || from_rag_panel)
+        && let Some(sel) = app.session.execute("type.selectionAttrs", &json!({"mixed": from_rag_panel})).ok().filter(|v| !v.is_null())
     {
+        let shared_style = from_rag_panel && sel["paragraphStyleMixed"] == false;
+        let mut base_style = designcraft_doc::NO_PARA_STYLE;
+        if shared_style && let Some(name) = sel["paragraphStyle"].as_str() {
+            base_style = name;
+            fields["basedOn"] = json!(name);
+        }
+        let (bp, bc) = styles.resolve_para_style(base_style);
+        let paragraph_language = json!({"language": sel["paragraphLanguage"]});
+        let chars = if from_rag_panel { &paragraph_language } else { &sel["chars"] };
+        let mixed_keys = sel["paraMixed"].as_array().map_or(&[][..], Vec::as_slice);
         for (prefix, now, base) in
-            [("p.", &sel["para"], serde_json::to_value(bp).unwrap_or_default()), ("c.", &sel["chars"], serde_json::to_value(bc).unwrap_or_default())]
+            [("p.", &sel["para"], serde_json::to_value(bp).unwrap_or_default()), ("c.", chars, serde_json::to_value(bc).unwrap_or_default())]
         {
             for (k, v) in now.as_object().into_iter().flatten() {
-                if !v.is_null() && base.get(k) != Some(v) && base.get(k).is_some() {
+                let mixed = prefix == "p." && mixed_keys.iter().any(|key| key == k.as_str());
+                if !mixed && !v.is_null() && base.get(k) != Some(v) && base.get(k).is_some() {
                     fields[format!("{prefix}{k}")] = v.clone();
                 }
             }
         }
-        fields["apply"] = json!(true);
+        fields["apply"] = json!(!from_rag_panel || (shared_style && mixed_keys.is_empty() && !sel["paragraphLanguage"].is_null()));
     }
     // New Character Style with text selected starts from what the text has of its own over its
     // paragraph ("[None] + Bold + color"), applied to the selection on OK, as InDesign's.
@@ -8341,7 +8369,7 @@ fn shown_rule(d: &Dialog, prefix: &str, which: &str, current: &Value) -> Value {
 }
 
 /// The paragraph attributes of the Justification controls.
-pub const JUSTIFY_ATTRS: [&str; 16] = [
+pub const JUSTIFY_ATTRS: [&str; 18] = [
     "wordSpaceMin",
     "wordSpaceDesired",
     "wordSpaceMax",
@@ -8356,12 +8384,14 @@ pub const JUSTIFY_ATTRS: [&str; 16] = [
     "composer",
     "ragPattern",
     "ragInset",
+    "ragLineInsets",
+    "ragNearThreshold",
     "kashidas",
     "koreanCharBreaks",
 ];
 
 /// The spacing rows of the Justification controls: (label, attribute stem, allowed percent range).
-const JUSTIFY_ROWS: [(&str, &str, (f64, f64)); 3] = [
+pub(crate) const JUSTIFY_ROWS: [(&str, &str, (f64, f64)); 3] = [
     ("Word Spacing", "wordSpace", (0.0, 1000.0)),
     ("Letter Spacing", "letterSpace", (-100.0, 500.0)),
     ("Glyph Scaling", "glyphScale", (50.0, 200.0)),
@@ -8383,7 +8413,7 @@ const SINGLE_WORD_CHOICES: [(&str, &str); 4] =
 /// Checks the edited spacing values: each within its range, and minimum ≤ desired ≤ maximum
 /// (values left mixed are not compared); an edited Auto Leading within its range, and an edited
 /// Single Word Justification one of its choices.
-fn check_justification(d: &Dialog, prefix: &str, current: &Value) -> Result<(), String> {
+pub(crate) fn check_justification(d: &Dialog, prefix: &str, current: &Value) -> Result<(), String> {
     crate::paragraph_rag::validate(d, prefix)?;
     if let Some(v) = d.fields.get(&format!("{prefix}autoLeading")) {
         let (lo, hi) = AUTO_LEADING_RANGE;

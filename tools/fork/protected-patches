@@ -2,14 +2,29 @@
 # A path followed by a tab protects that literal in a shared file.
 # Paragraph rag settings, rendering and regression tests
 crates/ui-egui/src/paragraph_rag.rs
+crates/ui-egui/src/paragraph_rag
+crates/ui-egui/src/dock.rs	crate::paragraph_rag::panel(
+crates/ui-egui/src/menus/tables.rs	ui:window.panel|Rag Options|
+crates/ui-egui/src/dialogs.rs	crate::paragraph_rag::style_fields(
+crates/engine/src/cmd/text.rs	format::paragraph_language
+crates/ui-egui/src/panels/properties/tests.rs	fn paragraph_panel_opens_rag_options_from_a_workspace_saved_without_it(
 crates/ui-egui/src/panels/properties/typography.rs	crate::paragraph_rag::COMMAND
 crates/ui-egui/src/menus/ui_commands.rs	crate::paragraph_rag::COMMAND
 crates/ui-egui/src/menus/run.rs	crate::paragraph_rag::COMMAND
 crates/ui-egui/src/dialogs.rs	crate::paragraph_rag::show(
 crates/doc/src/attrs/enums.rs	enum RagPattern
 crates/doc/src/attrs/para_attrs.rs	rag_pattern: RagPattern
+crates/doc/src/attrs/para_attrs.rs	rag_line_insets:
+crates/doc/src/attrs/para_attrs.rs	rag_near_threshold:
 crates/doc/src/attrs/para_attrs.rs	rag_inset:
 crates/engine/src/cmd/text/format.rs	attrs.rag_inset
+crates/compose/src/rag.rs
+crates/compose/src/rag
+crates/compose/src/lib.rs	rag::opening_props(
+crates/compose/src/lib.rs	= pp.rag_pattern == RagPattern::NearFlush
+crates/compose/src/reuse.rs	crate::rag::previous_character(
+crates/compose/src/breaker.rs	RagPattern::FourStop => 4
+crates/compose/src/tests.rs	mod rag_patterns;
 crates/compose/src/lib.rs	= rag_line_bounds(
 crates/compose/src/tests.rs	fn alternating_edges_restarts_after_an_odd_column_or_frame(
 crates/compose/src/tests.rs	fn alternating_measures_inset_short_lines_and_bound_justification(

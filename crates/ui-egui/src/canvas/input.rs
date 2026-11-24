@@ -49,16 +49,15 @@ pub(super) fn draw_cursor_badge(painter: &egui::Painter, p: Pos2, c: Cursor, t: 
     }
 }
 
-/// A text field had keyboard focus when this frame began, per window: egui keeps one focus per
-/// viewport, so a field focused in the main window must not mute the second window's canvas.
-fn field_focused_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::unique("canvas_field_focused").with(ctx.viewport_id())
+/// A text field or dock control held focus when this viewport began its frame.
+fn control_focused_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::unique("canvas_control_focused").with(ctx.viewport_id())
 }
 
 /// Called before the panels draw. A panel field gives up focus on Enter or Tab while it draws,
 /// before the canvas: without this the canvas would take that same key for the text.
 pub fn begin_frame(ctx: &egui::Context) {
-    let (id, focused) = (field_focused_id(ctx), ctx.text_edit_focused());
+    let (id, focused) = (control_focused_id(ctx), ctx.text_edit_focused() || crate::panel_docking::control_focused(ctx));
     ctx.data_mut(|d| d.insert_temp(id, focused));
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -319,9 +318,9 @@ fn canvas_owns_keys(app: &DesignApp, ui: &egui::Ui, resp: &egui::Response, menu_
     // a neighbouring widget while the user is still moving the caret or editing the page.
     let lock = egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true };
     ui.memory_mut(|m| m.set_focus_lock_filter(resp.id, lock));
-    let field_id = field_focused_id(ui.ctx());
-    let field = ui.ctx().text_edit_focused() || ui.data(|d| d.get_temp::<bool>(field_id)).unwrap_or(false);
-    !menu_open && !modal_open(app) && (!field || resp.has_focus()) && keyboard_pane(app)
+    let control_id = control_focused_id(ui.ctx());
+    let control_focused = ui.ctx().text_edit_focused() || ui.data(|d| d.get_temp::<bool>(control_id)).unwrap_or(false);
+    !menu_open && !modal_open(app) && (!control_focused || resp.has_focus()) && keyboard_pane(app)
 }
 
 /// Give an open menu priority, then handle wheel/zoom/pan, spring Zoom, guide drags and primary pointer routing.

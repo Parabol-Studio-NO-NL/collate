@@ -622,6 +622,7 @@ pub const MENUS: &[(&str, &[&str])] = &[
             "ui:window.panel|Conditional Text|{\"panel\": \"conditions\"}",
             "ui:window.panel|Glyphs|{\"panel\": \"glyphs\"}",
             "ui:window.panel|Paragraph|{\"panel\": \"paragraph\"}",
+            "ui:window.panel|Rag Options|{\"panel\": \"ragtime\"}",
             "ui:window.panel|Story|{\"panel\": \"story\"}",
             "ui:window.panel|Table|{\"panel\": \"table\"}",
             "ui:app.tabsPanel",
@@ -677,20 +678,19 @@ pub const CLASSIC_GROUPS: &[&[&str]] = &[
     &["stroke", "color"],
     &["swatches"],
     &["effects"],
-    &["paragraph"],
+    &["paragraph", "ragtime"],
     &["textWrap"],
     &["characterStyles", "paragraphStyles"],
     &["gradient"],
 ];
 
-/// The Typography preset's available panels in the order observed in InDesign's workspace.
-/// CC Libraries has no corresponding DesignCraft panel, and where the Story panel sits in it is
-/// not recorded, so these groups leave it out.
+/// Named panel groups in the Typography workspace.
 pub const TYPOGRAPHY_GROUPS: &[&[&str]] = &[
     &["pages", "layers", "swatches"],
     &["glyphs", "textWrap"],
     &["stroke", "gradient"],
     &["hyperlinks", "effects"],
     &["paragraph", "paragraphStyles"],
+    &["ragtime"],
     &["character", "characterStyles"],
 ];

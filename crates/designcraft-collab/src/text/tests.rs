@@ -190,6 +190,16 @@ fn invalid_or_unsupported_story_changes_leave_the_replica_and_story_unchanged() 
     assert_eq!(replica.apply(&mut current, &styles, "alice", 1, &[large]), Err(Error::Limit));
     assert_eq!(current, original);
     assert_eq!(replica.apply(&mut malformed, &styles, "alice", 1, std::slice::from_ref(&insert)), Err(Error::Invalid("story projection")));
+    for change in [
+        ParagraphFormatChange::Language(Some("a".repeat(256))),
+        ParagraphFormatChange::Language(Some("bad\nname".into())),
+        ParagraphFormatChange::RagLineInsets(Some([0.0, 2.0, -1.0, 3.0])),
+        ParagraphFormatChange::RagNearThreshold(Some(designcraft_doc::MAX_MEASURE + 1.0)),
+    ] {
+        let bad = TextEdit::FormatParagraph { after: None, change };
+        assert!(replica.apply(&mut current, &styles, "alice", 1, &[insert.clone(), bad]).is_err());
+        assert_eq!(current, original);
+    }
     replica.apply(&mut current, &styles, "alice", 1, &[insert]).unwrap();
     assert_eq!(current.text, "xé");
 }
@@ -344,6 +354,13 @@ fn old_text_operations_replay_with_a_long_existing_paragraph_style() {
     replica.apply(&mut current, &styles, "alice", 1, &[edit]).unwrap();
     assert_eq!(current.text, "A\nB");
     assert!(current.paras.iter().all(|paragraph| paragraph.style == name));
+    let legacy_rag = serde_json::from_value(serde_json::json!({
+        "type": "format_paragraph", "after": null, "change": {"kind":"rag_pattern", "value":"alternatingEdges"}
+    }))
+    .unwrap();
+    replica.apply(&mut current, &styles, "alice", 2, &[legacy_rag]).unwrap();
+    assert_eq!(current.paras[0].para.rag_pattern, Some(designcraft_doc::RagPattern::AlternatingEdges));
+    assert!(current.paras[0].para.rag_line_insets.is_none());
 }
 
 #[test]

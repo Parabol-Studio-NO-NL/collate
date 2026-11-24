@@ -232,11 +232,20 @@ pub fn specs() -> Vec<CommandSpec> {
             kern_pair
         ),
         cmd!(
+            "type.paragraphLanguage",
+            "Paragraph Language",
+            [],
+            None,
+            "{language: string | null} sets the default text language on selected paragraphs, or clears it to inherit the paragraph style. Character language overrides are preserved.",
+            has_text_or_frames,
+            format::paragraph_language
+        ),
+        cmd!(
             "type.para",
             "Paragraph Formatting",
             [],
             None,
-            "{attrs: {align?, leftIndent?, rightIndent?, spaceBefore?, spaceAfter?, sameParaStyleSpacing? (pt, each 0..15552), firstLineIndent?, lastLineIndent? (pt, each -15552..15552), wordSpaceMin?/wordSpaceDesired?/wordSpaceMax? (0..10, 1 = 100%), letterSpaceMin?/…Desired?/…Max? (-1..5), glyphScaleMin?/…Desired?/…Max? (0.5..2) (each row Minimum ≤ Desired ≤ Maximum), ragPattern?: none|natural|stepped|alternatingEdges, ragInset? (pt, 0..15552), autoLeading? (0..5 of the type size), singleWordJustify?: left|center|right|fullyJustified, dropCapLines?, dropCapChars?, dropCapStyle?, dropCapAlignLeft?, dropCapScaleDescenders?, hyphenate?: bool (default true), composer?, opticalMargin?: bool (hang at each character's own size; a story with story.options opticalMargin overrides it), ignoreOpticalMargin?: bool (no hang in the paragraph), tabs?, ruleAbove?/ruleBelow?: {on?, weight?, color?, tint?, columnWidth?, offset?, leftIndent?, rightIndent?} (only the named rule fields change), …}}",
+            "{attrs: {align?, leftIndent?, rightIndent?, spaceBefore?, spaceAfter?, sameParaStyleSpacing? (pt, each 0..15552), firstLineIndent?, lastLineIndent? (pt, each -15552..15552), wordSpaceMin?/wordSpaceDesired?/wordSpaceMax? (0..10, 1 = 100%), letterSpaceMin?/…Desired?/…Max? (-1..5), glyphScaleMin?/…Desired?/…Max? (0.5..2) (each row Minimum ≤ Desired ≤ Maximum), ragPattern?: none|natural|stepped|alternatingEdges|fourStop|nearFlush|contextualIndent, ragInset?/ragNearThreshold? (pt, 0..15552), ragLineInsets?: [pt|null; 4] (0..15552 per stop, null entries retain their resolved distance), autoLeading? (0..5 of the type size), singleWordJustify?: left|center|right|fullyJustified, dropCapLines?, dropCapChars?, dropCapStyle?, dropCapAlignLeft?, dropCapScaleDescenders?, hyphenate?: bool (default true), composer?, opticalMargin?: bool (hang at each character's own size; a story with story.options opticalMargin overrides it), ignoreOpticalMargin?: bool (no hang in the paragraph), tabs?, ruleAbove?/ruleBelow?: {on?, weight?, color?, tint?, columnWidth?, offset?, leftIndent?, rightIndent?} (only the named rule fields change), …}}",
             has_text_or_frames,
             |s, p| format_paras(s, p.get("attrs").unwrap_or(p))
         ),
@@ -431,7 +440,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Selection Attributes",
             [],
             None,
-            "{mixed?: bool} → resolved character/paragraph attributes at the text selection; `ownChars`: what the text has of its own over its paragraph (its character style's attributes and its overrides, what a character style made from the selection sets); with mixed, paraMixed lists the paragraph attributes that differ across the selected paragraphs; the selection's start as `selectedText` (one line, up to 60 characters); `storyOptions` {opticalMargin, opticalMarginSize} of the stories story.options would change (null where they differ)",
+            "{mixed?: bool} → resolved character/paragraph attributes at the text selection; `ownChars`: what the text has of its own over its paragraph (its character style's attributes and its overrides, what a character style made from the selection sets); paragraphLanguage is the paragraph default before character formatting; with mixed, paragraphLanguage is null when it varies, paragraphStyleMixed reports different style names, ragLineInsets gives four distances with differing stops null, and paraMixed lists differing paragraph attributes; the selection's start as `selectedText` (one line, up to 60 characters); `storyOptions` {opticalMargin, opticalMarginSize} of the stories story.options would change (null where they differ)",
             has_doc,
             selection_attrs
         ),

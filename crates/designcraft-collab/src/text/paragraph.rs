@@ -1,4 +1,4 @@
-use designcraft_doc::{Align, BASIC_PARAGRAPH, MAX_MEASURE, ParaAttrs, ParaFormat, RagPattern, Styles};
+use designcraft_doc::{Align, BASIC_PARAGRAPH, CharAttrs, MAX_MEASURE, ParaAttrs, ParaFormat, RagPattern, Styles};
 use serde::{Deserialize, Serialize};
 
 use super::{Error, validate_format_name};
@@ -15,8 +15,11 @@ pub(super) struct ParagraphFormat {
     space_before: Option<f64>,
     space_after: Option<f64>,
     hyphenate: Option<bool>,
+    language: Option<String>,
     rag_pattern: Option<RagPattern>,
     rag_inset: Option<f64>,
+    rag_line_insets: Option<[f64; 4]>,
+    rag_near_threshold: Option<f64>,
 }
 
 impl ParagraphFormat {
@@ -32,8 +35,11 @@ impl ParagraphFormat {
             space_before: attrs.space_before,
             space_after: attrs.space_after,
             hyphenate: attrs.hyphenate,
+            language: format.chars.language.clone(),
             rag_pattern: attrs.rag_pattern,
             rag_inset: attrs.rag_inset,
+            rag_line_insets: attrs.rag_line_insets,
+            rag_near_threshold: attrs.rag_near_threshold,
         };
         resolve_style(styles, &shared.style)?;
         for change in [
@@ -44,9 +50,12 @@ impl ParagraphFormat {
             ParagraphFormatChange::SpaceBefore(shared.space_before),
             ParagraphFormatChange::SpaceAfter(shared.space_after),
             ParagraphFormatChange::RagInset(shared.rag_inset),
+            ParagraphFormatChange::RagLineInsets(shared.rag_line_insets),
+            ParagraphFormatChange::RagNearThreshold(shared.rag_near_threshold),
         ] {
             change.validate(styles)?;
         }
+        validate_language(shared.language.as_deref())?;
         if shared.to_doc() != *format {
             return Err(Error::UnsupportedEdit);
         }
@@ -67,9 +76,11 @@ impl ParagraphFormat {
                 hyphenate: self.hyphenate,
                 rag_pattern: self.rag_pattern,
                 rag_inset: self.rag_inset,
+                rag_line_insets: self.rag_line_insets,
+                rag_near_threshold: self.rag_near_threshold,
                 ..Default::default()
             },
-            chars: Default::default(),
+            chars: CharAttrs { language: self.language.clone(), ..Default::default() },
             table: None,
         }
     }
@@ -85,8 +96,11 @@ impl ParagraphFormat {
             (self.space_before != before.space_before).then_some(ParagraphFormatChange::SpaceBefore(self.space_before)),
             (self.space_after != before.space_after).then_some(ParagraphFormatChange::SpaceAfter(self.space_after)),
             (self.hyphenate != before.hyphenate).then_some(ParagraphFormatChange::Hyphenate(self.hyphenate)),
+            (self.language != before.language).then(|| ParagraphFormatChange::Language(self.language.clone())),
             (self.rag_pattern != before.rag_pattern).then_some(ParagraphFormatChange::RagPattern(self.rag_pattern)),
             (self.rag_inset != before.rag_inset).then_some(ParagraphFormatChange::RagInset(self.rag_inset)),
+            (self.rag_line_insets != before.rag_line_insets).then_some(ParagraphFormatChange::RagLineInsets(self.rag_line_insets)),
+            (self.rag_near_threshold != before.rag_near_threshold).then_some(ParagraphFormatChange::RagNearThreshold(self.rag_near_threshold)),
         ]
         .into_iter()
         .flatten()
@@ -108,6 +122,9 @@ pub enum ParagraphFormatChange {
     Hyphenate(Option<bool>),
     RagPattern(Option<RagPattern>),
     RagInset(Option<f64>),
+    Language(Option<String>),
+    RagLineInsets(Option<[f64; 4]>),
+    RagNearThreshold(Option<f64>),
 }
 
 impl ParagraphFormatChange {
@@ -124,6 +141,9 @@ impl ParagraphFormatChange {
             Self::SpaceBefore(value) => validate_measure(*value, 0.0, "space before paragraph"),
             Self::SpaceAfter(value) => validate_measure(*value, 0.0, "space after paragraph"),
             Self::RagInset(value) => validate_measure(*value, 0.0, "short-line inset"),
+            Self::Language(name) => validate_language(name.as_deref()),
+            Self::RagLineInsets(values) => values.iter().flatten().try_for_each(|v| validate_measure(Some(*v), 0.0, "rag line inset")),
+            Self::RagNearThreshold(value) => validate_measure(*value, 0.0, "near-flush threshold"),
             Self::Align(_) | Self::Hyphenate(_) | Self::RagPattern(_) => Ok(()),
         }
     }
@@ -141,6 +161,9 @@ impl ParagraphFormatChange {
             Self::Hyphenate(value) => format.hyphenate = *value,
             Self::RagPattern(value) => format.rag_pattern = *value,
             Self::RagInset(value) => format.rag_inset = *value,
+            Self::Language(value) => format.language.clone_from(value),
+            Self::RagLineInsets(value) => format.rag_line_insets = *value,
+            Self::RagNearThreshold(value) => format.rag_near_threshold = *value,
         }
     }
 }
@@ -151,4 +174,11 @@ fn resolve_style(styles: &Styles, name: &str) -> Result<(), Error> {
 
 fn validate_measure(value: Option<f64>, min: f64, field: &'static str) -> Result<(), Error> {
     if value.is_some_and(|value| !(min..=MAX_MEASURE).contains(&value)) { Err(Error::Invalid(field)) } else { Ok(()) }
+}
+
+fn validate_language(name: Option<&str>) -> Result<(), Error> {
+    if name.is_some_and(|name| name.trim().is_empty()) {
+        return Err(Error::Invalid("paragraph language"));
+    }
+    validate_format_name(name)
 }

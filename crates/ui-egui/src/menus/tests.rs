@@ -2808,8 +2808,8 @@ fn typography_workspace_opens_its_panels_from_named_icon_groups_and_resets() {
     let groups = app.ui.icon_groups.clone().unwrap();
     assert_eq!(groups[0], ["pages", "layers", "swatches"]);
     assert_eq!(groups[4], ["paragraph", "paragraphStyles"]);
-    assert_eq!(groups[5], ["character", "characterStyles"]);
-    for panel in ["pages", "paragraphStyles", "characterStyles"] {
+    assert_eq!(groups[6], ["character", "characterStyles"]);
+    for panel in ["pages", "paragraphStyles", "ragtime", "characterStyles"] {
         run_ui(&mut app, "window.panel", &json!({"panel":panel})).unwrap().unwrap();
         assert!(crate::panel_docking::showing(&app, panel), "{panel}");
         assert!(app.ui.docking.as_ref().unwrap().floating.is_empty(), "{panel} opens from its icon group");
@@ -3306,6 +3306,41 @@ fn start_screen_texts(app: &mut crate::DesignApp) -> Vec<String> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_focused_dock_control_keeps_tab_and_space_out_of_selected_text() {
+    use egui_kittest::kittest::Queryable as _;
+
+    let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+    app.run("file.new", json!({})).unwrap();
+    let f = app.run("frame.create", json!({"rect":[30,40,300,300],"content":"text","text":"Typesetting"})).unwrap();
+    app.run("text.select", json!({"story":f["story"],"anchor":2})).unwrap();
+    app.run("window.workspace", json!({"name":"Typography"})).unwrap();
+    app.ui.control_bar = false;
+    app.run("window.panel.activate", json!({"panel":"ragtime"})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 800.0)).build_ui_state(
+        |ui, app: &mut DesignApp| {
+            app.logic(&ui.ctx().clone());
+            app.ui(ui);
+        },
+        app,
+    );
+    h.run_steps(4);
+    h.get_by_label("Paragraph language").focus();
+    h.run_steps(3);
+    h.key_press(egui::Key::Tab);
+    h.run_steps(3);
+    assert!(h.get_by_label("Hyphenate").is_focused());
+    let before = h.state_mut().run("type.selectionAttrs", json!({})).unwrap()["para"]["hyphenate"].clone();
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    assert_ne!(h.state_mut().run("type.selectionAttrs", json!({})).unwrap()["para"]["hyphenate"], before);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
+    h.run_steps(3);
+    assert!(h.get_by_label("Paragraph language").is_focused());
+    assert_eq!(h.state().ui.hidden_panels, 0);
+    assert_eq!(h.state_mut().run("story.get", json!({"story":f["story"]})).unwrap()["text"], "Typesetting");
+}
+
 #[test]
 fn start_screen_offers_document_actions_and_joins_from_the_keyboard() {
     use egui_kittest::kittest::Queryable as _;

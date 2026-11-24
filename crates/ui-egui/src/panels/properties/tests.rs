@@ -441,6 +441,24 @@ fn paragraph_panel_menu_opens_justification_and_rag_for_selected_text() {
 }
 
 #[test]
+fn paragraph_panel_opens_rag_options_from_a_workspace_saved_without_it() {
+    let mut app = text_app();
+    app.ui.icon_groups = Some(vec![vec!["paragraph".into(), "paragraphStyles".into()]]);
+    app.ui.docking = Some(crate::panel_docking::default_layout(&app.ui));
+    let mut h = panel_harness(app, paragraph_panel);
+    h.run_steps(3);
+    h.get_by_label("☰").click();
+    h.run_steps(3);
+    h.get_by_label("Rag Options").click();
+    h.run_steps(3);
+    assert!(crate::panel_docking::showing(h.state(), "ragtime"));
+    let saved = serde_json::to_vec(&h.state().ui).unwrap();
+    let restored = crate::UiState::from_preferences_json(&saved).unwrap();
+    assert_eq!(h.state().ui.docking, restored.docking);
+    assert!(restored.docking.unwrap().contains(&"paragraphStyles".to_owned()));
+}
+
+#[test]
 fn paragraph_panel_menu_define_lists_opens_its_dialog() {
     let mut h = panel_harness(text_app(), paragraph_panel);
     h.run_steps(3);

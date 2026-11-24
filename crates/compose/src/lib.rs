@@ -24,6 +24,7 @@ mod outline;
 mod overlay;
 mod parabox;
 mod placed;
+mod rag;
 mod reuse;
 mod ruby;
 pub mod shape;
@@ -53,6 +54,7 @@ pub use crate::notes::{find_note, hit_note, hit_note_with, note_caret};
 pub use crate::outline::FrameOutline;
 use crate::parabox::ParaBox;
 pub use crate::placed::Placement;
+use crate::rag::{rag_inset, rag_line_bounds};
 use crate::shape::{Glyph, StyleTable, SubstCtx};
 pub use crate::table::{BorderHit, PlacedCell, StrokeSeg, TableFrag, cell_caret, find_cell, hit_border, hit_cell, hit_cell_with};
 
@@ -1653,6 +1655,7 @@ struct NestedLineStyleInput<'a, 'b, 'font> {
     drop_align: bool,
     drop_tabs: (&'a [designcraft_doc::TabStop], f64),
     cursor: &'a Cursor,
+    context_anchor: Option<f64>,
     frames: &'a [FrameSpec],
     columns: &'a [Vec<Rect>],
     exceptions: &'a HashMap<String, Vec<usize>>,
@@ -1679,6 +1682,7 @@ fn apply_nested_line_styles(input: NestedLineStyleInput<'_, '_, '_>) {
         drop_align,
         drop_tabs,
         cursor: cur,
+        context_anchor,
         frames,
         columns: cols,
         exceptions: hyph_exceptions,
@@ -1703,22 +1707,32 @@ fn apply_nested_line_styles(input: NestedLineStyleInput<'_, '_, '_>) {
             // of the vector, and the drop cap's character still votes (#1688).
             let korean = hyphen::korean_paragraph(gl.iter().map(|g| (g.byte, g.ch, g.list_label || g.generated_text.is_some())));
             let dc = split_drop_cap(db, &mut gl, drop_end, pp.drop_cap_lines, base_leading, base_cap, drop_grid, drop_align, drop_tabs);
+            apply_desired_spacing(&mut gl, pp);
+            mojikumi::apply(&mut gl, &doc.styles, &pp.mojikumi);
+            let mut hy = hyphenation_points(&story.text, &gl, pp, hyph_exceptions, &foreign_ranges(doc, story, prange.clone(), base_chars), korean);
+            suppress_hyphens(&mut hy, &gl, suppressed_hyphens);
+            let first_indent = if pp.rag_pattern == RagPattern::ContextualIndent {
+                rag::contextual_indent(
+                    context_anchor,
+                    col.x0 + pp.left_indent,
+                    col.x1 - pp.right_indent,
+                    breaker::first_word_width(&gl, &hy, &spacing),
+                )
+            } else {
+                pp.first_line_indent
+            };
             let width = |j: usize| {
                 let ind = match &dc {
                     Some(dc) if j < dc.lines => dc.indent(),
-                    _ if j == 0 => pp.first_line_indent,
+                    _ if j == 0 => first_indent,
                     _ => 0.0,
                 };
                 let measure = (col.width() - pp.left_indent - pp.right_indent - ind).max(1.0);
                 measure - rag_inset(pp, j, measure)
             };
-            apply_desired_spacing(&mut gl, pp);
-            mojikumi::apply(&mut gl, &doc.styles, &pp.mojikumi);
-            let mut hy = hyphenation_points(&story.text, &gl, pp, hyph_exceptions, &foreign_ranges(doc, story, prange.clone(), base_chars), korean);
-            suppress_hyphens(&mut hy, &gl, suppressed_hyphens);
             let breaks = if pp.composer.single_line() || gl.iter().any(|g| g.ch == '\t') || gl.len() > 4000 {
                 let tab = |j: usize, x: f64, i: usize| {
-                    let ind = pp.left_indent + if j == 0 { pp.first_line_indent } else { 0.0 };
+                    let ind = pp.left_indent + if j == 0 { first_indent } else { 0.0 };
                     tab_advance(&pp.tabs, pp.left_indent, ind + x, gl.get(i + 1..).unwrap_or_default()).0
                 };
                 breaker::greedy(&gl, &hy, &spacing, &width, &tab)
@@ -2019,28 +2033,6 @@ struct BreakInput<'a> {
     rtl: bool,
     has_tabs: bool,
     spacing: &'a Spacing,
-}
-
-/// Bound the inset wherever wrapping or indents leave less room than the full column.
-/// Smaller slots keep all the measure they have.
-fn rag_inset(pp: &ParaProps, line_in_column: usize, measure: f64) -> f64 {
-    let inset_line = match pp.rag_pattern {
-        RagPattern::None => false,
-        RagPattern::Natural | RagPattern::Stepped => !line_in_column.is_multiple_of(2),
-        RagPattern::AlternatingEdges => true,
-    };
-    if inset_line && pp.rag_inset.is_finite() { pp.rag_inset.clamp(0.0, (measure - 12.0).max(0.0)) } else { 0.0 }
-}
-
-fn rag_line_bounds(pp: &ParaProps, line_in_column: usize, x0: f64, x1: f64, left_page: bool) -> (f64, f64, Align) {
-    let inset = rag_inset(pp, line_in_column, x1 - x0);
-    match pp.rag_pattern {
-        RagPattern::None => (x0, x1, page_alignment(pp.align, left_page)),
-        RagPattern::Natural => (x0, x1 - inset, Align::Left),
-        RagPattern::Stepped => (x0, x1 - inset, Align::LeftJustified),
-        RagPattern::AlternatingEdges if !line_in_column.is_multiple_of(2) => (x0 + inset, x1, Align::Right),
-        RagPattern::AlternatingEdges => (x0, x1 - inset, Align::Left),
-    }
 }
 
 fn choose_paragraph_breaks(input: BreakInput<'_>) -> Vec<Break> {
@@ -2473,7 +2465,7 @@ fn place_paragraph_lines(shared: PlacementShared<'_, '_>, paragraph: ParagraphLi
         let est_first = if carry.is_empty() { cur.next_baseline(f, col, base_leading, est_asc, est_tops, pp) } else { carry_baseline + base_leading };
         let est_jump = cur.jump(f, base_leading, est_asc, est_tops);
         let slots = estimate_slots(f, col, est_first, est_jump, base_leading, base_chars.size, est_band, &glyphs[g0..], rtl, &carry);
-        let breaks = choose_paragraph_breaks(BreakInput {
+        let mut break_input = BreakInput {
             glyphs: &glyphs[g0..],
             hyphens: &hyph_after[g0..],
             props: pp,
@@ -2485,7 +2477,11 @@ fn place_paragraph_lines(shared: PlacementShared<'_, '_>, paragraph: ParagraphLi
             rtl,
             has_tabs,
             spacing,
-        });
+        };
+        let contextual = rag::opening_props(&break_input, out.frames[cur.fi].lines.last(), pi, cur.col);
+        let pp = contextual.as_ref().unwrap_or(pp);
+        break_input.props = pp;
+        let breaks = choose_paragraph_breaks(break_input);
         let mut moved = false;
         // Set by a line with an Indent to Here character, for the lines broken again after it.
         let mut reindented = None;
@@ -2540,7 +2536,8 @@ fn place_paragraph_lines(shared: PlacementShared<'_, '_>, paragraph: ParagraphLi
             // Past the estimated slots the breaker assumes the whole column. Check that
             // fallback too: narrow wrap segments may need more lines than the estimate.
             let (estimated_x0, estimated_x1) = slots.get(k).copied().unwrap_or((col.x0, col.x1));
-            if (k > 0 || !continues) && rebreaks < 256 && ((estimated_x1 - estimated_x0) - (x1 - x0)).abs() > 0.5 {
+            let context_slot_moved = line_no == 0 && pp.rag_pattern == RagPattern::ContextualIndent && (estimated_x0 - x0).abs() > 0.5;
+            if (k > 0 || !continues) && rebreaks < 256 && (context_slot_moved || ((estimated_x1 - estimated_x0) - (x1 - x0)).abs() > 0.5) {
                 rebreaks += 1;
                 carry.insert(0, (x0, x1));
                 g0 = s;
@@ -2613,7 +2610,7 @@ fn place_paragraph_lines(shared: PlacementShared<'_, '_>, paragraph: ParagraphLi
                 // one in a right-to-left paragraph: applied on the left it moved the line the
                 // wrong way, out of the frame for the hanging indent a numbered list uses
                 // (#1448).
-                None if rtl => (pp.left_indent, pp.right_indent + first_line),
+                None if rtl && pp.rag_pattern != RagPattern::ContextualIndent => (pp.left_indent, pp.right_indent + first_line),
                 None => (pp.left_indent + first_line, pp.right_indent),
             };
             let line_in_column = line_no - col_first_line;
@@ -2766,6 +2763,7 @@ struct ParagraphShapeInput<'a, 'font> {
     frames: &'a [FrameSpec],
     columns: &'a [Vec<Rect>],
     cursor: &'a Cursor,
+    context_anchor: Option<f64>,
 }
 
 struct ShapedParagraph {
@@ -2809,6 +2807,7 @@ fn shape_paragraph(input: ParagraphShapeInput<'_, '_>) -> ShapedParagraph {
         frames,
         columns,
         cursor,
+        context_anchor,
     } = input;
     let drop_end = drop_cap_end(&story.text, prange.clone(), pp, sub.vertical);
     let mut table = StyleTable { styles, missing: missing_fonts };
@@ -2873,6 +2872,7 @@ fn shape_paragraph(input: ParagraphShapeInput<'_, '_>) -> ShapedParagraph {
         drop_align,
         drop_tabs: (&pp.tabs[..], drop_tab_indent),
         cursor,
+        context_anchor,
         frames,
         columns,
         exceptions: hyph_exceptions,
@@ -3424,6 +3424,7 @@ fn compose_run(
         });
         #[cfg(test)]
         reuse::SHAPED.with(|n| n.set(n.get() + 1));
+        let context_anchor = rag::nested_anchor(&pp, out.frames.get(cur.fi), pi, cur.col);
         let shaped = shape_paragraph(ParagraphShapeInput {
             db,
             doc,
@@ -3444,6 +3445,7 @@ fn compose_run(
             frames,
             columns: &cols,
             cursor: &cur,
+            context_anchor,
         });
         boxes[pi] = shaped.para_box;
         let ShapedParagraph {
@@ -3990,8 +3992,8 @@ fn spacing_for(pp: &ParaProps, base_size: f64, story: &Story, cjk: bool) -> Spac
     let (optical, optical_size) = optical_for(pp, story);
     let justify = match pp.rag_pattern {
         RagPattern::None => pp.align.is_justified(),
-        RagPattern::Stepped => true,
-        RagPattern::Natural | RagPattern::AlternatingEdges => false,
+        RagPattern::Stepped | RagPattern::FourStop => true,
+        RagPattern::Natural | RagPattern::AlternatingEdges | RagPattern::NearFlush | RagPattern::ContextualIndent => false,
     };
     Spacing {
         justify,
@@ -5298,14 +5300,13 @@ fn layout_line(
     let seg_justifies = last_tab.is_none_or(|(_, left)| left);
     // Spaces inside a jidori run keep the run's fitted width, as in the breaker.
     let spaces: Vec<usize> = line.iter().enumerate().skip(seg).filter(|(_, g)| g.is_justify_space() && !g.locked_advance).map(|(i, _)| i).collect();
-    let justify_this = align.is_justified() && (!last || align == Align::FullyJustified || forced_mid) && seg_justifies;
+    let near_flush = pp.rag_pattern == RagPattern::NearFlush && !last && (0.0..=pp.rag_near_threshold).contains(&extra);
+    let justify_this = (near_flush || align.is_justified() && (!last || align == Align::FullyJustified || forced_mid)) && seg_justifies;
     // A line can have been composed with shrink even when it is not justified.
     let squeeze = !justify_this
         && seg_justifies
         && extra < 0.0
-        && (align.is_justified()
-            || sp.rag_pattern != RagPattern::None
-            || line.iter().any(|g| g.moji.shrink > 0.0 || mojikumi::start_elastic(g, false, true)[1] > 0.0));
+        && (align.is_justified() || sp.elastic() || line.iter().any(|g| g.moji.shrink > 0.0 || mojikumi::start_elastic(g, false, true)[1] > 0.0));
     // Extra advance per glyph (word spaces and letter gaps) and horizontal scale per glyph.
     let mut add = vec![0.0; line.len()];
     let mut scale = vec![1.0; line.len()];

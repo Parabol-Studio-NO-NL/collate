@@ -130,7 +130,7 @@ pub(super) fn selection_attrs(s: &mut Session, p: &Value) -> Result<Value> {
     own.merge(&cf.over);
     // The selected text (its start, on one line), for previews such as the font menu's.
     let selected = selected_text_preview(story.text.get(r.start..r.end).unwrap_or_default().chars());
-    let mut out = json!({"story": sid.0, "paragraphStyle": pf.style, "characterStyle": cf.style, "para": pp, "chars": cp, "ownChars": own,
+    let mut out = json!({"story": sid.0, "paragraphStyle": pf.style, "paragraphLanguage": base.language, "characterStyle": cf.style, "para": pp, "chars": cp, "ownChars": own,
         "paraOverrides": style_para.delta(&pp).count() + style_chars.delta(&base).count(),
         "charOverrides": char_delta.count(), "characterStyleOverrides": character_style_overrides,
         "selectedText": selected.trim()});
@@ -140,7 +140,7 @@ pub(super) fn selection_attrs(s: &mut Session, p: &Value) -> Result<Value> {
     }
     out["storyOptions"] = story_options_of(&st.doc, &stories);
     if bool_or(p, "mixed", false) {
-        out["paraMixed"] = json!(mixed_para_attrs(&st.doc, &targets));
+        add_mixed_paragraph_attrs(&st.doc, &targets, pf, &mut out);
     }
     Ok(out)
 }
@@ -158,28 +158,84 @@ fn story_options_of(doc: &designcraft_doc::Document, stories: &[StoryId]) -> Val
     json!({"opticalMargin": on, "opticalMarginSize": size})
 }
 
-/// The paragraph attributes whose resolved values differ across the paragraphs of `targets`.
-fn mixed_para_attrs(doc: &designcraft_doc::Document, targets: &[Target]) -> Vec<String> {
-    let mut first: Option<serde_json::Map<String, Value>> = None;
+/// Reuse the first paragraph's resolved values, especially when inspecting a uniform text frame.
+fn add_mixed_paragraph_attrs(doc: &designcraft_doc::Document, targets: &[Target], first: &designcraft_doc::ParaFormat, out: &mut Value) {
     let mut mixed = std::collections::BTreeSet::new();
-    for t in targets {
-        let Some(story) = doc.text_story(t.story, t.cell) else { continue };
-        let a = story.para_at(t.range.start);
-        let b = story.para_at(t.range.end.max(t.range.start));
-        for pf in story.paras.get(a..=b).unwrap_or(&[]) {
-            let Ok(Value::Object(v)) = serde_json::to_value(doc.styles.resolve_para(pf).0) else { continue };
-            match &first {
-                None => first = Some(v),
-                Some(f) => mixed.extend(v.into_iter().filter(|(k, x)| f.get(k) != Some(x)).map(|(k, _)| k)),
+    let mut insets = [None; 4];
+    for (i, value) in insets.iter_mut().enumerate() {
+        *value = out["para"]["ragLineInsets"][i].as_f64();
+    }
+    let mut style_mixed = false;
+    let mut language_mixed = false;
+    for target in targets {
+        let Some(story) = doc.text_story(target.story, target.cell) else { continue };
+        let a = story.para_at(target.range.start);
+        let b = story.para_at(target.range.end);
+        for format in story.paras.get(a..=b).unwrap_or(&[]) {
+            if format == first {
+                continue;
+            }
+            let (para, chars) = doc.styles.resolve_para(format);
+            for (common, inset) in insets.iter_mut().zip(para.rag_line_insets) {
+                if *common != Some(inset) {
+                    *common = None;
+                }
+            }
+            style_mixed |= format.style != first.style;
+            language_mixed |= out["paragraphLanguage"].as_str() != Some(chars.language.as_str());
+            if let Ok(Value::Object(values)) = serde_json::to_value(para) {
+                mixed.extend(values.into_iter().filter(|(key, value)| out["para"].get(key) != Some(value)).map(|(key, _)| key));
             }
         }
     }
-    mixed.into_iter().collect()
+    out["paraMixed"] = json!(mixed);
+    out["paragraphStyleMixed"] = json!(style_mixed);
+    out["ragLineInsets"] = json!(insets);
+    if language_mixed {
+        out["paragraphLanguage"] = Value::Null;
+    }
 }
 
 #[cfg(test)]
 mod story_options_tests {
     use super::*;
+
+    #[test]
+    fn paragraph_language_at_a_caret_reflows_text_and_preserves_run_languages() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let text = "Satz internationalization internationalization internationalization\nNext";
+        let frame = s.execute("frame.create", &json!({"rect": [0, 0, 84, 500], "content": "text", "text": text})).unwrap();
+        let sid = frame["story"].as_u64().unwrap();
+        let hyphens = |s: &Session| {
+            let composed = s.cache.get(&s.doc().unwrap().doc, StoryId(sid), None);
+            composed.frames[0].lines.iter().filter(|line| line.hyphenated).count()
+        };
+        let select = |s: &mut Session, a, b| {
+            s.execute("text.select", &json!({"story":sid, "anchor":a, "focus":b})).unwrap();
+        };
+        let attrs = |s: &mut Session| s.execute("type.selectionAttrs", &json!({"mixed":true})).unwrap();
+        select(&mut s, 0, 4);
+        s.execute("type.char", &json!({"attrs":{"language":"German"}})).unwrap();
+        select(&mut s, 0, 0);
+        s.execute("type.paragraphLanguage", &json!({"language":"French"})).unwrap();
+        let current = attrs(&mut s);
+        assert_eq!(current["paragraphLanguage"], "French");
+        assert_eq!(current["chars"]["language"], "German");
+        select(&mut s, 10, 11);
+        assert_eq!(attrs(&mut s)["chars"]["language"], "French");
+        assert!(hyphens(&s) > 0, "French hyphenation applies to existing words");
+        s.execute("type.paragraphLanguage", &json!({"language":"[No Language]"})).unwrap();
+        assert_eq!(hyphens(&s), 0);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(hyphens(&s) > 0);
+        select(&mut s, 0, text.len());
+        assert!(attrs(&mut s)["paragraphLanguage"].is_null());
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(attrs(&mut s)["paragraphLanguage"], "English: USA");
+        select(&mut s, 0, 0);
+        assert_eq!(attrs(&mut s)["chars"]["language"], "German");
+    }
 
     #[test]
     fn malformed_explicit_story_targets_do_not_change_the_selection() {

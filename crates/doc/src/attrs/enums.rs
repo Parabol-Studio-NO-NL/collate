@@ -214,6 +214,9 @@ pub enum RagPattern {
     Natural,
     Stepped,
     AlternatingEdges,
+    FourStop,
+    NearFlush,
+    ContextualIndent,
 }
 
 /// What a nested style runs to (Drop Caps and Nested Styles).
