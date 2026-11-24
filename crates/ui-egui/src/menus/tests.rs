@@ -1076,6 +1076,11 @@ fn tab_hides_panels_and_documents_cycle() {
     for _ in 0..3 {
         app.session.execute("file.new", &json!({})).unwrap();
     }
+    let ctx = egui::Context::default();
+    press(&mut app, &ctx, egui::Key::Tab, egui::Modifiers::NONE);
+    assert_eq!(app.ui.hidden_panels, 1, "Tab still hides panels when a document is open");
+    press(&mut app, &ctx, egui::Key::Tab, egui::Modifiers::SHIFT);
+    assert_eq!(app.ui.hidden_panels, 2, "Shift+Tab leaves the document tools visible");
     assert_eq!(app.session.active_index(), Some(2));
     run_ui(&mut app, "window.nextDocument", &json!({})).unwrap().unwrap();
     assert_eq!(app.session.active_index(), Some(0));
@@ -3296,6 +3301,42 @@ fn start_screen_texts(app: &mut crate::DesignApp) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn start_screen_offers_document_actions_and_joins_from_the_keyboard() {
+    use egui_kittest::kittest::Queryable as _;
+
+    let app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
+        |ui, app: &mut DesignApp| {
+            app.logic(&ui.ctx().clone());
+            app.ui(ui);
+        },
+        app,
+    );
+    h.run_steps(4);
+    for removed in ["Welcome to Collate", "Page layout for print and screen", "Open sample magazine", "DesignCraft community"] {
+        assert!(h.query_by_label_contains(removed).is_none(), "{removed} appeared on the start screen");
+    }
+    assert!(h.query_by_label("New file").is_some());
+    h.get_by_label("Open").focus();
+    h.run();
+    assert!(h.get_by_label("Open").is_focused());
+    h.key_press(egui::Key::Tab);
+    h.run();
+    assert_eq!(h.state().ui.hidden_panels, 0, "Tab should move focus on Home");
+    assert!(h.get_by_label("Join shared document…").is_focused());
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
+    h.run();
+    assert!(h.get_by_label("Open").is_focused());
+    h.key_press(egui::Key::Tab);
+    h.run();
+    assert!(h.query_by_label("Join and receive document").is_none());
+    h.key_press(egui::Key::Enter);
+    h.run();
+    assert!(h.query_by_label("Join and receive document").is_some());
 }
 
 /// File › Open Recent: the files first (`app.openRecent {index}`), then Clear Recent Files.

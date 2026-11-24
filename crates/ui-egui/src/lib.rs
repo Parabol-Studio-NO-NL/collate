@@ -248,6 +248,8 @@ pub struct DesignApp {
     /// window is ready; see [`DesignApp::open_documents_later`].
     os_documents: Vec<String>,
     pub integrated_titlebar: bool,
+    /// Leading inset in native points, measured after AppKit lays out the window buttons.
+    pub mac_home_leading: Option<f32>,
     /// The desktop host uses our caption controls and window drag/resize regions (Windows).
     pub custom_titlebar: bool,
     pub(crate) window_maximized: bool,

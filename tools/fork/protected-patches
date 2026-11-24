@@ -32,6 +32,9 @@ crates/ui-egui/src/app.rs	self.show_collaboration(
 crates/ui-egui/src/app/quit.rs	self.collaboration_blocks_close()
 crates/ui-egui/src/canvas.rs	app.draw_collaboration_presence(
 crates/ui-egui/src/chrome/app_bar.rs	app.collaboration_button(
+crates/ui-egui/src/chrome/start_screen.rs	"app.shareDocument"
+crates/ui-egui/src/menus/tests.rs	fn start_screen_offers_document_actions_and_joins_from_the_keyboard(
+crates/ui-egui/src/chrome/tests.rs	fn the_title_bar_tools_have_equal_gaps_and_height(
 crates/ui-egui/src/menus/run.rs	"app.shareDocument" =>
 crates/ui-egui/src/tests.rs	fn top_bar_share_opens_collaboration_from_the_keyboard(
 

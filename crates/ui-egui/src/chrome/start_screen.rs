@@ -12,62 +12,26 @@ pub fn start_screen(app: &mut DesignApp, ui: &mut egui::Ui) {
         })),
         |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.label(crate::rtl::widget(
-                    ui,
-                    egui::RichText::new(crate::i18n::tr(&app.ui.language, "Welcome to Collate")).font(semibold(28.0)).color(t.text_strong),
-                ));
-                ui.label(crate::rtl::widget(
-                    ui,
-                    egui::RichText::new(crate::i18n::tr(&app.ui.language, "Page layout for print and screen — fast, open and scriptable."))
-                        .size(15.0)
-                        .color(t.text_dim),
-                ));
-                ui.add_space(24.0);
                 ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(crate::rtl::widget(
-                                ui,
-                                egui::RichText::new(crate::i18n::tr(&app.ui.language, "  New file  ")).size(14.0).color(Color32::WHITE),
-                            ))
-                            .fill(t.accent_strong)
-                            .corner_radius(16.0)
-                            .min_size(vec2(0.0, 32.0)),
-                        )
-                        .clicked()
-                    {
+                    ui.spacing_mut().button_padding.x *= 2.0;
+                    let button = |ui: &egui::Ui, text: egui::RichText| {
+                        egui::Button::new(crate::rtl::widget(ui, text.size(14.0))).corner_radius(16.0).min_size(vec2(0.0, 32.0))
+                    };
+                    let new = egui::RichText::new(crate::i18n::tr(&app.ui.language, "  New file  ").trim()).color(Color32::WHITE);
+                    if ui.add(button(ui, new).fill(t.accent_strong)).clicked() {
                         let _ = app.run("app.newDocumentDialog", json!({}));
                     }
-                    if ui
-                        .add(
-                            egui::Button::new(crate::rtl::widget(ui, egui::RichText::new(crate::i18n::tr(&app.ui.language, "  Open  ")).size(14.0)))
-                                .corner_radius(16.0)
-                                .min_size(vec2(0.0, 32.0)),
-                        )
-                        .clicked()
-                    {
-                        let _ = app.run("app.openDialog", json!({}));
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if ui.add(egui::Button::new(crate::i18n::tr(&app.ui.language, "Join shared document…")).min_size(vec2(0.0, 32.0))).clicked() {
-                        let _ = app.run("app.shareDocument", json!({}));
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(crate::rtl::widget(
-                                ui,
-                                egui::RichText::new(crate::i18n::tr(&app.ui.language, "  Open sample magazine  ")).size(14.0),
-                            ))
-                            .corner_radius(16.0)
-                            .min_size(vec2(0.0, 32.0)),
-                        )
-                        .clicked()
-                    {
-                        let _ = app.run("file.newSample", json!({}));
+                    for (label, command) in [
+                        ("  Open  ", "app.openDialog"),
+                        #[cfg(not(target_arch = "wasm32"))]
+                        ("Join shared document…", "app.shareDocument"),
+                    ] {
+                        let text = egui::RichText::new(crate::i18n::tr(&app.ui.language, label).trim());
+                        if ui.add(button(ui, text)).clicked() {
+                            let _ = app.run(command, json!({}));
+                        }
                     }
                 });
-                ui.add_space(20.0);
-                community_card(app, ui);
                 recent_files(app, ui);
                 ui.add_space(24.0);
                 ui.label(crate::rtl::widget(
@@ -221,29 +185,4 @@ fn recent_preview_texture(ctx: &egui::Context, path: &str, modified: Option<std:
     });
     ctx.data_mut(|d| d.insert_temp::<Cached>(key, (modified, tex.clone())));
     tex
-}
-
-/// Start screen: upstream project resources.
-fn community_card(app: &mut DesignApp, ui: &mut egui::Ui) {
-    let t = Tokens::get(ui.ctx());
-    egui::Frame::NONE.fill(t.panel).corner_radius(10.0).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
-        ui.label(crate::rtl::widget(
-            ui,
-            egui::RichText::new(crate::i18n::tr(&app.ui.language, "DesignCraft community")).font(semibold(14.0)).color(t.text_strong),
-        ));
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            for (text, id) in [("DesignCraft page", "help.appPage"), ("GitHub", "help.github"), ("getartcraft.com", "help.website")] {
-                let url = designcraft_engine::links::get(&id[5..]).unwrap_or_default();
-                let link = ui
-                    .add(egui::Label::new(egui::RichText::new(text).size(12.0).color(t.accent).underline()).sense(Sense::click()))
-                    .on_hover_text(url)
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if link.clicked() {
-                    let _ = app.run(id, json!({}));
-                }
-                ui.add_space(8.0);
-            }
-        });
-    });
 }

@@ -105,6 +105,7 @@ impl DesignApp {
             fonts_ready: false,
             os_documents: Vec::new(),
             integrated_titlebar: false,
+            mac_home_leading: None,
             custom_titlebar: false,
             window_maximized: false,
             pending_window_commands: vec![],

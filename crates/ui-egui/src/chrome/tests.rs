@@ -653,25 +653,38 @@ fn a_narrow_window_scrolls_the_control_bar() {
 
 #[test]
 fn the_mac_app_bar_centres_and_clears_the_traffic_lights() {
-    use super::{MAC_APP_BAR, MAC_CONTENT_LEFT, MAC_LIGHT, MAC_LIGHT_PITCH, MAC_LIGHTS_LEFT};
-    // Content keeps the same gap after the lights as the lights keep from the top.
-    let margin = (MAC_APP_BAR - MAC_LIGHT) / 2.0;
-    assert_eq!(MAC_CONTENT_LEFT - (MAC_LIGHTS_LEFT + 2.0 * MAC_LIGHT_PITCH + MAC_LIGHT), margin);
-    // `egui::Margin` is in `i8`.
-    assert!(MAC_CONTENT_LEFT <= f32::from(i8::MAX));
+    use super::MAC_APP_BAR;
     let mut app = app();
     app.integrated_titlebar = true;
-    let h = test_window::open(app, vec2(1400.0, 900.0));
+    let native_home_x = 80.0;
+    app.mac_home_leading = Some(native_home_x);
+    let mut h = test_window::open(app, vec2(1400.0, 900.0));
     // The bar's controls share the lights' centre line and start after them (relative to the
     // bar, which the test window insets).
     let bar = test_window::panel_rect(&h, "app_bar").min.to_vec2();
     let home = rect(&h, "Home").translate(-bar);
     assert_eq!(home.center().y, MAC_APP_BAR / 2.0, "{home:?}");
-    assert!(home.min.y >= 2.0 && home.min.x >= MAC_CONTENT_LEFT, "{home:?}");
+    assert!(home.min.y >= 2.0 && (home.min.x - native_home_x).abs() < 1.0, "{home:?}");
     for label in ["File", "Help", "Share"] {
         let r = rect(&h, label).translate(-bar);
         assert!((r.center().y - MAC_APP_BAR / 2.0).abs() <= 0.5 && r.max.y <= MAC_APP_BAR, "{label} at {r:?}");
     }
+    // AppKit's buttons stay in place when the interface is zoomed out.
+    h.state_mut().app.ui.ui_scale = 0.5;
+    h.run_steps(5);
+    let home_x = rect(&h, "Home").left() - test_window::panel_rect(&h, "app_bar").left();
+    assert!((home_x * h.ctx.zoom_factor() - native_home_x).abs() < 1.0, "{home_x}");
+}
+
+#[test]
+fn the_title_bar_tools_have_equal_gaps_and_height() {
+    let h = test_window::open(app(), vec2(1400.0, 900.0));
+    let share = rect(&h, "Share");
+    let workspace = rect(&h, "Essentials ▾");
+    let search = h.ctx.read_response(super::search_id()).unwrap().rect;
+    let gap = workspace.left() - share.right();
+    assert!(gap > 0.0 && (search.left() - workspace.right() - gap).abs() < 1.0, "{share:?}, {workspace:?}, {search:?}");
+    assert!((workspace.height() - share.height()).abs() < 1.0 && (search.height() - share.height()).abs() < 1.0);
 }
 
 fn press(h: &egui_kittest::Harness<'static, test_window::Window>, pos: egui::Pos2, pressed: bool) {
@@ -762,8 +775,7 @@ fn the_mac_window_is_not_movable_on_the_title_bar_controls() {
     let mut h = test_window::open(app, vec2(1400.0, 900.0));
     let bar = test_window::panel_rect(&h, "app_bar");
     let mid = bar.min.y + MAC_APP_BAR / 2.0;
-    // The search field is the bar's last control: 125 wide, 4 from the 10-wide right margin.
-    let search = pos2(bar.max.x - 10.0 - 4.0 - 60.0, mid);
+    let search = h.ctx.read_response(super::search_id()).unwrap().rect.center();
     let controls = [rect(&h, "Home").center(), rect(&h, "Share").center(), rect(&h, "File").center(), search];
     let mut movable_at = |at: egui::Pos2| {
         h.hover_at(at);
