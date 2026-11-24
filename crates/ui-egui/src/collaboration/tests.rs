@@ -1210,6 +1210,24 @@ fn shared_paragraph_formatting_preserves_concurrent_text_in_threaded_frames() {
             assert_eq!(attrs.rag_inset, Some(12.0));
         }
     }
+    // Paragraph language applies to the same anchor as the pattern, but has its own history.
+    let insets = [0.0, 18.0, 4.0, 27.0];
+    host.run("type.para", json!({"attrs": {"ragPattern":"fourStop", "ragLineInsets":insets, "ragNearThreshold":8.5}})).unwrap();
+    guest.run("type.paragraphLanguage", json!({"language":"French"})).unwrap();
+    wait_for(&mut [&mut host, &mut guest], "pattern and dictionary converge", |apps| apps.iter().all(|app| room(app).revision == 13));
+    for (revision, command, language) in [(13, None, Some("French")), (14, Some("edit.undo"), None), (15, Some("edit.redo"), Some("French"))] {
+        if let Some(command) = command {
+            guest.run(command, json!({})).unwrap();
+            wait_for(&mut [&mut host, &mut guest], command, |apps| apps.iter().all(|app| room(app).revision == revision));
+        }
+        assert_eq!(document(&host), document(&guest));
+        let paragraphs = &document(&host).story(story_id).unwrap().paras;
+        assert_eq!(paragraphs[0].chars.language.as_deref(), language);
+        assert_eq!(paragraphs[0].para.rag_pattern, Some(RagPattern::FourStop));
+        assert_eq!(paragraphs[0].para.rag_line_insets, Some(insets));
+        assert_eq!(paragraphs[0].para.rag_near_threshold, Some(8.5));
+        assert_eq!(paragraphs[1].chars.language, original.chars.language);
+    }
     let confirmed = room(&host).history.iter().map(|(commit, _)| commit.clone()).collect();
     let recovered = super::replay::restore(&seed, &seed, confirmed).unwrap();
     assert_eq!(&recovered.document, document(&host));

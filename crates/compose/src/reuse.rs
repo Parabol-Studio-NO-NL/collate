@@ -333,6 +333,15 @@ impl Reuse<'_> {
         if !same_above || info.len() != pi || !old.moved(plan).same(&new) || before.styles.get(..old.styles) != Some(styles.as_slice()) {
             return false;
         }
+        // A chain of contextual paragraphs also depends on the previous line's horizontal end,
+        // even when its baseline and line count survived the edit.
+        let above = |story: &ComposedStory, mark: &Mark, paragraph| {
+            let line = mark.lines.checked_sub(1).and_then(|i| story.frames.get(mark.fi)?.lines.get(i));
+            crate::rag::previous_character(line, paragraph, mark.col)
+        };
+        if bits(above(out, &new, pi)) != bits(above(before, old, k)) {
+            return false;
+        }
         for (i, (to, from)) in out.frames.iter_mut().zip(&before.frames).enumerate().skip(old.fi) {
             let (lines, decos) = if i == old.fi { (old.lines, old.decos) } else { (0, 0) };
             to.lines.extend(from.lines.get(lines..).unwrap_or_default().iter().map(|l| moved_line(l, plan.bytes, plan.paras)));

@@ -3,6 +3,7 @@ use super::{
     NestedLineStyle, NestedStyle, NumberStyle, RagPattern, Rule, Serialize, SpanColumns, StartParagraph, TabStop, TextDirection, attr_key,
     deserialize_explicit_value, expand_list_levels, expand_list_text, list_level_index, sanitized_tabs, unknown_attribute,
 };
+use designcraft_geom::units::PT_PER_MM;
 
 attr_set! {
     /// Paragraph attributes (Paragraph panel / paragraph styles).
@@ -65,6 +66,10 @@ attr_set! {
         rag_pattern: RagPattern = RagPattern::None,
         /// Distance in points to inset the short edge.
         rag_inset: f64 = 5.0 * 72.0 / 25.4,
+        /// Repeating right-edge insets for a four-stop rag, in document points.
+        rag_line_insets: [f64; 4] = [0.0, 8.0 * PT_PER_MM, 2.0 * PT_PER_MM, 12.0 * PT_PER_MM],
+        /// Distance from the right edge inside which a near-flush line may justify.
+        rag_near_threshold: f64 = 3.0 * PT_PER_MM,
         /// Insert Kashidas (World-Ready): justified Arabic lines stretch at joins before spaces.
         kashidas: bool = true,
         /// Preserved vendor policy; non-default policies require a dedicated composer.
@@ -219,6 +224,14 @@ impl ParaAttrs {
     /// [`TabStop::checked_list`] does.
     pub fn set_json_over(&mut self, key: &str, value: &serde_json::Value, current: &ParaProps) -> Result<(), String> {
         let rule = match key.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase().as_str() {
+            "raglineinsets" if !value.is_null() => {
+                // Unedited stops in a mixed selection retain each paragraph's own distance.
+                let patch = <[Option<f64>; 4]>::deserialize(value).map_err(|e| format!("{key}: {e}"))?;
+                if patch.iter().any(Option::is_some) {
+                    self.rag_line_insets = Some(std::array::from_fn(|i| patch[i].unwrap_or(current.rag_line_insets[i])));
+                }
+                return Ok(());
+            }
             "ruleabove" => &current.rule_above,
             "rulebelow" => &current.rule_below,
             "tabs" if !value.is_null() => {

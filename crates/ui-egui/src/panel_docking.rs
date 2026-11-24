@@ -117,6 +117,7 @@ const ICON_GROUPS: &[&[&str]] = &[
     &["characterStyles", "paragraphStyles"],
     &["objectStyles"],
     &["character", "paragraph", "typography"],
+    &["ragtime"],
     &["glyphs", "story"],
     &["table"],
     &["textWrap"],
@@ -1277,6 +1278,29 @@ fn panel_icon(panel: &str) -> Option<&'static str> {
 struct PanelContent<'a> {
     app: &'a mut DesignApp,
 }
+
+fn control_focus_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::unique("dock-control-focus").with(ctx.viewport_id())
+}
+
+/// A focused dock control owns its navigation keys even when text is selected on the canvas.
+pub(crate) fn control_focused(ctx: &egui::Context) -> bool {
+    let key = control_focus_id(ctx);
+    ctx.memory(|m| m.focused()).is_some_and(|focused| ctx.data(|d| d.get_temp::<egui::Id>(key)) == Some(focused))
+}
+
+fn panel_contents(app: &mut DesignApp, ui: &mut egui::Ui, id: &str) {
+    crate::dock::panel_body(app, ui, id);
+    if let Some(focused) = ui.memory(|m| m.focused())
+        && let Some(control) = ui.ctx().read_response(focused)
+        && control.layer_id == ui.layer_id()
+        && ui.clip_rect().intersect(ui.min_rect()).contains(control.rect.center())
+    {
+        let key = control_focus_id(ui.ctx());
+        ui.data_mut(|d| d.insert_temp(key, focused));
+    }
+}
+
 impl craft_ui::docking::DockContent<String> for PanelContent<'_> {
     fn body(&mut self, ui: &mut egui::Ui, id: &String) {
         if id == CANVAS {
@@ -1287,14 +1311,14 @@ impl craft_ui::docking::DockContent<String> for PanelContent<'_> {
         }
         egui::Frame::NONE.inner_margin(egui::Margin::same(8)).show(ui, |ui| {
             if crate::dock::scrolls_itself(id) {
-                crate::dock::panel_body(self.app, ui, id);
+                panel_contents(self.app, ui, id);
                 return;
             }
             // Shrinking to the content's height lets craft-ui fit a float or flyout to it.
             egui::ScrollArea::vertical()
                 .id_salt(("shared-panel-body", id))
                 .auto_shrink([false, true])
-                .show(ui, |ui| crate::dock::panel_body(self.app, ui, id));
+                .show(ui, |ui| panel_contents(self.app, ui, id));
         });
     }
     fn logical_label(&self, id: &String) -> String {

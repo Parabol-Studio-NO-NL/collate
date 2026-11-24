@@ -371,6 +371,9 @@ fn paragraph_panel_menu(app: &mut DesignApp, ui: &mut Ui, p: &Value) {
         attrs = Some(json!({"ignoreOpticalMargin": !ignore}));
     }
     ui.separator();
+    if item(ui, crate::dock::panel_label("ragtime"), None, true) {
+        crate::menus::activate(app, "window.panel.activate", &json!({"panel": "ragtime"}));
+    }
     for (label, id) in [
         ("Justification…", "app.justificationDialog"),
         (crate::paragraph_rag::LABEL, crate::paragraph_rag::COMMAND),

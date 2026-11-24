@@ -163,6 +163,7 @@ pub(crate) fn is_deferred_edit_command(id: &str) -> bool {
             | "text.deleteSurrounding"
             | "type.char"
             | "type.para"
+            | "type.paragraphLanguage"
             | "type.align"
             | "type.alignLeft"
             | "type.alignCenter"

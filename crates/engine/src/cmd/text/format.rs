@@ -180,6 +180,7 @@ pub(crate) fn validate_para_values(attrs: &ParaAttrs, command_id: &str) -> Resul
         ("spaceBefore", attrs.space_before, 0.0),
         ("spaceAfter", attrs.space_after, 0.0),
         ("ragInset", attrs.rag_inset, 0.0),
+        ("ragNearThreshold", attrs.rag_near_threshold, 0.0),
         ("sameParaStyleSpacing", attrs.same_para_style_spacing.flatten(), 0.0),
     ];
     for (key, v, lo) in spaces {
@@ -188,6 +189,11 @@ pub(crate) fn validate_para_values(attrs: &ParaAttrs, command_id: &str) -> Resul
         {
             return Err(bad(command_id, format!("{key} {v}: {lo} to {MAX_PARA_SPACE} pt")));
         }
+    }
+    if let Some(stops) = attrs.rag_line_insets
+        && stops.iter().any(|v| !(0.0..=MAX_PARA_SPACE).contains(v))
+    {
+        return Err(bad(command_id, format!("ragLineInsets: each of the four distances must be 0 to {MAX_PARA_SPACE} pt")));
     }
     let rows = [
         [attrs.word_space_min, attrs.word_space_desired, attrs.word_space_max],
@@ -416,6 +422,24 @@ pub(crate) fn apply_char_attrs(d: &mut designcraft_doc::Document, targets: &[Tar
             }
         });
     }
+}
+
+/// Set the language that text inherits from its paragraph. Explicit languages on runs take precedence.
+pub(super) fn paragraph_language(s: &mut Session, params: &Value) -> Result<Value> {
+    let language = match params.get("language") {
+        Some(Value::Null) => None,
+        Some(Value::String(name)) if !name.trim().is_empty() && !name.chars().any(char::is_control) => Some(name.clone()),
+        _ => return Err(bad("type.paragraphLanguage", "give a language name, or null to inherit the paragraph style")),
+    };
+    let targets = format_targets(s);
+    s.edit(|doc, _| {
+        for target in targets {
+            if let Some(story) = doc.text_story_mut(target.story, target.cell) {
+                story.format_paras(target.range, |format| format.chars.language.clone_from(&language));
+            }
+        }
+        ok()
+    })
 }
 
 pub(crate) fn format_paras(s: &mut Session, attrs: &Value) -> Result<Value> {
@@ -1274,6 +1298,29 @@ mod size_bounds_tests {
         }
     }
 
+    #[test]
+    fn editing_one_rag_stop_on_mixed_paragraphs_preserves_the_other_three_and_undoes_together() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("frame.create", &json!({"rect": [0, 0, 200, 200], "content": "text", "text": "A\nB"})).unwrap();
+        let select =
+            |s: &mut Session, anchor, focus| s.execute("text.select", &json!({"story": r["story"], "anchor": anchor, "focus": focus})).unwrap();
+        let stops = |s: &mut Session| s.execute("type.selectionAttrs", &json!({})).unwrap()["para"]["ragLineInsets"].clone();
+        for (at, inset) in [(0, 6.0), (2, 10.0)] {
+            select(&mut s, at, at);
+            s.execute("type.para", &json!({"attrs":{"ragPattern":"fourStop", "ragLineInsets":[0.0,inset,2.0,12.0]}})).unwrap();
+        }
+        let before = s.doc().unwrap().doc.clone();
+        select(&mut s, 0, 3);
+        s.execute("type.para", &json!({"attrs":{"ragLineInsets":[null,null,4.0,null]}})).unwrap();
+        for (at, inset) in [(0, 6.0), (2, 10.0)] {
+            select(&mut s, at, at);
+            assert_eq!(stops(&mut s), json!([0.0, inset, 4.0, 12.0]));
+        }
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().doc, before);
+    }
+
     /// `type.para` set any number for paragraph indents, spacing and justification: a negative
     /// left indent or Space Before, word spacing of 5000% and a Minimum above Maximum all went into the paragraph,
     /// and Single Word Justification took any alignment. Values outside the ranges are refused,
@@ -1308,6 +1355,9 @@ mod size_bounds_tests {
             (json!({"autoLeading": 6}), "autoLeading 600%: 0% to 500%"),
             (json!({"autoLeading": -0.1}), "autoLeading -10%: 0% to 500%"),
             (json!({"singleWordJustify": "leftJustified"}), "singleWordJustify \"leftJustified\": left, center, right or fullyJustified"),
+            (json!({"ragNearThreshold": -0.5}), "ragNearThreshold"),
+            (json!({"ragLineInsets": [0.0, 3.0, -1.0, 8.0]}), "ragLineInsets"),
+            (json!({"ragLineInsets": [0.0, 2.0, 4.0]}), "ragLineInsets"),
             // Desired word spacing is 100%, so a Minimum of 120% alone is out of order.
             (json!({"wordSpaceMin": 1.2}), "word spacing needs Minimum ≤ Desired ≤ Maximum, not 120%, 100%, 133%"),
             (

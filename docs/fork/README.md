@@ -24,9 +24,20 @@ Font files stay on each Mac. Collate uses DesignCraft's local missing-font fallb
 
 ## Shape the paragraph rag
 
-Select text or a text frame, open the **Paragraph** panel menu, and choose **Justification and Rag…**. The spacing controls and short-line inset work together. Choose **Natural rag** for alternating full and shorter measures, **Stepped justification** to justify those lines within your spacing limits, or **Alternating edges** to alternate left- and right-aligned lines. The pattern starts again in each column or threaded frame. Choose **Off** to return to the paragraph’s usual alignment.
+Open **Window > Type & Tables > Rag Options**, or open **Rag Options** from the **Paragraph** panel menu. Select text, place the caret, or select a text frame to work on its paragraphs. The panel can stay beside the document as you edit.
 
-To reuse a rag across paragraphs, set it in **Paragraph Style Options > Justification**. Collate saves the pattern and inset in the native document.
+| Pattern | What happens on the page |
+| --- | --- |
+| Natural rag | Alternates full and shorter lines. Words set the exact line endings. |
+| Stepped justification | Fits alternating lines toward the full and inset right edges. |
+| Alternating edges | Alternates between a left-aligned and a right-aligned line. |
+| Four-stop rag | Repeats four editable right insets. The initial values are 0, 8, 2 and 12 mm. |
+| Near-flush | Stretches a nonfinal line when its natural end falls within the chosen distance of the right edge, up to the fitting limits. The initial distance is 3 mm. |
+| Contextual indent | Aligns the first line with the previous paragraph’s last visible character in the same column. If the preceding paragraph is blank or the opening cannot fit, the text starts flush. |
+
+The repeating patterns restart in each column or threaded frame. **Off** restores the paragraph’s usual alignment. **Paragraph language** sets the default for the selected paragraphs. Words with an explicit character language keep it. Expand **Hyphenation settings** or **Fitting limits** to adjust how the composer breaks and fits lines.
+
+Choose **New Paragraph Style…** to save the settings for reuse. Existing styles have a **Rag Options** section in **Paragraph Style Options**. In a shared document, everyone uses collaboration protocol 13. Peers can apply existing styles, edit patterns and insets, change paragraph language, and switch hyphenation on or off. Define advanced fitting and hyphenation settings in a style before starting a room.
 
 ## Develop
 

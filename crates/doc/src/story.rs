@@ -99,7 +99,7 @@ pub struct ParaFormat {
     pub style: String,
     #[serde(default, skip_serializing_if = "ParaAttrs::is_empty")]
     pub para: ParaAttrs,
-    /// Paragraph-level character overrides are stored on the char runs; this holds nothing.
+    /// Character defaults for this paragraph, applied over its style and before individual runs.
     #[serde(default, skip_serializing_if = "CharAttrs::is_empty")]
     pub chars: CharAttrs,
     /// The table anchored in this paragraph (key into [`Story::tables`]).
