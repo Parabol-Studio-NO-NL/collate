@@ -14,15 +14,6 @@ const DOC_TAB_PAD: f32 = 44.0;
 pub fn doc_tabs(app: &mut DesignApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
-    #[cfg(not(target_arch = "wasm32"))]
-    let bar = if bar.width() >= 165.0 {
-        let mut tabs = bar;
-        tabs.max.x -= 80.0;
-        app.collaboration_button(ui, egui::Rect::from_min_max(egui::pos2(tabs.max.x + 4.0, bar.min.y + 2.0), bar.max - vec2(3.0, 2.0)));
-        tabs
-    } else {
-        bar
-    };
     let max_w = DOC_TAB_MAX_W.min(bar.width());
     let close_label = crate::i18n::tr(&app.ui.language, "Close");
     ui.painter().rect_filled(bar, 0.0, t.tab_strip);

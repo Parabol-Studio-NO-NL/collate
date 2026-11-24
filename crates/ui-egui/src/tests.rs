@@ -1,5 +1,29 @@
 use super::*;
 
+/// The top bar must open collaboration even on the start screen, before a guest has a layout.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn top_bar_share_opens_collaboration_from_the_keyboard() {
+    use egui_kittest::kittest::Queryable as _;
+
+    let app = DesignApp::new(designcraft_engine::Session::new(), Services::default());
+    let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut DesignApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    harness.run_steps(4);
+    assert!(harness.query_by_label("Join and receive document").is_none());
+    harness.get_by_label("Share").focus();
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(harness.query_by_label("Join and receive document").is_some());
+}
+
 /// The Control panel's two-row groups were centred as if they were one row tall, so the second
 /// row hung below the panel and was cut off.
 #[test]

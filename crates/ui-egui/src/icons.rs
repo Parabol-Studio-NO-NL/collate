@@ -462,11 +462,6 @@ fn paint_panels(pen: &mut Pen, name: &str) -> bool {
             pen.circle(8.5, 8.5, 5.0);
             pen.line(&[(12.5, 12.5), (17.0, 17.0)]);
         }
-        "share" => {
-            pen.line(&[(10.0, 3.0), (10.0, 13.0)]);
-            pen.line(&[(6.5, 6.5), (10.0, 3.0), (13.5, 6.5)]);
-            pen.line(&[(5.0, 10.0), (4.0, 10.0), (4.0, 17.0), (16.0, 17.0), (16.0, 10.0), (15.0, 10.0)]);
-        }
         "screen-normal" => pen.rect(3.0, 4.0, 17.0, 16.0),
         // View Options: a frame's dashed edges with a ruler's ticks above.
         "view-options" => {

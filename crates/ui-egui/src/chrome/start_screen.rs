@@ -50,7 +50,7 @@ pub fn start_screen(app: &mut DesignApp, ui: &mut egui::Ui) {
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     if ui.add(egui::Button::new(crate::i18n::tr(&app.ui.language, "Join shared document…")).min_size(vec2(0.0, 32.0))).clicked() {
-                        app.open_collaboration_dialog();
+                        let _ = app.run("app.shareDocument", json!({}));
                     }
                     if ui
                         .add(
@@ -223,51 +223,27 @@ fn recent_preview_texture(ctx: &egui::Context, path: &str, modified: Option<std:
     tex
 }
 
-/// Start screen: the ArtCraft community (Discord first) and project links.
+/// Start screen: upstream project resources.
 fn community_card(app: &mut DesignApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     egui::Frame::NONE.fill(t.panel).corner_radius(10.0).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
-        // Wide enough for the longer translations of the line under the title, with the button
-        // at the right edge; the text wraps before the button's space rather than run under it.
-        const BUTTON: egui::Vec2 = vec2(190.0, 38.0);
-        ui.set_max_width(760.0);
-        ui.horizontal(|ui| {
-            let label = crate::i18n::tr(&app.ui.language, "DesignCraft Discord");
-            let button = crate::about::discord_button_size(ui.ctx(), label, BUTTON);
-            let text_width = (ui.available_width() - button.x - 16.0).max(120.0);
-            ui.vertical(|ui| {
-                ui.set_max_width(text_width);
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                ui.label(crate::rtl::widget(
-                    ui,
-                    egui::RichText::new(crate::i18n::tr(&app.ui.language, "DesignCraft community")).font(semibold(14.0)).color(t.text_strong),
-                ));
-                ui.label(crate::rtl::widget(
-                    ui,
-                    egui::RichText::new(crate::i18n::tr(&app.ui.language, "Find help with the upstream editor and share your layouts."))
-                        .size(12.0)
-                        .color(t.text_dim),
-                ));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    for (text, id) in [("DesignCraft page", "help.appPage"), ("GitHub", "help.github"), ("getartcraft.com", "help.website")] {
-                        let url = designcraft_engine::links::get(&id[5..]).unwrap_or_default();
-                        let l = ui
-                            .add(egui::Label::new(egui::RichText::new(text).size(12.0).color(t.accent).underline()).sense(Sense::click()))
-                            .on_hover_text(url)
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                        if l.clicked() {
-                            let _ = app.run(id, json!({}));
-                        }
-                        ui.add_space(8.0);
-                    }
-                });
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if crate::about::discord_button(ui, label, BUTTON) {
-                    let _ = app.run("help.discord", json!({}));
+        ui.label(crate::rtl::widget(
+            ui,
+            egui::RichText::new(crate::i18n::tr(&app.ui.language, "DesignCraft community")).font(semibold(14.0)).color(t.text_strong),
+        ));
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for (text, id) in [("DesignCraft page", "help.appPage"), ("GitHub", "help.github"), ("getartcraft.com", "help.website")] {
+                let url = designcraft_engine::links::get(&id[5..]).unwrap_or_default();
+                let link = ui
+                    .add(egui::Label::new(egui::RichText::new(text).size(12.0).color(t.accent).underline()).sense(Sense::click()))
+                    .on_hover_text(url)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if link.clicked() {
+                    let _ = app.run(id, json!({}));
                 }
-            });
+                ui.add_space(8.0);
+            }
         });
     });
 }
