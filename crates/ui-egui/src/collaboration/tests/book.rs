@@ -10,7 +10,7 @@ use serde_json::json;
 use super::{artwork_fixture_with_side, document, editor, room, wait_for, wait_for_revision};
 use crate::{
     DesignApp, Services,
-    collaboration::{Room, replay, seed_document::fingerprint},
+    collaboration::{replay, seed_document::fingerprint},
 };
 
 const PAGES: usize = 200;
@@ -99,6 +99,15 @@ fn receive_invitation(invitation: &str, name: &str) -> DesignApp {
     app
 }
 
+fn assert_received_book(received: &Document, expected: &Document) {
+    assert_eq!(fingerprint(received).unwrap(), fingerprint(expected).unwrap());
+    assert_eq!(received.assets.len(), expected.assets.len());
+    for (id, asset) in &expected.assets {
+        let original = asset.data.embedded_bytes().unwrap();
+        assert_eq!(received.assets[id].data.embedded_bytes().unwrap(), original);
+    }
+}
+
 #[test]
 fn illustrated_book_converges_through_concurrent_editing_late_join_and_recovery() {
     let (seed, chapter, illustration) = book();
@@ -115,9 +124,9 @@ fn illustrated_book_converges_through_concurrent_editing_late_join_and_recovery(
     let invitation = room(&host).invitation.clone().unwrap();
     let mut guest = receive_invitation(&invitation, "Remote editor");
     wait_for(&mut [&mut host, &mut guest], "first guest receives the illustrated book", |apps| {
-        apps[1].collaboration.room.as_ref().is_some_and(Room::can_edit)
+        apps[1].collaboration.room.as_ref().is_some_and(|room| room.can_edit() && !room.originals.is_pending())
     });
-    assert_eq!(document(&guest), &seed);
+    assert_received_book(document(&guest), &seed);
 
     // Both peers form their edits against the original version of the same threaded story.
     host.run("text.select", json!({"story": chapter.0, "anchor": 0})).unwrap();
@@ -154,13 +163,13 @@ fn illustrated_book_converges_through_concurrent_editing_late_join_and_recovery(
     revision += 1;
     wait_for_revision(&mut host, &mut guest, "illustration moves on the last page", revision);
     assert!(document(&host).item(illustration).unwrap().bounds().x0 > before.x0);
-    assert_eq!(document(&guest), document(&host));
+    assert_received_book(document(&guest), document(&host));
 
     let mut late = receive_invitation(&invitation, "Late proofreader");
     wait_for(&mut [&mut host, &mut guest, &mut late], "late guest receives artwork and chapter edits", |apps| {
-        apps[2].collaboration.room.as_ref().is_some_and(|room| room.can_edit() && room.revision == revision)
+        apps[2].collaboration.room.as_ref().is_some_and(|room| room.can_edit() && room.revision == revision && !room.originals.is_pending())
     });
-    assert_eq!(document(&late), document(&host));
+    assert_received_book(document(&late), document(&host));
     assert_eq!(document(&late).page_count(), PAGES);
 
     let mut reopened = DesignApp::new(Session::new(), Services::default());
@@ -216,4 +225,71 @@ fn automerge_merges_a_long_chapter_without_replacing_the_rest_of_the_book() {
     assert!(seed.stories.iter().filter(|(id, _)| **id != chapter).all(|(id, original)| Arc::ptr_eq(original, &first.stories[id])));
     assert!(seed.assets.iter().all(|(id, original)| Arc::ptr_eq(original, &first.assets[id])));
     assert!(seed.spreads.iter().zip(&first.spreads).all(|(original, merged)| Arc::ptr_eq(original, merged)));
+}
+
+#[cfg(feature = "automerge-rooms")]
+#[test]
+fn an_illustrated_book_accepts_more_than_the_old_room_limit_and_catches_up() {
+    // Small captions spread the test edits across the book. This keeps the test focused
+    // on host history and catch-up without repeatedly reprojecting a whole chapter.
+    const EDIT_COUNT: usize = 1_025;
+    const CAPTION_COUNT: usize = 8;
+    const MARK: &str = "·";
+    let (mut seed, _, _) = book();
+    let layer = seed.default_layer();
+    let captions: Vec<_> = (0..CAPTION_COUNT)
+        .map(|index| {
+            let page = index * PAGES / CAPTION_COUNT;
+            let (spread, _) = seed.page_loc(page).unwrap();
+            let x = seed.page(page).unwrap().x;
+            seed.add_text_frame(
+                SpreadRef::Doc(spread),
+                Rect::new(x + 215.0, 610.0, x + 500.0, 650.0),
+                layer,
+                &format!("Figure {}: ", index + 1),
+                ParaFormat::default(),
+            )
+            .unwrap()
+            .1
+        })
+        .collect();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("Survey before proofing.designcraft");
+    let mut host = editor(&seed, "Book designer");
+    host.run("file.saveACopy", json!({"path": &path})).unwrap();
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "book room starts", |apps| room(apps[0]).can_edit() && room(apps[0]).invitation.is_some());
+
+    for index in 0..EDIT_COUNT {
+        let story = captions[index % captions.len()];
+        let end = document(&host).story(story).unwrap().text.len();
+        host.run("text.select", json!({"story": story.0, "anchor": end})).unwrap();
+        host.run("text.insert", json!({"text": MARK, "raw": true})).unwrap();
+        // Take the same path as the host poll without sleeping or touching the LAN between edits.
+        let edit = host.session.take_deferred_edit().unwrap();
+        let state = host.collaboration.room.as_mut().unwrap();
+        state.capture_edit(&mut host.session, edit).unwrap_or_else(|error| panic!("edit {} was refused: {error}", index + 1));
+        state.update_edit_policy(&mut host.session);
+    }
+    let revision = room(&host).revision;
+    assert_eq!(revision, EDIT_COUNT as u64);
+    let invitation = room(&host).invitation.clone().unwrap();
+    let mut late = receive_invitation(&invitation, "Late proofreader");
+    wait_for(&mut [&mut host, &mut late], "late proofreader catches up after the old room limit", |apps| {
+        apps[1].collaboration.room.as_ref().is_some_and(|room| room.can_edit() && room.revision == revision && !room.originals.is_pending())
+    });
+    assert_received_book(document(&late), document(&host));
+    assert_eq!(document(&late).page_count(), PAGES);
+    for (index, story) in captions.into_iter().enumerate() {
+        let expected_marks = (index..EDIT_COUNT).step_by(CAPTION_COUNT).count();
+        let original = &seed.story(story).unwrap().text;
+        assert_eq!(document(&late).story(story).unwrap().text, format!("{original}{}", MARK.repeat(expected_marks)));
+    }
+
+    let mut reopened = DesignApp::new(Session::new(), Services::default());
+    reopened.run("file.open", json!({"path": &path})).unwrap();
+    let commits: Vec<_> = room(&host).history.iter().map(|(commit, _)| commit).collect();
+    let encoded = serde_json::to_vec(&commits).unwrap();
+    let restored = replay::restore(&seed, document(&reopened), serde_json::from_slice(&encoded).unwrap()).unwrap();
+    assert_eq!(fingerprint(&restored.document).unwrap(), fingerprint(document(&late)).unwrap());
 }

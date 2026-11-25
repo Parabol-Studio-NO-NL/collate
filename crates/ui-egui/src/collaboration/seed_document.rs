@@ -11,7 +11,7 @@ use designcraft_collab::artwork::{
     BlobId, MAX_ARTWORK_BYTES, MAX_IMAGE_PIXELS, PDF_MIME, pdf_dimensions, raster_dimensions as image_dimensions, raster_format as image_format,
     valid_dimensions,
 };
-use designcraft_doc::{Asset, AssetData, AssetId, Document, Storage, StoryId};
+use designcraft_doc::{Asset, AssetData, AssetId, Document, Proxy, Storage, StoryId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -19,10 +19,14 @@ use super::{attachments::Blobs, seed::MAX_SEED_BYTES};
 
 pub(super) const MAX_MODEL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_ASSETS: usize = 128;
+const PROGRESSIVE: bool = cfg!(feature = "automerge-rooms");
+const MAX_ASSETS: usize = if PROGRESSIVE { 512 } else { 128 };
+pub(super) const MAX_SEED_BLOBS: usize = MAX_ASSETS * 2;
 const MAX_PROXY_BYTES: u64 = 1024 * 1024;
 const MAX_PROXY_PIXELS: u64 = 1024 * 1024;
-const MAX_TOTAL_PIXELS: u64 = 32 * 1024 * 1024;
+const MAX_TOTAL_PIXELS: u64 = if PROGRESSIVE { (MAX_IMAGE_PIXELS + MAX_PROXY_PIXELS) * MAX_ASSETS as u64 } else { 32 * 1024 * 1024 };
+const SCREEN_PREVIEW_SIDE: u32 = 256;
+const SCREEN_PREVIEW_BYTES: usize = 64 * 1024;
 // The native File > New page size ceiling, in points (216 inches).
 const MAX_PAGE_POINTS: f64 = 15_552.0;
 const NATIVE_MEMBERS: [&str; 3] = ["mimetype", "meta.json", "document.json"];
@@ -129,20 +133,18 @@ impl Fingerprints {
     pub(super) fn canonical(&mut self, doc: &Document) -> Result<[u8; 32], String> {
         let mut canonical = doc.clone();
         canonical.compact_assets_with_hash(|asset| {
-            asset.data.embedded_bytes().map_or_else(
-                || asset.data.key().0,
-                |body| {
-                    let digest = self.digest(body);
-                    u64::from_be_bytes(std::array::from_fn(|i| digest[i]))
-                },
-            )
+            asset
+                .data
+                .shared_reference()
+                .map(|(digest, _)| digest)
+                .or_else(|| asset.data.embedded_bytes().map(|body| self.digest(body)))
+                .map_or(asset.data.key().0, |digest| u64::from_be_bytes(std::array::from_fn(|i| digest[i])))
         });
         self.fingerprint(&canonical)
     }
 
     fn fingerprint(&mut self, doc: &Document) -> Result<[u8; 32], String> {
         validate_model(doc)?;
-        let payloads = payloads(doc, false)?;
         let mut normalized = doc.clone();
         normalized.created = 0;
         normalized.modified = 0;
@@ -152,13 +154,41 @@ impl Fingerprints {
         fingerprint.update(b"CoDesign native seed\0");
         fingerprint.update((model.len() as u64).to_be_bytes());
         fingerprint.update(model);
-        for (name, data) in payloads {
-            fingerprint.update((name.len() as u64).to_be_bytes());
-            fingerprint.update(name.as_bytes());
-            fingerprint.update(self.digest(data));
+        if PROGRESSIVE && doc.assets.values().any(|asset| asset.data.shared_original_pending()) {
+            if artwork_size(doc) > MAX_ARTWORK_BYTES as u64 {
+                return Err(TOO_LARGE.into());
+            }
+            for asset in doc.assets.values() {
+                let digest = if let Some((digest, length)) = asset.data.shared_reference() {
+                    let id = BlobId { digest, length };
+                    if !id.valid() || asset.mime == PDF_MIME {
+                        return Err(INVALID.into());
+                    }
+                    digest
+                } else {
+                    let bytes = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
+                    original_dimensions(asset, bytes, MAX_IMAGE_PIXELS, false)?;
+                    self.digest(bytes)
+                };
+                add_fingerprint_member(&mut fingerprint, &asset_name("assets", asset.id.0, &asset.mime)?, digest);
+                if let Some(proxy) = &asset.proxy {
+                    let bytes = check_proxy(proxy, MAX_PROXY_PIXELS, false)?;
+                    add_fingerprint_member(&mut fingerprint, &asset_name("proxies", asset.id.0, &proxy.mime)?, self.digest(bytes));
+                }
+            }
+        } else {
+            for (name, data) in payloads(doc, false)? {
+                add_fingerprint_member(&mut fingerprint, &name, self.digest(data));
+            }
         }
         Ok(fingerprint.finalize().into())
     }
+}
+
+fn add_fingerprint_member(fingerprint: &mut Sha256, name: &str, digest: [u8; 32]) {
+    fingerprint.update((name.len() as u64).to_be_bytes());
+    fingerprint.update(name.as_bytes());
+    fingerprint.update(digest);
 }
 
 #[cfg(test)]
@@ -167,7 +197,9 @@ pub(super) fn fingerprint(doc: &Document) -> Result<[u8; 32], String> {
 }
 
 const BUNDLE_MAGIC: &[u8] = b"Collate shared assets v1\n";
+const PREVIEW_MAGIC: &[u8] = b"Collate preview assets v1\n";
 type Members = BTreeMap<AssetId, (BlobId, Option<BlobId>)>;
+pub(super) type OriginalTargets = BTreeMap<BlobId, Vec<Arc<Asset>>>;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,13 +208,171 @@ struct Manifest<D> {
     members: Members,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewManifest<D> {
+    document: D,
+    members: BTreeMap<AssetId, PreviewMember>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewMember {
+    original: BlobId,
+    native_preview: Option<BlobId>,
+    screen_preview: Option<ScreenPreview>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScreenPreview {
+    id: BlobId,
+    mime: String,
+    pixels: (u32, u32),
+}
+
+pub(super) struct PreviewSeed {
+    pub(super) archive: Vec<u8>,
+    pub(super) eager: Blobs,
+    pub(super) originals: Blobs,
+}
+
+pub(super) fn use_preview_seed(doc: &Document) -> bool {
+    PROGRESSIVE && doc.assets.values().any(|asset| asset.mime != PDF_MIME && asset.data.len() > SCREEN_PREVIEW_BYTES as u64)
+}
+
+pub(super) fn is_preview_seed(bytes: &[u8]) -> bool {
+    bytes.starts_with(PREVIEW_MAGIC)
+}
+
 pub(super) fn artwork_size(doc: &Document) -> u64 {
     doc.assets
         .values()
         .flat_map(|asset| std::iter::once(&asset.data).chain(asset.proxy.iter().map(|p| &p.data)))
-        .filter_map(AssetData::embedded_bytes)
-        .map(|body| body.len() as u64)
+        .filter_map(|data| {
+            data.shared_reference().map(|(_, length)| u64::from(length)).or_else(|| data.embedded_bytes().map(|body| body.len() as u64))
+        })
         .sum()
+}
+
+/// Network-only seed. The ordinary native file and encrypted journal keep their
+/// complete artwork and never serialize these preview-only handles.
+pub(super) fn preview_seed(doc: &Document) -> Result<PreviewSeed, String> {
+    validate_model(doc)?;
+    payloads(doc, false)?;
+    let mut eager = Blobs::new();
+    let mut originals = Blobs::new();
+    let mut members = BTreeMap::new();
+    for (&id, asset) in &doc.assets {
+        let body = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
+        let original = blob_id(body)?;
+        let preview = (asset.mime != PDF_MIME && body.len() > SCREEN_PREVIEW_BYTES)
+            .then(|| designcraft_render::proxy::make_proxy_with_limits(body, asset.page, SCREEN_PREVIEW_SIDE, SCREEN_PREVIEW_BYTES))
+            .flatten();
+        let screen_preview = if let Some(image) = preview {
+            originals.entry(original).or_insert_with(|| body.clone());
+            let bytes = Arc::new(image.data);
+            let id = blob_id(&bytes)?;
+            eager.entry(id).or_insert(bytes);
+            Some(ScreenPreview { id, mime: image.mime.into(), pixels: image.pixels })
+        } else {
+            eager.entry(original).or_insert_with(|| body.clone());
+            None
+        };
+        let native_preview = if let Some(proxy) = &asset.proxy {
+            let bytes = proxy.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
+            let id = blob_id(bytes)?;
+            eager.entry(id).or_insert_with(|| bytes.clone());
+            Some(id)
+        } else {
+            None
+        };
+        members.insert(id, PreviewMember { original, native_preview, screen_preview });
+    }
+    let mut output = ModelBytes(PREVIEW_MAGIC.into());
+    serde_json::to_writer(&mut output, &PreviewManifest { document: doc, members }).map_err(|_| TOO_LARGE)?;
+    Ok(PreviewSeed { archive: output.0, eager, originals })
+}
+
+fn blob_id(bytes: &[u8]) -> Result<BlobId, String> {
+    let id = BlobId { digest: Sha256::digest(bytes).into(), length: u32::try_from(bytes.len()).map_err(|_| TOO_LARGE)? };
+    if id.valid() { Ok(id) } else { Err(TOO_LARGE.into()) }
+}
+
+/// The transfer authenticates available blobs before this function sees their bytes.
+pub(super) fn restore_preview_seed(
+    bytes: &[u8],
+    mut load: impl FnMut(BlobId) -> Result<Arc<Vec<u8>>, String>,
+) -> Result<(Document, OriginalTargets), String> {
+    if !PROGRESSIVE || bytes.len() > MAX_SEED_BYTES {
+        return Err(INVALID.into());
+    }
+    let manifest = bytes.strip_prefix(PREVIEW_MAGIC).ok_or(INVALID)?;
+    let PreviewManifest { mut document, members }: PreviewManifest<Document> = serde_json::from_slice(manifest).map_err(|_| INVALID)?;
+    validate_model(&document)?;
+    if document.assets.len() != members.len() {
+        return Err(INVALID.into());
+    }
+    let mut total = 0u64;
+    for (&id, asset) in &document.assets {
+        let member = members.get(&id).ok_or(INVALID)?;
+        let native = member.native_preview;
+        if !member.original.valid()
+            || asset.proxy.is_some() != native.is_some()
+            || native.is_some_and(|id| u64::from(id.length) > MAX_PROXY_BYTES || !id.valid())
+        {
+            return Err(INVALID.into());
+        }
+        if let Some(preview) = &member.screen_preview
+            && (asset.mime == PDF_MIME
+                || !valid_dimensions(preview.pixels, u64::from(SCREEN_PREVIEW_SIDE) * u64::from(SCREEN_PREVIEW_SIDE))
+                || preview.pixels.0.max(preview.pixels.1) > SCREEN_PREVIEW_SIDE
+                || !preview.id.valid()
+                || preview.id.length as usize > SCREEN_PREVIEW_BYTES
+                || !matches!(preview.mime.as_str(), "image/png" | "image/jpeg"))
+        {
+            return Err(INVALID.into());
+        }
+        total += u64::from(member.original.length) + native.map_or(0, |p| u64::from(p.length));
+    }
+    if total > MAX_ARTWORK_BYTES as u64 {
+        return Err(TOO_LARGE.into());
+    }
+    let mut loaded = Blobs::new();
+    let mut resolve = |id: BlobId| -> Result<Arc<Vec<u8>>, String> {
+        if let std::collections::btree_map::Entry::Vacant(entry) = loaded.entry(id) {
+            let bytes = load(id)?;
+            if bytes.len() != id.length as usize {
+                return Err(INVALID.into());
+            }
+            entry.insert(bytes);
+        }
+        Ok(loaded[&id].clone())
+    };
+    let mut originals = OriginalTargets::new();
+    for (id, member) in members {
+        let asset = document.assets.get_mut(&id).ok_or(INVALID)?;
+        let model = Arc::make_mut(asset);
+        if let (Some(proxy), Some(preview)) = (&mut model.proxy, member.native_preview) {
+            proxy.data = AssetData::embedded(resolve(preview)?);
+            check_proxy(proxy, MAX_PROXY_PIXELS, true)?;
+        }
+        if let Some(preview) = member.screen_preview {
+            let preview = Proxy { mime: preview.mime, pixels: preview.pixels, data: AssetData::embedded(resolve(preview.id)?) };
+            check_proxy(&preview, MAX_PROXY_PIXELS, true)?;
+            model.data = AssetData::shared_original(member.original.digest, member.original.length, Some(preview));
+            originals.entry(member.original).or_default().push(asset.clone());
+        } else {
+            let bytes = resolve(member.original)?;
+            original_dimensions(model, &bytes, MAX_IMAGE_PIXELS, true)?;
+            model.data = AssetData::embedded(bytes);
+        }
+    }
+    Ok((document, originals))
+}
+
+pub(super) fn verify_original(asset: &Asset, bytes: &[u8]) -> Result<(), String> {
+    original_dimensions(asset, bytes, MAX_IMAGE_PIXELS, true).map(|_| ())
 }
 
 pub(super) fn bundle(doc: &Document) -> Result<(Vec<u8>, Blobs), String> {
@@ -194,7 +384,7 @@ pub(super) fn bundle(doc: &Document) -> Result<(Vec<u8>, Blobs), String> {
         return Err(TOO_LARGE.into());
     }
     validate_model(doc)?;
-    payloads(doc, true)?;
+    payloads(doc, !PROGRESSIVE)?;
     let mut blobs = Blobs::new();
     let mut identify = |data: &AssetData| -> Result<BlobId, String> {
         let body = data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
@@ -452,37 +642,46 @@ fn asset_name(directory: &str, id: u64, mime: &str) -> Result<String, String> {
     Ok(format!("{directory}/{id}.{extension}"))
 }
 
+fn original_dimensions(asset: &Asset, bytes: &[u8], limit: u64, verify: bool) -> Result<(u32, u32), String> {
+    if bytes.len() > MAX_ARTWORK_BYTES {
+        return Err(TOO_LARGE.into());
+    }
+    if asset.mime == PDF_MIME {
+        let dimensions = pdf_dimensions(asset, bytes, verify)?;
+        if !valid_dimensions(dimensions, limit) {
+            return Err(TOO_LARGE.into());
+        }
+        Ok(dimensions)
+    } else {
+        image_dimensions(&asset.mime, bytes, limit, verify).map_err(str::to_owned)
+    }
+}
+
+fn check_proxy(proxy: &Proxy, limit: u64, verify: bool) -> Result<&Arc<Vec<u8>>, String> {
+    let bytes = proxy.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
+    if bytes.len() as u64 > MAX_PROXY_BYTES {
+        return Err(TOO_LARGE.into());
+    }
+    let dims = image_dimensions(&proxy.mime, bytes, limit, verify)?;
+    if dims != proxy.pixels {
+        return Err("A shared image preview is invalid.".into());
+    }
+    Ok(bytes)
+}
+
 fn payloads(doc: &Document, verify_image_body: bool) -> Result<Vec<(String, &Arc<Vec<u8>>)>, String> {
     let mut entries = Vec::new();
     let mut pixels = 0u64;
     for asset in doc.assets.values() {
         let data = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
-        if data.len() > MAX_ARTWORK_BYTES {
-            return Err(TOO_LARGE.into());
-        }
         let remaining = MAX_IMAGE_PIXELS.min(MAX_TOTAL_PIXELS - pixels);
-        let dimensions = if asset.mime == PDF_MIME {
-            let dimensions = pdf_dimensions(asset, data, verify_image_body)?;
-            if !valid_dimensions(dimensions, remaining) {
-                return Err(TOO_LARGE.into());
-            }
-            dimensions
-        } else {
-            image_dimensions(&asset.mime, data, remaining, verify_image_body)?
-        };
+        let dimensions = original_dimensions(asset, data, remaining, verify_image_body)?;
         pixels += u64::from(dimensions.0) * u64::from(dimensions.1);
         entries.push((asset_name("assets", asset.id.0, &asset.mime)?, data));
 
         if let Some(proxy) = &asset.proxy {
-            let data = proxy.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
-            if data.len() as u64 > MAX_PROXY_BYTES {
-                return Err(TOO_LARGE.into());
-            }
-            let dims = image_dimensions(&proxy.mime, data, MAX_PROXY_PIXELS.min(MAX_TOTAL_PIXELS - pixels), verify_image_body)?;
-            if dims != proxy.pixels {
-                return Err("A shared image preview is invalid.".into());
-            }
-            pixels += u64::from(dims.0) * u64::from(dims.1);
+            let data = check_proxy(proxy, MAX_PROXY_PIXELS.min(MAX_TOTAL_PIXELS - pixels), verify_image_body)?;
+            pixels += u64::from(proxy.pixels.0) * u64::from(proxy.pixels.1);
             entries.push((asset_name("proxies", asset.id.0, &proxy.mime)?, data));
         }
     }
@@ -496,7 +695,11 @@ pub(super) fn check_artwork(doc: &Document) -> Result<(), String> {
     if doc.assets.len() > MAX_ASSETS {
         return Err(TOO_LARGE.into());
     }
-    payloads(doc, false).map(|_| ())
+    if PROGRESSIVE && doc.assets.values().any(|asset| asset.data.shared_original_pending()) {
+        Fingerprints::default().fingerprint(doc).map(|_| ())
+    } else {
+        payloads(doc, false).map(|_| ())
+    }
 }
 
 fn expanded_size(entries: &[(String, &Arc<Vec<u8>>)]) -> u64 {

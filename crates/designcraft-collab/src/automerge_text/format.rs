@@ -184,7 +184,27 @@ impl Properties {
         Ok(())
     }
 
-    fn changed_from<'a>(&'a self, old: &'a Self) -> impl Iterator<Item = (&'a str, Option<&'a str>)> {
+    pub(super) fn update(&mut self, writes: &BTreeMap<String, Option<String>>) {
+        for (name, value) in writes {
+            if let Some(value) = value {
+                self.0.insert(name.clone(), value.clone());
+            } else {
+                self.0.remove(name);
+            }
+        }
+    }
+
+    pub(super) fn apply_writes(&mut self, writes: &BTreeMap<String, Option<String>>, character: bool, styles: &Styles) -> Result<(), Error> {
+        let prefix = if character { CHARACTER } else { FOLLOWING_PARAGRAPH };
+        for (key, value) in writes {
+            let scalar = value.as_ref().map(|value| ScalarValue::from(value.as_str()));
+            validate_property(&format!("{prefix}{key}"), scalar.as_ref(), prefix, styles)?;
+        }
+        self.update(writes);
+        Ok(())
+    }
+
+    pub(super) fn changed_from<'a>(&'a self, old: &'a Self) -> impl Iterator<Item = (&'a str, Option<&'a str>)> {
         self.0
             .iter()
             .filter(|(key, value)| old.0.get(*key) != Some(*value))

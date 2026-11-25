@@ -17,7 +17,7 @@ pub use operations::{Appearance, Change, CommentAnchor, CommentReply, CommentThr
 pub use replica::Replica;
 
 /// The room protocol must identify the exact adapter schema used by all replicas.
-pub const PROTOCOL_VERSION: u16 = if cfg!(feature = "automerge-rooms") { 16 } else { 15 };
+pub const PROTOCOL_VERSION: u16 = if cfg!(feature = "automerge-rooms") { 17 } else { 15 };
 pub const MAX_OPERATIONS: usize = 64;
 
 #[derive(Debug, Error, PartialEq, Eq)]

@@ -195,7 +195,7 @@ impl Server {
         let state = DocState::new(recovered.document, None);
         let mut room = Room::new(transport, Mode::Host { delivery: BTreeMap::new() }, storage, state.uid, header.seed);
         room.revision = recovered.history.len() as u64;
-        room.history = recovered.history;
+        room.restore_history_index(recovered.history);
         room.inverses = recovered.inverses;
         room.history_bytes = recovered.history_bytes;
         room.replica = recovered.replica;

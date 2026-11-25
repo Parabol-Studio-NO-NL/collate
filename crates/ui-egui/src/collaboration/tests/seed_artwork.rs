@@ -3,6 +3,107 @@ use crate::collaboration::seed_document::{bundle, restore_bundle};
 use designcraft_doc::{AssetData, AssetId};
 use std::sync::Arc;
 
+#[cfg(feature = "automerge-rooms")]
+#[test]
+fn a_preview_seed_keeps_the_original_fingerprint_with_multiple_native_proxies() {
+    use crate::collaboration::seed_document::{preview_seed, restore_preview_seed};
+
+    let (mut seed, id, _) = embedded_image_fixture();
+    let asset = Arc::make_mut(seed.assets.get_mut(&id).unwrap());
+    asset.data = AssetData::embedded(artwork_fixture_with_side(120, 180));
+    asset.pixels = Some((180, 180));
+    let mut another = asset.clone();
+    // "100" sorts before the first asset's name, but its numeric ID follows it.
+    another.id = AssetId(100);
+    another.data = AssetData::embedded(artwork_fixture_with_side(322, 180));
+    seed.next_id = seed.next_id.max(another.id.0);
+    seed.assets.insert(another.id, Arc::new(another));
+
+    let mut preview = preview_seed(&seed).unwrap();
+    let (partial, originals) = restore_preview_seed(&preview.archive, |id| Ok(preview.eager.remove(&id).unwrap())).unwrap();
+    assert!(preview.eager.is_empty());
+    assert_eq!(originals.len(), seed.assets.len());
+    assert_eq!(fingerprint(&partial).unwrap(), fingerprint(&seed).unwrap());
+    for (blob, targets) in originals {
+        for target in targets {
+            assert!(target.data.install_verified_original(preview.originals[&blob].clone()));
+        }
+    }
+    assert_eq!(partial, seed);
+    assert_eq!(fingerprint(&partial).unwrap(), fingerprint(&seed).unwrap());
+}
+
+#[cfg(feature = "automerge-rooms")]
+#[test]
+fn a_guest_edits_from_previews_before_the_verified_original_is_available() {
+    let (mut seed, asset, _) = embedded_image_fixture();
+    let bytes = artwork_fixture_with_side(781, 720);
+    assert!(bytes.len() > designcraft_collab_core::MAX_PAYLOAD);
+    let artwork = Arc::make_mut(seed.assets.get_mut(&asset).unwrap());
+    artwork.data = AssetData::embedded(bytes.clone());
+    artwork.pixels = Some((720, 720));
+
+    let mut host = editor(&seed, "Illustrated book host");
+    let created = host.run("frame.create", json!({"rect": [140, 180, 330, 240], "content": "text", "text": "Proof"})).unwrap();
+    let story = StoryId(created["story"].as_u64().unwrap());
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "host advertises the illustrated book", |apps| room(apps[0]).invitation.is_some());
+    let mut guest = DesignApp::new(Session::new(), Services::default());
+    guest.collaboration.name = "Remote designer".into();
+    guest.collaboration.join_code = room(&host).invitation.clone().unwrap();
+    guest.start_seed_download().unwrap();
+    wait_for(&mut [&mut host, &mut guest], "guest can edit the preview document", |apps| {
+        apps[1].collaboration.room.as_ref().is_some_and(Room::can_edit)
+    });
+    let asset = *document(&guest).assets.keys().next().unwrap();
+    let downloaded = &document(&guest).assets[&asset];
+    assert!(downloaded.data.shared_original_pending());
+    assert!(downloaded.data.shared_preview().is_some_and(|preview| !preview.data.is_empty()));
+    assert_eq!(downloaded.output_bytes().err(), Some(designcraft_doc::Unavailable::SharedOriginalPending));
+    assert!(designcraft_format::save(document(&guest)).is_err());
+    assert!(guest.run("file.exportPdf", json!({})).unwrap_err().to_string().contains("original artwork"));
+
+    guest.run("text.select", json!({"story": story.0, "anchor": 5, "focus": 5})).unwrap();
+    guest.run("text.insert", json!({"text": " edited before downloading"})).unwrap();
+    let wait_without_originals = |host: &mut DesignApp, guest: &mut DesignApp, revision| {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // Pump the host's edit channel while deliberately holding its original queue.
+        while room(guest).revision < revision {
+            guest.poll_collaboration(&ctx);
+            let hosted = host.collaboration.room.as_mut().unwrap();
+            while let Some(event) = hosted.transport.try_event() {
+                hosted.on_event(&mut host.session, event);
+            }
+            hosted.advance_delivery();
+            assert!(Instant::now() < deadline, "the edit should reach the host before the original transfers");
+            thread::sleep(Duration::from_millis(2));
+        }
+    };
+    wait_without_originals(&mut host, &mut guest, 1);
+    assert_eq!(document(&host).story(story).unwrap().text, "Proof edited before downloading");
+    assert!(document(&guest).assets[&asset].data.shared_original_pending());
+
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("the-same-image.png");
+    std::fs::write(&path, &bytes).unwrap();
+    guest.run("selection.set", json!({"ids": []})).unwrap();
+    guest.open_picked("place", path.to_str().unwrap().into()).unwrap();
+    wait_without_originals(&mut host, &mut guest, 2);
+    assert!(document(&guest).assets[&asset].data.shared_original_pending());
+    assert_eq!(document(&host).assets.len(), 1);
+    assert_eq!(document(&guest).assets.len(), 1);
+    assert_eq!(document(&guest).placed_items().iter().filter(|frame| frame.graphic().is_some_and(|graphic| graphic.asset == asset)).count(), 2);
+
+    wait_for(&mut [&mut host, &mut guest], "guest verifies the original artwork", |apps| !room(apps[1]).originals.is_pending());
+    let hydrated = &document(&guest).assets[&asset];
+    let output = hydrated.output_bytes().unwrap();
+    assert!(!output.proxied);
+    assert_eq!(output.bytes.as_slice(), bytes.as_slice());
+    assert_eq!(fingerprint(document(&host)).unwrap(), fingerprint(document(&guest)).unwrap());
+    assert!(designcraft_format::save(document(&guest)).is_ok());
+}
+
 #[test]
 fn large_seed_reuses_shared_bodies_and_checks_aggregate_length_before_loading() {
     let (mut seed, id, _) = embedded_image_fixture();
@@ -46,7 +147,7 @@ fn guest_can_edit_after_the_host_rejects_artwork_at_its_retained_limit() {
 
     // Simulate other artwork having consumed the host's quota while the guest
     // was preparing a proposal, without allocating a gigabyte in regular CI.
-    host.collaboration.room.as_mut().unwrap().history[0].1.artwork_size = designcraft_doc::MAX_SHARED_ARTWORK_BYTES as u64 - 32;
+    host.collaboration.room.as_mut().unwrap().history_artwork = designcraft_doc::MAX_SHARED_ARTWORK_BYTES as u64 - 32;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("small.png");
     std::fs::write(&path, artwork_fixture(64)).unwrap();
@@ -148,7 +249,7 @@ fn smaller_placements_stay_out_of_json_history_and_inline_journals_still_replay(
         host.open_picked("place", path.to_str().unwrap().into()).unwrap();
         wait_for(&mut [&mut host, &mut guest], "placed image confirmed", |apps| apps.iter().all(|app| room(app).revision == u64::from(index) + 1));
     }
-    assert!(old_size > super::super::MAX_HISTORY_BYTES);
+    assert!(old_size > 8 * 1024 * 1024);
     assert!(room(&host).history_bytes < designcraft_collab_core::MAX_PAYLOAD);
     assert_eq!(document(&host), document(&guest));
 

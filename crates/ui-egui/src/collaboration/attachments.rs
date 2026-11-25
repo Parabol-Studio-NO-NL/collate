@@ -15,6 +15,7 @@ use super::Proposal;
 
 pub(super) type Blobs = BTreeMap<BlobId, Arc<Vec<u8>>>;
 const PREFIX: u8 = 0xb4;
+const ORIGINAL_PREFIX: u8 = 0xb5;
 const HEADER: usize = 1 + 32 + 4 + 4;
 const PART: usize = MAX_PAYLOAD - HEADER;
 const INVALID: &str = "The shared artwork transfer is invalid or exceeds the 1 GiB room limit.";
@@ -59,6 +60,27 @@ pub(super) fn is_part(bytes: &[u8]) -> bool {
     bytes.first() == Some(&PREFIX)
 }
 
+pub(super) fn is_original_part(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&ORIGINAL_PREFIX)
+}
+
+pub(super) fn original_part(id: BlobId, original: &[u8], offset: u32) -> Option<(Vec<u8>, u32)> {
+    part(ORIGINAL_PREFIX, id, original, offset)
+}
+
+fn part(prefix: u8, id: BlobId, bytes: &[u8], offset: u32) -> Option<(Vec<u8>, u32)> {
+    let start = offset as usize;
+    let end = (start + PART).min(bytes.len());
+    let body = bytes.get(start..end).filter(|b| !b.is_empty())?;
+    let mut frame = Vec::with_capacity(HEADER + body.len());
+    frame.push(prefix);
+    frame.extend(id.digest);
+    frame.extend(id.length.to_be_bytes());
+    frame.extend(offset.to_be_bytes());
+    frame.extend_from_slice(body);
+    Some((frame, end as u32))
+}
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct BlobCursor {
     index: usize,
@@ -78,20 +100,13 @@ impl BlobCursor {
     /// None after all attachments have been accepted by the transport queue.
     pub(super) fn next(&mut self, blobs: &Blobs, send: impl FnOnce(Vec<u8>) -> Result<(), String>) -> Option<Result<(), String>> {
         let (id, data) = blobs.iter().nth(self.index)?;
-        let start = self.offset as usize;
-        let end = (start + PART).min(data.len());
-        let mut frame = Vec::with_capacity(HEADER + end - start);
-        frame.push(PREFIX);
-        frame.extend(id.digest);
-        frame.extend(id.length.to_be_bytes());
-        frame.extend(self.offset.to_be_bytes());
-        frame.extend_from_slice(&data[start..end]);
+        let (frame, end) = part(PREFIX, *id, data, self.offset)?;
         Some(send(frame).inspect(|_| {
-            if end == data.len() {
+            if end as usize == data.len() {
                 self.index += 1;
                 self.offset = 0;
             } else {
-                self.offset = end as u32;
+                self.offset = end;
             }
         }))
     }
@@ -132,7 +147,20 @@ impl BlobDownload {
     /// Reserve by declared length before accepting any bytes. The caller deducts all
     /// competing transfers from the allowance. Disk space grows only as bytes arrive.
     pub(super) fn append(&mut self, bytes: &[u8], allowance: usize) -> Result<(), String> {
-        if !is_part(bytes) || !(HEADER + 1..=MAX_PAYLOAD).contains(&bytes.len()) {
+        self.append_part(bytes, allowance, 256, None).map(|_| ())
+    }
+
+    pub(super) fn append_seed(&mut self, bytes: &[u8], allowance: usize, max_files: usize) -> Result<(), String> {
+        self.append_part(bytes, allowance, max_files, None).map(|_| ())
+    }
+
+    pub(super) fn append_original(&mut self, bytes: &[u8], expected: BlobId) -> Result<bool, String> {
+        self.append_part(bytes, expected.length as usize, 1, Some(expected))
+    }
+
+    fn append_part(&mut self, bytes: &[u8], allowance: usize, max_files: usize, expected: Option<BlobId>) -> Result<bool, String> {
+        let prefix = if expected.is_some() { ORIGINAL_PREFIX } else { PREFIX };
+        if bytes.first() != Some(&prefix) || !(HEADER + 1..=MAX_PAYLOAD).contains(&bytes.len()) {
             return Err(INVALID.into());
         }
         let digest = bytes[1..33].try_into().map_err(|_| INVALID)?;
@@ -140,11 +168,12 @@ impl BlobDownload {
         let offset = u32::from_be_bytes(bytes[37..41].try_into().map_err(|_| INVALID)?) as usize;
         let id = BlobId { digest, length };
         let length = length as usize;
-        if !id.valid() || offset >= length || bytes.len() - HEADER != PART.min(length - offset) {
+        if expected.is_some_and(|wanted| wanted != id) || !id.valid() || offset >= length || bytes.len() - HEADER != PART.min(length - offset) {
             return Err(INVALID.into());
         }
         if self.pending.is_none() {
-            if offset != 0 || self.complete.contains_key(&id) || self.complete.len() >= 256 || self.reserved.saturating_add(length) > allowance {
+            if offset != 0 || self.complete.contains_key(&id) || self.complete.len() >= max_files || self.reserved.saturating_add(length) > allowance
+            {
                 return Err(INVALID.into());
             }
             // A zero threshold keeps every nonempty chunk on disk in an anonymous temporary file.
@@ -166,8 +195,9 @@ impl BlobDownload {
                 return Err(INVALID.into());
             }
             self.complete.insert(id, stream.file);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(super) fn load(&mut self, id: BlobId) -> Result<Arc<Vec<u8>>, String> {

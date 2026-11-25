@@ -19,8 +19,10 @@ use crate::{
 
 mod comment_anchor;
 mod format;
+pub(crate) mod reversible;
 
 pub use comment_anchor::AutomergeCommentAnchor;
+pub use reversible::ReversibleCommentAnchor;
 
 use format::{CHARACTER, EMPTY_CHARACTER, FIRST_PARAGRAPH, FOLLOWING_PARAGRAPH, Properties};
 

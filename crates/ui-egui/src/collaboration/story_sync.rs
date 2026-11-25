@@ -102,7 +102,7 @@ impl PendingSelection {
 pub(super) fn capture(replica: &Replica, actor: ActorId, edit: &DeferredEdit, sequence: u64) -> Result<Option<Captured>, String> {
     let mut draft = replica.clone();
     let hint = edit.before_selection.text.zip(edit.after_selection.text).and_then(|(before, after)| splice(before, after, &edit.before, &edit.after));
-    let transaction = match draft.capture_automerge_text(&edit.before, &edit.after, &actor.0, hint) {
+    let transaction = match draft.capture_reversible_text(&edit.before, &edit.after, &actor.0, sequence, hint) {
         Ok(Some(transaction)) => transaction,
         Ok(None) | Err(Error::UnsupportedEdit) => return Ok(None),
         Err(error) => return Err(error.to_string()),
@@ -127,6 +127,7 @@ pub(super) fn rebase(
     let mut document = (**confirmed).clone();
     let mut visible = replica.clone();
     for proposal in pending {
+        proposal.validate_story_transaction()?;
         let transaction = proposal.story_transaction.as_ref().ok_or("A story outbox also contains structural changes.")?;
         visible.apply_automerge_text(&mut document, &actor.0, transaction).map_err(|error| error.to_string())?;
     }
@@ -185,12 +186,15 @@ fn resolve(updated: &Replica, mut selection: TextSel, anchor: &[u8], focus: &[u8
 
 impl Proposal {
     pub(super) fn validate_story_transaction(&self) -> Result<(), String> {
-        if self.story_transaction.is_some() {
+        if let Some(transaction) = &self.story_transaction {
             if !cfg!(feature = "automerge-rooms") {
                 return Err("This room does not accept Automerge story edits.".into());
             }
             if !self.edits.is_empty() || self.history_action.is_some() {
                 return Err("An Automerge story transaction cannot contain room commands or undo requests.".into());
+            }
+            if transaction.reversible_sequence().is_some_and(|sequence| sequence != self.sequence) {
+                return Err("The story edit does not match its authenticated sequence.".into());
             }
         }
         Ok(())
@@ -236,7 +240,7 @@ impl Commit {
                 return Err("An Automerge story edit cannot be applied as an undo or redo.".into());
             }
             replica.apply_automerge_text(document, &self.actor.0, transaction).map_err(|error| error.to_string())?;
-            return Ok(None);
+            return Ok(replica.inverse_reversible_text(&self.actor.0, self.proposal.sequence, transaction));
         }
         let edits = &self.proposal.edits;
         let inverse = replica.inverse_patch_batch(document, edits).map_err(|error| error.to_string())?;

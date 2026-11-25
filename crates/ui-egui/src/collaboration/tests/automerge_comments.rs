@@ -23,7 +23,7 @@ fn a_seed_text_comment_tracks_original_glyphs_through_wire_replay() {
 
     // The seed has not yet been edited or installed as Automerge state in this room.
     let anchor = room(&guest).replica.text_comment_anchor(document(&guest), story, 1..5).unwrap();
-    assert!(matches!(&anchor, CommentAnchor::AutomergeText { story: target, .. } if *target == story));
+    assert!(matches!(&anchor, CommentAnchor::ReversibleText { story: target, .. } if *target == story));
     let reviewer = guest.collaboration.room.as_mut().unwrap();
     let thread = SharedId::Created { actor: reviewer.local.as_ref().unwrap().actor.to_string(), sequence: reviewer.next_sequence, index: 0 };
     reviewer

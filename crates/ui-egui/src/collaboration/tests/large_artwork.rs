@@ -62,7 +62,7 @@ fn large_artwork_survives_guest_placement_save_and_a_new_host() {
     recipient.collaboration.join_code = room(&reopened).invitation.clone().unwrap();
     recipient.start_seed_download().unwrap();
     wait_for_with_deadline(&mut [&mut reopened, &mut recipient], "new invitation delivers saved artwork", timeout, |apps| {
-        apps[1].collaboration.room.as_ref().is_some_and(Room::can_edit)
+        apps[1].collaboration.room.as_ref().is_some_and(|room| room.can_edit() && !room.originals.is_pending())
     });
     verify(&recipient);
 }

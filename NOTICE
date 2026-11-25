@@ -161,6 +161,11 @@ licensed (MIT/Apache-2.0/BSD/ISC/Zlib), fetched through crates.io or the pinned 
 Automerge (https://crates.io/crates/automerge) and its hexane dependency use the MIT License.
 Copyright (c) 2019-2021 the Automerge contributors.
 
+sha2 (https://crates.io/crates/sha2) is available under the MIT or Apache-2.0 license.
+Copyright (c) 2006-2009 Graydon Hoare
+Copyright (c) 2009-2013 Mozilla Foundation
+Copyright (c) 2016 Artyom Pavlov
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights

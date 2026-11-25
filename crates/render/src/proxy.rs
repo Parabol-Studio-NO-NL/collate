@@ -25,19 +25,27 @@ pub struct ProxyImage {
 /// A proxy of page `page` of the image or PDF `bytes`, or `None` when it can't be decoded or no
 /// encoding within [`MAX_BYTES`] was found.
 pub fn make_proxy(bytes: &[u8], page: u32) -> Option<ProxyImage> {
-    let pm = decode_for_proxy(bytes, page)?;
+    make_proxy_with_limits(bytes, page, MAX_SIDE_PX, MAX_BYTES)
+}
+
+/// A smaller screen preview for an original that is loading separately.
+pub fn make_proxy_with_limits(bytes: &[u8], page: u32, max_side: u32, max_bytes: usize) -> Option<ProxyImage> {
+    if max_side == 0 || max_bytes == 0 {
+        return None;
+    }
+    let pm = decode_for_proxy(bytes, page, max_side)?;
     let (w, h) = (u32::from(pm.width()), u32::from(pm.height()));
     if w == 0 || h == 0 {
         return None;
     }
-    let (tw, th) = fit(w, h, MAX_SIDE_PX);
+    let (tw, th) = fit(w, h, max_side.min(MAX_SIDE_PX));
     let mut cur = if (tw, th) == (w, h) { pm } else { resample(&pm, tw, th)? };
     let mut quality = JPEG_QUALITY;
     for _ in 0..MAX_TRIES {
         let (cw, ch) = (u32::from(cur.width()), u32::from(cur.height()));
         let (rgba, opaque) = unpremultiplied(&cur);
         let data = if opaque { encode_jpeg(cw, ch, &rgba, quality) } else { encode_png(cw, ch, rgba) };
-        if let Some(data) = data.filter(|d| d.len() <= MAX_BYTES) {
+        if let Some(data) = data.filter(|d| d.len() <= max_bytes.min(MAX_BYTES)) {
             return Some(ProxyImage { mime: if opaque { "image/jpeg" } else { "image/png" }, pixels: (cw, ch), data });
         }
         // Lower the JPEG quality first, then halve the size (PNG has no quality).
@@ -55,12 +63,12 @@ pub fn make_proxy(bytes: &[u8], page: u32) -> Option<ProxyImage> {
 }
 
 /// Decode `bytes`, through reduced decoding when it still leaves at least [`MAX_SIDE_PX`].
-fn decode_for_proxy(bytes: &[u8], page: u32) -> Option<Pixmap> {
+fn decode_for_proxy(bytes: &[u8], page: u32, max_side: u32) -> Option<Pixmap> {
     if page == 0 && designcraft_images::supports_reduced_decode(bytes) {
         let (w, h) = image_size(bytes)?;
         let long = w.max(h);
         let mut shrink = 0u8;
-        while shrink < designcraft_images::MAX_REDUCED_SHRINK && (long >> (shrink + 1)) >= MAX_SIDE_PX {
+        while shrink < designcraft_images::MAX_REDUCED_SHRINK && (long >> (shrink + 1)) >= max_side {
             shrink += 1;
         }
         if shrink > 0

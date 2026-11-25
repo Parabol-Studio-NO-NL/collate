@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     Error,
-    automerge_text::{AutomergeText, append_inserted_text},
+    automerge_text::{AutomergeText, append_inserted_text, reversible::ReversibleText},
     text::TextSplice,
 };
 
@@ -24,6 +24,8 @@ const MAX_TRANSACTION_BYTES: usize = 2 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct StoryTransaction {
     pub changes: Vec<StoryChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reversible_sequence: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -39,6 +41,7 @@ pub struct StoryChange {
 #[derive(Clone, Default)]
 pub struct AutomergeStories {
     stories: BTreeMap<StoryId, Arc<AutomergeText>>,
+    reversible: BTreeMap<StoryId, Arc<ReversibleText>>,
 }
 
 impl AutomergeStories {
@@ -46,8 +49,17 @@ impl AutomergeStories {
         self.stories.get(&id).map(Arc::as_ref)
     }
 
+    pub(crate) fn reversible(&self, id: StoryId) -> Option<&ReversibleText> {
+        self.reversible.get(&id).map(Arc::as_ref)
+    }
+
+    pub(crate) fn contains(&self, id: StoryId) -> bool {
+        self.stories.contains_key(&id) || self.reversible.contains_key(&id)
+    }
+
     pub(crate) fn remove(&mut self, id: StoryId) {
         self.stories.remove(&id);
+        self.reversible.remove(&id);
     }
 
     /// Record a native text edit locally and return the changes to send. A structural
@@ -59,9 +71,38 @@ impl AutomergeStories {
         actor: &[u8; 32],
         splice: Option<(StoryId, TextSplice)>,
     ) -> Result<Option<StoryTransaction>, Error> {
+        self.capture_version(before, after, actor, None, splice)
+    }
+
+    pub(crate) fn capture_reversible(
+        &mut self,
+        before: &Document,
+        after: &Document,
+        actor: &[u8; 32],
+        sequence: u64,
+        splice: Option<(StoryId, TextSplice)>,
+    ) -> Result<Option<StoryTransaction>, Error> {
+        // A pre-existing schema-1 story keeps its original history and anchors.
+        // A mixed-schema edit is rejected by either version's exclusive open path.
+        let has_old_story = after
+            .stories
+            .iter()
+            .any(|(id, story)| self.stories.contains_key(id) && before.stories.get(id).is_some_and(|old| !Arc::ptr_eq(old, story) && old != story));
+        let version = if has_old_story { None } else { Some(sequence) };
+        self.capture_version(before, after, actor, version, splice)
+    }
+
+    fn capture_version(
+        &mut self,
+        before: &Document,
+        after: &Document,
+        actor: &[u8; 32],
+        reversible_sequence: Option<u64>,
+        splice: Option<(StoryId, TextSplice)>,
+    ) -> Result<Option<StoryTransaction>, Error> {
         let mut native = before.clone();
         let mut staged = self.clone();
-        let mut transaction = StoryTransaction { changes: Vec::new() };
+        let mut transaction = StoryTransaction { changes: Vec::new(), reversible_sequence };
         for (&id, current) in &after.stories {
             let previous = before.stories.get(&id).ok_or(Error::UnsupportedEdit)?;
             if Arc::ptr_eq(previous, current) || previous == current {
@@ -69,9 +110,14 @@ impl AutomergeStories {
             }
             check_native_ranges(before, id)?;
             let hint = splice.as_ref().filter(|(story, _)| *story == id).map(|(_, hint)| hint.clone());
-            let story = staged.open(previous, &before.styles, actor)?;
-            story.set_actor(actor)?;
-            if let Some(bytes) = story.capture(previous, current, &before.styles, hint)? {
+            let bytes = if let Some(sequence) = reversible_sequence {
+                staged.open_reversible(previous, &before.styles)?.capture(previous, current, &before.styles, actor, sequence, hint)?
+            } else {
+                let story = staged.open(previous, &before.styles, actor)?;
+                story.set_actor(actor)?;
+                story.capture(previous, current, &before.styles, hint)?
+            };
+            if let Some(bytes) = bytes {
                 if transaction.changes.len() == MAX_STORIES_PER_EDIT {
                     return Err(Error::Limit);
                 }
@@ -99,14 +145,24 @@ impl AutomergeStories {
         for change in &transaction.changes {
             let original = document.story(change.story).ok_or(Error::UnknownResource)?;
             check_native_ranges(document, change.story)?;
-            let story = staged.open(original, &document.styles, actor)?;
             let mut output = original.clone();
-            story.project(&mut output, &document.styles)?;
-            if output.text != original.text || output.chars != original.chars || output.paras != original.paras {
-                return Err(Error::Invalid("story projection"));
+            if let Some(sequence) = transaction.reversible_sequence {
+                let story = staged.open_reversible(original, &document.styles)?;
+                story.project(&mut output, &document.styles)?;
+                if output != *original {
+                    return Err(Error::Invalid("story projection"));
+                }
+                story.apply(actor, sequence, &change.bytes, &document.styles)?;
+                story.project(&mut output, &document.styles)?;
+            } else {
+                let story = staged.open(original, &document.styles, actor)?;
+                story.project(&mut output, &document.styles)?;
+                if output != *original {
+                    return Err(Error::Invalid("story projection"));
+                }
+                story.apply_changes(actor, &change.bytes, &document.styles)?;
+                story.project(&mut output, &document.styles)?;
             }
-            story.apply_changes(actor, &change.bytes, &document.styles)?;
-            story.project(&mut output, &document.styles)?;
             projected.push((change.story, Arc::new(output)));
         }
         document.stories.extend(projected);
@@ -117,11 +173,31 @@ impl AutomergeStories {
     pub(crate) fn open(&mut self, original: &Story, styles: &Styles, actor: &[u8; 32]) -> Result<&mut AutomergeText, Error> {
         use std::collections::btree_map::Entry;
 
+        if self.reversible.contains_key(&original.id) {
+            return Err(Error::UnsupportedEdit);
+        }
         let story = match self.stories.entry(original.id) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => entry.insert(Arc::new(AutomergeText::seed(original, styles, actor)?)),
         };
         Ok(Arc::make_mut(story))
+    }
+
+    pub(crate) fn open_reversible(&mut self, original: &Story, styles: &Styles) -> Result<&mut ReversibleText, Error> {
+        use std::collections::btree_map::Entry;
+
+        if self.stories.contains_key(&original.id) {
+            return Err(Error::UnsupportedEdit);
+        }
+        let story = match self.reversible.entry(original.id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(Arc::new(ReversibleText::seed(original, styles)?)),
+        };
+        Ok(Arc::make_mut(story))
+    }
+
+    pub(crate) fn toggle(&mut self, story: &mut Story, styles: &Styles, actor: &str, sequence: u64, active: bool) -> Result<(), Error> {
+        Arc::make_mut(self.reversible.get_mut(&story.id).ok_or(Error::UnknownResource)?).toggle(story, styles, actor, sequence, active)
     }
 }
 
@@ -153,6 +229,11 @@ fn deserialize_change<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<
 }
 
 impl StoryTransaction {
+    /// The authenticated proposal sequence for reversible edits. Older commits omit it.
+    pub fn reversible_sequence(&self) -> Option<u64> {
+        self.reversible_sequence
+    }
+
     /// Recover inserted text from a locally submitted change that the host declined.
     pub fn inserted_text(&self) -> Result<String, Error> {
         self.validate()?;
@@ -164,8 +245,8 @@ impl StoryTransaction {
     }
 
     fn validate(&self) -> Result<(), Error> {
-        if self.changes.is_empty() {
-            return Err(Error::Invalid("empty story transaction"));
+        if self.changes.is_empty() || self.reversible_sequence == Some(0) {
+            return Err(Error::Invalid("story transaction"));
         }
         if self.changes.len() > MAX_STORIES_PER_EDIT {
             return Err(Error::Limit);

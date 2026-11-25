@@ -35,15 +35,15 @@ use web_time::Instant;
 use self::{
     edit_wire::{SendCursor, WireEdit},
     history::HistoryAction,
-    join::{PendingJoin, SeedDelivery},
+    join::{JoinedSeed, OriginalDownloads, PendingJoin, SeedDelivery},
     presence::Presence,
     seed::{SeedAdvertisement, SeedChunk, SeedDownload},
     storage::{OpenRoom, Storage},
 };
 use crate::DesignApp;
 
-const MAX_HISTORY: usize = 1024;
-const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HISTORY: usize = if cfg!(feature = "automerge-rooms") { 16_384 } else { 1024 };
+const MAX_HISTORY_BYTES: usize = (if cfg!(feature = "automerge-rooms") { 64 } else { 8 }) * 1024 * 1024;
 const MAX_QUEUED_STORY_EDITS: usize = 64;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -80,6 +80,7 @@ enum Message {
     ArtworkReceipt { revision: u64, sequence: u64, digest: [u8; 32] },
     Incompatible,
     RequestSeed,
+    RequestOriginal { blob: designcraft_collab::artwork::BlobId },
     SeedOffer(SeedAdvertisement),
     SeedPart(SeedChunk),
     EditOffer(SeedAdvertisement),
@@ -147,8 +148,12 @@ struct Room {
     history: Vec<(Commit, WireEdit)>,
     inverses: Vec<Option<Vec<Operation>>>,
     history_bytes: usize,
+    committed_sequences: BTreeMap<(ActorId, u64), usize>,
+    history_artwork: u64,
+    seed_artwork: u64,
     model_size: Option<(Weak<Document>, usize)>,
     seed_delivery: SeedDelivery,
+    originals: OriginalDownloads,
     receiving_edits: BTreeMap<ActorId, SeedDownload>,
     receiving_blobs: BTreeMap<ActorId, attachments::BlobDownload>,
     sending_proposal: Option<(WireEdit, SendCursor)>,
@@ -351,9 +356,12 @@ impl DesignApp {
         }
     }
 
-    fn install_downloaded_seed(&mut self, joining: PendingJoin, doc: Document) -> Result<(), String> {
+    fn install_downloaded_seed(&mut self, joining: PendingJoin, seed_download: JoinedSeed) -> Result<(), String> {
+        let JoinedSeed { document: doc, originals } = seed_download;
         let seed = fingerprint(&doc)?;
-        let storage = Storage::ephemeral(doc.clone(), joining.identity.to_bytes())?;
+        let identity = joining.identity.to_bytes();
+        let storage =
+            if originals.is_pending() { Storage::ephemeral_preview(doc.clone(), identity) } else { Storage::ephemeral(doc.clone(), identity)? };
         let state = designcraft_engine::DocState::new(doc, None);
         let uid = state.uid;
         self.session.add_document(state);
@@ -362,6 +370,7 @@ impl DesignApp {
         room.host = Some(joining.host);
         room.online = true;
         room.peers = joining.peers;
+        room.originals = originals;
         self.collaboration.room = Some(room);
         self.session.defer_document_edits(Some(uid));
         // An invitation download has no local file. Keep it off disk until the user saves.
@@ -393,6 +402,7 @@ impl DesignApp {
         room.last_send = None;
         room.receiving_edits.clear();
         room.receiving_blobs.clear();
+        room.originals.disconnect();
         room.sending_proposal = None;
         room.story_sender = Default::default();
         c.join_code.clear();
@@ -478,7 +488,7 @@ impl DesignApp {
         }
         c.join_code.clear();
         let mut room = Room::new(transport, mode, storage, uid, seed);
-        room.history = recovered.history;
+        room.restore_history_index(recovered.history);
         room.inverses = recovered.inverses;
         room.history_bytes = recovered.history_bytes;
         room.replica = recovered.replica;
@@ -507,6 +517,7 @@ fn fingerprint(doc: &Document) -> Result<[u8; 32], String> {
 
 impl Room {
     fn new(transport: Transport, mode: Mode, storage: Storage, doc_uid: u64, seed: [u8; 32]) -> Self {
+        let seed_artwork = seed_document::artwork_size(&storage.seed);
         let replica = Replica::new(&storage.seed);
         Self {
             transport,
@@ -520,8 +531,12 @@ impl Room {
             history: Vec::new(),
             inverses: Vec::new(),
             history_bytes: 0,
+            committed_sequences: BTreeMap::new(),
+            history_artwork: 0,
+            seed_artwork,
             model_size: None,
             seed_delivery: SeedDelivery::default(),
+            originals: OriginalDownloads::default(),
             receiving_edits: BTreeMap::new(),
             receiving_blobs: BTreeMap::new(),
             sending_proposal: None,
@@ -552,9 +567,15 @@ impl Room {
         }
     }
 
+    fn restore_history_index(&mut self, history: Vec<(Commit, WireEdit)>) {
+        self.committed_sequences = history.iter().enumerate().map(|(i, (commit, _))| ((commit.actor, commit.proposal.sequence), i)).collect();
+        self.history_artwork = history.iter().map(|(_, wire)| wire.artwork_size).sum();
+        self.history = history;
+    }
+
     #[cfg(target_os = "macos")]
     fn enable_recovery(&mut self, recovery_dir: Option<&std::path::Path>, path: &str) {
-        if self.storage.is_durable() || recovery_dir.is_none() || self.recovery_path_checked.as_deref() == Some(path) {
+        if self.storage.is_durable() || self.originals.is_pending() || recovery_dir.is_none() || self.recovery_path_checked.as_deref() == Some(path) {
             return;
         }
         let Mode::Guest { .. } = self.mode else { return };
@@ -623,6 +644,7 @@ impl Room {
         self.advance_delivery();
         self.seed_delivery.advance(&self.transport, &self.storage.seed_blobs);
         self.advance_proposal();
+        self.advance_original_delivery();
     }
 
     fn artwork_progress(&self) -> Option<attachments::ArtworkProgress> {
@@ -630,7 +652,9 @@ impl Room {
             return Some(progress);
         }
         match &self.mode {
-            Mode::Guest { .. } => self.sending_proposal.as_ref().and_then(|(wire, cursor)| wire.progress(cursor)),
+            Mode::Guest { .. } => {
+                self.sending_proposal.as_ref().and_then(|(wire, cursor)| wire.progress(cursor)).or_else(|| self.originals.progress())
+            }
             Mode::Host { delivery } => self
                 .seed_delivery
                 .progress(&self.storage.seed_blobs)
@@ -727,6 +751,7 @@ impl Room {
         self.presence.clear();
         self.receiving_edits.clear();
         self.receiving_blobs.clear();
+        self.originals.disconnect();
         self.sending_proposal = None;
         self.story_sender = Default::default();
         if matches!(self.mode, Mode::Guest { .. }) {
@@ -736,6 +761,9 @@ impl Room {
 
     fn on_packet(&mut self, session: &mut Session, actor: ActorId, bytes: &[u8]) {
         if self.fatal {
+            return;
+        }
+        if self.on_original_packet(actor, bytes) {
             return;
         }
         if attachments::is_part(bytes) {
@@ -811,6 +839,7 @@ impl Room {
     fn on_guest_message(&mut self, session: &mut Session, actor: ActorId, message: Message) {
         match message {
             Message::RequestSeed => self.provide_seed(actor),
+            Message::RequestOriginal { blob } if self.serving(actor) => self.provide_original(actor, blob),
             Message::Hello { seed, revision } => {
                 if seed != self.seed || revision > self.revision {
                     self.reply(actor, Message::Incompatible);
@@ -823,7 +852,7 @@ impl Room {
             Message::Propose(mut proposal) if self.serving(actor) => {
                 let sequence = proposal.sequence;
                 let transfer = self.receiving_blobs.remove(&actor).unwrap_or_default();
-                let duplicate = self.history.iter().any(|(old, _)| old.actor == actor && old.proposal.sequence == sequence);
+                let duplicate = self.committed_sequences.contains_key(&(actor, sequence));
                 let uploaded = !duplicate && transfer.reserved() > 0 && proposal.history_action.is_none();
                 let validated = if duplicate {
                     Ok(())
@@ -1069,7 +1098,7 @@ impl Room {
         if !matches!(self.mode, Mode::Host { .. }) {
             return Err("Only the host can confirm edits.".into());
         }
-        if let Some(index) = self.history.iter().position(|(old, _)| old.actor == actor && old.proposal.sequence == proposal.sequence) {
+        if let Some(&index) = self.committed_sequences.get(&(actor, proposal.sequence)) {
             if let Mode::Host { delivery } = &mut self.mode
                 && let Some(state) = delivery.get_mut(&actor).filter(|state| state.sent > index)
             {
@@ -1197,14 +1226,16 @@ impl Room {
     }
 
     fn check_artwork_budget(&self, next: u64) -> Result<(), String> {
-        let retained: u64 = self.history.iter().map(|(_, wire)| wire.artwork_size).sum();
-        if seed_document::artwork_size(&self.storage.seed) + retained + next > designcraft_collab::artwork::MAX_ARTWORK_BYTES as u64 {
+        if self.seed_artwork + self.history_artwork + next > designcraft_collab::artwork::MAX_ARTWORK_BYTES as u64 {
             return Err(attachments::ARTWORK_LIMIT.into());
         }
         Ok(())
     }
 
     fn commit(&mut self, session: &mut Session, commit: Commit) -> Result<(), String> {
+        if commit.proposal.sequence == 0 || self.committed_sequences.contains_key(&(commit.actor, commit.proposal.sequence)) {
+            return Err("The confirmed edit has an invalid sequence.".into());
+        }
         history::verify_text_compensation(&commit, self.history.iter().map(|(original, _)| original), &self.inverses)?;
         let bytes = encode_edit(Message::Commit(commit.clone()))?;
         self.check_artwork_budget(bytes.artwork_size)?;
@@ -1232,6 +1263,10 @@ impl Room {
         } else if let Some(transaction) = &commit.proposal.story_transaction {
             let pending = self.pending_story_selection.as_ref().filter(|selection| local_edit && selection.sequence == commit.proposal.sequence);
             story_sync::selection_after(st, &self.replica, &replica, transaction, pending)
+        } else if commit.proposal.edits.iter().any(|op| {
+            matches!(op, Operation::SetAutomergeTextBatchActive { story, .. } if st.selection.text.is_some_and(|sel| sel.story == *story && sel.cell.is_none()))
+        }) {
+            story_sync::remap_selection(st, &self.replica, &replica)
         } else {
             text_selection::after(st, &self.replica, &replica, &commit.proposal.edits, local_edit)
         };
@@ -1244,7 +1279,8 @@ impl Room {
                 .as_ref()
                 .and_then(|p| p.story_transaction.as_ref())
                 .is_some_and(|front| Some(front) == commit.proposal.story_transaction.as_ref());
-        if let Err(error) = self.storage.write(self.history.iter().map(|(c, _)| c).chain(std::iter::once(&commit)), &self.pending, self.next_sequence)
+        if let Err(error) =
+            self.storage.append_confirmed(self.history.iter().map(|(c, _)| c), &commit, bytes.len(), &self.pending, self.next_sequence)
         {
             if let Some(front) = front {
                 self.pending.push_front(front);
@@ -1309,6 +1345,8 @@ impl Room {
         }
         self.revision = commit.revision;
         self.history_bytes += bytes.len();
+        self.history_artwork += bytes.artwork_size;
+        self.committed_sequences.insert((commit.actor, commit.proposal.sequence), self.history.len());
         self.history.push((commit, bytes));
         self.inverses.push(inverse);
         Ok(())
@@ -1418,7 +1456,9 @@ fn page_location(document: &Document, id: PageId) -> Option<(usize, usize)> {
 
 fn operation_story(operation: &Operation) -> Option<designcraft_doc::StoryId> {
     match operation {
-        Operation::Text { story, .. } | Operation::SetTextBatchActive { story, .. } => Some(*story),
+        Operation::Text { story, .. } | Operation::SetTextBatchActive { story, .. } | Operation::SetAutomergeTextBatchActive { story, .. } => {
+            Some(*story)
+        }
         _ => None,
     }
 }

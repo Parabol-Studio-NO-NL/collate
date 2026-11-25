@@ -74,16 +74,21 @@ enum Drawn<'a> {
 /// can't be had) those of `proxy`, the asset's preview, which spans the same page.
 fn pixels<'a>(f: &Frame, want: &'a images::Want, proxy: Option<&'a designcraft_doc::AssetData>) -> Drawn<'a> {
     let (width_pt, on_screen) = (want.width_pt, want.on_screen);
+    let awaiting = want.bytes.shared_original_pending();
     if !f.opts.defer_images {
-        if let Some(pm) = images::mip(&want.bytes, want.page, width_pt, on_screen) {
+        if !awaiting && let Some(pm) = images::mip(&want.bytes, want.page, width_pt, on_screen) {
             return Drawn::Pixels(pm, &want.bytes);
         }
         return proxy.and_then(|p| Some(Drawn::Pixels(images::mip(p, 0, width_pt, on_screen)?, p))).unwrap_or(Drawn::Nothing);
     }
-    let loading = match images::mip_now(&want.bytes, want.page, width_pt, on_screen) {
-        images::Mip::Ready(pm) | images::Mip::Pending(Some(pm)) => return Drawn::Pixels(pm, &want.bytes),
-        images::Mip::Pending(None) => true,
-        images::Mip::Failed => false,
+    let loading = if awaiting {
+        true
+    } else {
+        match images::mip_now(&want.bytes, want.page, width_pt, on_screen) {
+            images::Mip::Ready(pm) | images::Mip::Pending(Some(pm)) => return Drawn::Pixels(pm, &want.bytes),
+            images::Mip::Pending(None) => true,
+            images::Mip::Failed => false,
+        }
     };
     match proxy.map(|p| (p, images::mip_now(p, 0, width_pt, on_screen))) {
         Some((p, images::Mip::Ready(pm) | images::Mip::Pending(Some(pm)))) => Drawn::Pixels(pm, p),
@@ -282,7 +287,7 @@ impl Renderer {
         };
         let page_w = want.width_pt;
         // A layer variant has no proxy: the asset's shows the file's default layers.
-        let proxy = asset.proxy.as_ref().map(|p| &p.data).filter(|_| want.bytes.key() == asset.data.key());
+        let proxy = asset.data.shared_preview().or(asset.proxy.as_ref()).map(|p| &p.data).filter(|_| want.bytes.key() == asset.data.key());
         let (pm, data) = match pixels(f, &want, proxy) {
             Drawn::Pixels(pm, data) => (pm, data),
             Drawn::Loading => return loading(ctx),

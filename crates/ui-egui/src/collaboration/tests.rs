@@ -812,8 +812,11 @@ fn three_peers_converge_after_delayed_reordered_and_duplicate_packets() {
 
     // Stage all three changes before polling transport. Send the fill before the delayed text proposal.
     for app in [&mut host, &mut writer, &mut reviewer] {
-        let edit = app.session.take_deferred_edit().unwrap();
-        app.collaboration.room.as_mut().unwrap().capture_edit(&mut app.session, edit).unwrap();
+        if let Some(edit) = app.session.take_deferred_edit() {
+            app.collaboration.room.as_mut().unwrap().capture_edit(&mut app.session, edit).unwrap();
+        } else {
+            assert!(cfg!(feature = "automerge-rooms") && room(app).story_draft.is_some());
+        }
     }
     let fill_proposal = room(&reviewer).pending.front().unwrap().clone();
     let text_proposal = room(&writer).pending.front().unwrap().clone();
@@ -837,7 +840,12 @@ fn three_peers_converge_after_delayed_reordered_and_duplicate_packets() {
     deliver_room_packet(&host, &mut writer, Message::Commit(moved.clone()));
     deliver_room_packet(&host, &mut writer, Message::Commit(moved));
     assert_eq!(room(&writer).history.len(), 1);
-    assert_eq!(document(&writer).story(story).unwrap().text, "ABCD");
+    if cfg!(feature = "automerge-rooms") {
+        assert_eq!(room(&writer).story_draft.as_ref().unwrap().confirmed.story(story).unwrap().text, "ABCD");
+        assert_eq!(document(&writer).story(story).unwrap().text, "ABλCD");
+    } else {
+        assert_eq!(document(&writer).story(story).unwrap().text, "ABCD");
+    }
 
     wait_for(&mut [&mut host, &mut writer, &mut reviewer], "three peers fill the gap without reconnecting", |apps| {
         apps.iter().all(|app| room(app).online && room(app).can_edit() && room(app).revision == 3)
@@ -903,7 +911,11 @@ fn shared_text_comment_tracks_original_atoms_through_edits_and_replay() {
     wait_for(&mut [&mut host, &mut guest], "text reviewer joins", |apps| room(apps[1]).can_edit());
 
     let anchor = room(&guest).replica.text_comment_anchor(document(&guest), story, 1..5).unwrap();
-    assert_eq!(anchor, CommentAnchor::Text { story, atoms: vec![AtomId::Seed(1), AtomId::Seed(2)] });
+    if cfg!(feature = "automerge-rooms") {
+        assert!(matches!(&anchor, CommentAnchor::ReversibleText { story: target, .. } if *target == story));
+    } else {
+        assert_eq!(anchor, CommentAnchor::Text { story, atoms: vec![AtomId::Seed(1), AtomId::Seed(2)] });
+    }
     let review_room = guest.collaboration.room.as_mut().unwrap();
     let thread = SharedId::Created { actor: review_room.local.as_ref().unwrap().actor.to_string(), sequence: review_room.next_sequence, index: 0 };
     review_room
@@ -969,8 +981,13 @@ fn shared_text_comment_tracks_original_atoms_through_edits_and_replay() {
             vec![Operation::CreateComment { id: long_id.clone(), anchor: large_anchor.clone(), text: "Review this passage".into() }],
         )
         .unwrap();
-    assert!(review_room.sending_proposal.as_ref().unwrap().0.len() > designcraft_collab_core::MAX_PAYLOAD);
-    wait_for(&mut [&mut host, &mut guest], "the large text anchor crosses the transport in chunks", |apps| {
+    let wire_size = review_room.sending_proposal.as_ref().unwrap().0.len();
+    if cfg!(feature = "automerge-rooms") {
+        assert!(wire_size <= designcraft_collab_core::MAX_PAYLOAD, "a contiguous identity range fits in one packet");
+    } else {
+        assert!(wire_size > designcraft_collab_core::MAX_PAYLOAD, "the legacy anchor requires multiple packets");
+    }
+    wait_for(&mut [&mut host, &mut guest], "the maximum-length text anchor reaches both peers", |apps| {
         apps.iter().all(|app| room(app).revision == 8)
     });
     for app in [&host, &guest] {
@@ -1066,7 +1083,14 @@ fn shared_clipboard_and_placeholder_fill_reach_both_peers() {
 
     guest.run("selection.set", json!({"ids": [frame["id"]]})).unwrap();
     guest.run("type.fillWithPlaceholder", json!({})).unwrap();
-    assert_eq!(document(&guest), &seed);
+    if cfg!(feature = "automerge-rooms") {
+        assert!(document(&guest).story(story).unwrap().text.contains('\n'));
+        assert!(document(&host).story(story).unwrap().text.is_empty());
+        let confirmed = &room(&guest).story_draft.as_ref().unwrap().confirmed;
+        assert_eq!(confirmed.as_ref(), &seed);
+    } else {
+        assert_eq!(document(&guest), &seed);
+    }
     wait_for_revision(&mut host, &mut guest, "placeholder fills the shared frame", 1);
     let filler = &document(&guest).story(story).unwrap().text;
     assert!(filler.contains('\n'));
@@ -1078,7 +1102,13 @@ fn shared_clipboard_and_placeholder_fill_reach_both_peers() {
     let pasted = pasted.replace("\r\n", "\n");
     assert_eq!(document(&guest).story(story).unwrap().text, pasted);
     assert_eq!(guest.session.doc().unwrap().selection.text.unwrap().focus, pasted.len());
-    assert!(room(&host).history[1].1.len() > designcraft_collab_core::MAX_PAYLOAD);
+    let (paste_commit, wire) = &room(&host).history[1];
+    if cfg!(feature = "automerge-rooms") {
+        assert!(paste_commit.proposal.story_transaction.is_some());
+        assert!(wire.len() <= designcraft_collab_core::MAX_PAYLOAD, "a compact paste can travel in one packet");
+    } else {
+        assert!(wire.len() > designcraft_collab_core::MAX_PAYLOAD);
+    }
 
     host.run("selection.set", json!({"ids": [shape.0]})).unwrap();
     host.run("edit.copy", json!({})).unwrap();
@@ -1246,21 +1276,40 @@ fn deleting_a_shared_text_frame_preserves_declined_and_buffered_typing() {
     let submitted = "🧪".repeat(151);
     guest.run("text.select", json!({"story": story, "anchor": 5})).unwrap();
     guest.run("text.insert", json!({"text": submitted, "raw": true})).unwrap();
-    let edit = guest.session.take_deferred_edit().unwrap();
-    guest.collaboration.room.as_mut().unwrap().capture_edit(&mut guest.session, edit).unwrap();
-    assert!(guest.buffer_shared_typing(" later"));
+    if cfg!(feature = "automerge-rooms") {
+        guest.run("text.insert", json!({"text": " later", "raw": true})).unwrap();
+        assert_eq!(room(&guest).pending.len(), 2);
+    } else {
+        let edit = guest.session.take_deferred_edit().unwrap();
+        guest.collaboration.room.as_mut().unwrap().capture_edit(&mut guest.session, edit).unwrap();
+        assert!(guest.buffer_shared_typing(" later"));
+    }
 
     // The host's local deletion is confirmed before its event loop reads the guest's proposal.
     host.run("edit.clear", json!({"ids": [frame]})).unwrap();
     wait_for(&mut [&mut host, &mut guest], "delete confirmed and stale text declined", |apps| {
-        room(apps[0]).revision == 1 && room(apps[1]).revision == 1 && room(apps[1]).pending.is_empty()
+        let guest = room(apps[1]);
+        room(apps[0]).revision == 1
+            && guest.revision == 1
+            && if cfg!(feature = "automerge-rooms") { guest.story_queue_blocked } else { guest.pending.is_empty() }
     });
 
-    assert_eq!(document(&host), document(&guest));
-    assert!(document(&guest).item(ItemId(frame)).is_none());
-    assert!(document(&guest).story(designcraft_doc::StoryId(story)).is_none());
-    assert!(guest.session.doc().unwrap().selection.text.is_none());
-    assert_eq!(room(&guest).paused_typing(), Some(format!("{submitted} later").as_str()));
+    if cfg!(feature = "automerge-rooms") {
+        let room = room(&guest);
+        let draft = room.story_draft.as_ref().unwrap();
+        assert_eq!(document(&host), draft.confirmed.as_ref());
+        assert!(draft.confirmed.item(ItemId(frame)).is_none());
+        assert!(draft.confirmed.story(StoryId(story)).is_none());
+        assert_eq!(room.pending.len(), 2);
+        assert_eq!(room.declined_story_text(), format!("{submitted} later"));
+        assert_eq!(document(&guest).story(StoryId(story)).unwrap().text, format!("Proof{submitted} later"));
+    } else {
+        assert_eq!(document(&host), document(&guest));
+        assert!(document(&guest).item(ItemId(frame)).is_none());
+        assert!(document(&guest).story(StoryId(story)).is_none());
+        assert!(guest.session.doc().unwrap().selection.text.is_none());
+        assert_eq!(room(&guest).paused_typing(), Some(format!("{submitted} later").as_str()));
+    }
     assert!(guest.collaboration_blocks_close());
 }
 
@@ -1521,16 +1570,18 @@ fn concurrent_editor_text_inserts_and_deletes_keep_the_other_peers_atoms() {
 
     let end = document(&guest).story(story_id).unwrap().text.len();
     guest.run("text.select", json!({"story": story, "anchor": end, "focus": end})).unwrap();
-    guest.run("text.insert", json!({"text": "1", "raw": true})).unwrap();
-    assert!(guest.buffer_shared_typing("23"));
+    type_while_waiting_for_confirmation(&mut guest, story_id);
     wait_for(&mut [&mut host, &mut guest], "buffered typing", |apps| apps.iter().all(|app| room(app).revision == 8));
     assert_eq!(document(&host), document(&guest));
     assert!(document(&host).story(story_id).unwrap().text.ends_with("123"));
 
     // A fresh invitation from a restarted host keeps the guest's identity and its outstanding edit.
     guest.run("text.insert", json!({"text":"4","raw":true})).unwrap();
-    let edit = guest.session.take_deferred_edit().unwrap();
-    guest.collaboration.room.as_mut().unwrap().capture_edit(&mut guest.session, edit).unwrap();
+    if let Some(edit) = guest.session.take_deferred_edit() {
+        guest.collaboration.room.as_mut().unwrap().capture_edit(&mut guest.session, edit).unwrap();
+    } else {
+        assert!(cfg!(feature = "automerge-rooms") && room(&guest).story_draft.is_some());
+    }
     let guest_actor = room(&guest).local.as_ref().unwrap().actor;
     assert!(guest.collaboration_blocks_close());
     guest.request_quit();
@@ -1568,8 +1619,21 @@ fn concurrent_editor_text_inserts_and_deletes_keep_the_other_peers_atoms() {
     assert_eq!(*document(&guest), unchanged);
 }
 
+fn type_while_waiting_for_confirmation(guest: &mut DesignApp, story: StoryId) {
+    guest.run("text.insert", json!({"text": "1", "raw": true})).unwrap();
+    if cfg!(feature = "automerge-rooms") {
+        guest.run("text.insert", json!({"text": "23", "raw": true})).unwrap();
+        assert!(document(guest).story(story).unwrap().text.ends_with("123"));
+        assert_eq!(room(guest).pending.len(), 2);
+    } else {
+        assert!(guest.buffer_shared_typing("23"));
+    }
+}
+
 #[cfg(feature = "automerge-rooms")]
 mod automerge_comments;
+#[cfg(feature = "automerge-rooms")]
+mod automerge_undo;
 mod book;
 mod embedded_link;
 mod font_notice;

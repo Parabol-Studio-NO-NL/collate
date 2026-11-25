@@ -8,9 +8,16 @@ use super::{Commit, MAX_QUEUED_STORY_EDITS, Proposal, attachments::Blobs, seed_d
 use designcraft_collab::artwork::BlobId;
 
 const JOURNAL_VERSION: u16 = 1;
+#[cfg(target_os = "macos")]
+const SEGMENTED_JOURNAL_VERSION: u16 = 2;
+#[cfg(target_os = "macos")]
+const HISTORY_SEGMENT_EDITS: usize = 64;
+#[cfg(target_os = "macos")]
+const HISTORY_SEGMENT_BYTES: usize = 512 * 1024;
 const QUEUED_OUTBOX: bool = cfg!(feature = "automerge-rooms");
 const MAX_PENDING: usize = if QUEUED_OUTBOX { MAX_QUEUED_STORY_EDITS } else { 1 };
 #[cfg(target_os = "macos")]
+// Keep the development path stable so existing protocol-16 journals can migrate in place.
 pub(super) const JOURNAL_DIRECTORY: &str = if cfg!(feature = "automerge-rooms") { "Collaboration-Protocol16" } else { "Collaboration" };
 
 #[cfg(target_os = "macos")]
@@ -68,6 +75,26 @@ pub(super) struct SavedRoom {
     pub(super) confirmed: Vec<Commit>,
     #[serde(default, deserialize_with = "deserialize_pending")]
     pub(super) pending: VecDeque<Proposal>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryTail {
+    segments: usize,
+    archived_edits: usize,
+    commits: Vec<Commit>,
+    bytes: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryHead {
+    tail: HistoryTail,
+    next_sequence: u64,
+    #[serde(serialize_with = "serialize_pending", deserialize_with = "deserialize_pending")]
+    pending: VecDeque<Proposal>,
 }
 
 #[cfg(target_os = "macos")]
@@ -316,6 +343,9 @@ struct Durable {
     record: RecordId,
     _lease: RecordLock,
     stored: std::cell::RefCell<std::collections::BTreeSet<BlobId>>,
+    confirmed_blobs: std::cell::RefCell<std::collections::BTreeSet<BlobId>>,
+    pending_blobs: std::cell::RefCell<std::collections::BTreeSet<BlobId>>,
+    history: std::cell::RefCell<Option<HistoryTail>>,
     hosts: Option<HostRooms>,
 }
 
@@ -338,6 +368,18 @@ impl Storage {
             #[cfg(target_os = "macos")]
             durable: None,
         })
+    }
+
+    pub(super) fn ephemeral_preview(document: Document, identity: [u8; 32]) -> Self {
+        Self {
+            identity,
+            seed_blobs: Blobs::new(),
+            seed: Arc::new(document),
+            encoded_archive: String::new(),
+            archive: Vec::new(),
+            #[cfg(target_os = "macos")]
+            durable: None,
+        }
     }
 
     pub(super) fn open(
@@ -392,6 +434,12 @@ impl Storage {
         }
         let mut saved = if let Some(bytes) = existing {
             let saved: SavedRoom = serde_json::from_slice(&bytes).map_err(|_| "The local collaboration journal could not be read.")?;
+            #[cfg(target_os = "macos")]
+            let saved = if QUEUED_OUTBOX && saved.version == SEGMENTED_JOURNAL_VERSION {
+                durable.as_ref().ok_or("The room recovery directory is missing.")?.restore_history(saved)?
+            } else {
+                saved
+            };
             if saved.version != JOURNAL_VERSION || saved.next_sequence == 0 || saved.confirmed.len() > super::MAX_HISTORY {
                 return Err("The local collaboration journal needs a compatible app version.".into());
             }
@@ -455,6 +503,14 @@ impl Storage {
             }
             proposal.attach(&blobs)?;
         }
+        #[cfg(target_os = "macos")]
+        if QUEUED_OUTBOX && let Some(durable) = &durable {
+            durable
+                .confirmed_blobs
+                .borrow_mut()
+                .extend(seed_blobs.keys().copied().chain(saved.confirmed.iter().flat_map(|c| c.proposal.blob_refs())));
+            durable.pending_blobs.borrow_mut().extend(saved.pending.iter().flat_map(Proposal::blob_refs));
+        }
         let storage = Self {
             identity: saved.identity,
             seed_blobs,
@@ -481,6 +537,12 @@ impl Storage {
         let durable = Durable::new(root, path, Some(host))?;
         if durable.journal.load(durable.record).map_err(|error| error.to_string())?.is_some() {
             return Err("This path already has a saved room. Keep this copy under a different name for recovery.".into());
+        }
+        if self.archive.is_empty() {
+            let (archive, blobs) = seed_document::bundle(&self.seed)?;
+            self.encoded_archive = STANDARD_NO_PAD.encode(&archive);
+            self.archive = archive;
+            self.seed_blobs = blobs;
         }
         self.durable = Some(durable);
         if let Err(error) = self.write(confirmed, pending, next_sequence) {
@@ -534,6 +596,10 @@ impl Storage {
                 return Err("Only a guest can keep a queued story recovery record.".into());
             }
             let bytes = encode_record(&StoryOutboxRecord { confirmed_revision, pending, next_sequence })?;
+            // The next ACK must also fit the encrypted history tail in the same record.
+            if bytes.len() > MAX_RECORD_BYTES - super::seed::MAX_SEED_BYTES - 1024 {
+                return Err("Wait for your queued story edits to sync before pasting more text.".into());
+            }
             durable.journal.store(durable.story_outbox_id(), &bytes).map_err(|error| error.to_string())?;
         }
         Ok(())
@@ -549,6 +615,53 @@ impl Storage {
         if !self.is_durable() {
             return Ok(());
         }
+        #[cfg(target_os = "macos")]
+        if QUEUED_OUTBOX && let Some(durable) = &self.durable {
+            let existing = durable.history.borrow().clone();
+            if let Some(tail) = existing {
+                durable.write_proposal_blobs(pending.iter())?;
+                durable.write_history_head(&self.identity, tail, pending, next_sequence)?;
+                durable.retire_pending_blobs(pending);
+                return Ok(());
+            }
+            let mut tail = HistoryTail::default();
+            durable.store_blobs(&self.seed_blobs)?;
+            let mut confirmed_blobs: std::collections::BTreeSet<_> = self.seed_blobs.keys().copied().collect();
+            for commit in confirmed {
+                durable.write_proposal_blobs(std::iter::once(&commit.proposal))?;
+                confirmed_blobs.extend(commit.proposal.blob_refs());
+                let bytes = encode_record(commit)?.len();
+                durable.stage_commit(&self.identity, &mut tail, commit, bytes)?;
+            }
+            let base = Record {
+                version: SEGMENTED_JOURNAL_VERSION,
+                identity: &self.identity,
+                seed: &self.encoded_archive,
+                next_sequence: 1,
+                confirmed: Vec::new(),
+                pending: &VecDeque::new(),
+            };
+            let base = encode_record(&base)?;
+            durable.write_proposal_blobs(pending.iter())?;
+            durable.write_history_head(&self.identity, tail, pending, next_sequence)?;
+            // Publishing the base last keeps a legacy journal recoverable if migration is interrupted.
+            if let Err(error) = durable.journal.store(durable.record, &base) {
+                durable.history.replace(None);
+                return Err(error.to_string());
+            }
+            durable.confirmed_blobs.replace(confirmed_blobs);
+            durable.retire_pending_blobs(pending);
+            return Ok(());
+        }
+        self.write_legacy(confirmed, pending, next_sequence)
+    }
+
+    pub(super) fn write_legacy<'a>(
+        &self,
+        confirmed: impl Iterator<Item = &'a Commit>,
+        pending: &VecDeque<Proposal>,
+        next_sequence: u64,
+    ) -> Result<(), String> {
         let record = Record {
             version: JOURNAL_VERSION,
             identity: &self.identity,
@@ -574,10 +687,104 @@ impl Storage {
         let _ = bytes;
         Ok(())
     }
+
+    pub(super) fn append_confirmed<'a>(
+        &self,
+        confirmed: impl Iterator<Item = &'a Commit>,
+        commit: &'a Commit,
+        wire_bytes: usize,
+        pending: &VecDeque<Proposal>,
+        next_sequence: u64,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if QUEUED_OUTBOX && let Some(durable) = &self.durable {
+            let existing = durable.history.borrow().clone();
+            if let Some(mut tail) = existing {
+                validate_pending(pending, next_sequence)?;
+                durable.write_proposal_blobs(std::iter::once(&commit.proposal).chain(pending))?;
+                durable.stage_commit(&self.identity, &mut tail, commit, wire_bytes)?;
+                durable.write_history_head(&self.identity, tail, pending, next_sequence)?;
+                durable.confirmed_blobs.borrow_mut().extend(commit.proposal.blob_refs());
+                durable.retire_pending_blobs(pending);
+                return Ok(());
+            }
+        }
+        let _ = wire_bytes;
+        self.write(confirmed.chain(std::iter::once(commit)), pending, next_sequence)
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl Durable {
+    fn history_id(&self, identity: &[u8; 32], segment: u64) -> RecordId {
+        let mut hash = Sha256::new();
+        hash.update(b"Collate encrypted confirmed history v2");
+        hash.update(self.record.room);
+        hash.update(identity);
+        hash.update(segment.to_be_bytes());
+        RecordId { room: hash.finalize().into(), role: self.record.role }
+    }
+
+    fn restore_history(&self, mut saved: SavedRoom) -> Result<SavedRoom, String> {
+        const INVALID: &str = "The encrypted room history is incomplete or invalid.";
+        if saved.next_sequence != 1 || !saved.pending.is_empty() || !saved.confirmed.is_empty() {
+            return Err(INVALID.into());
+        }
+        let bytes = self.journal.load(self.history_id(&saved.identity, 0)).map_err(|error| error.to_string())?.ok_or(INVALID)?;
+        let HistoryHead { tail, pending, next_sequence } = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
+        let total = tail.archived_edits.checked_add(tail.commits.len()).filter(|&edits| edits <= super::MAX_HISTORY).ok_or(INVALID)?;
+        if tail.segments > tail.archived_edits || tail.commits.len() > HISTORY_SEGMENT_EDITS || tail.bytes > super::MAX_HISTORY_BYTES {
+            return Err(INVALID.into());
+        }
+        let mut encoded_bytes = 0usize;
+        for ordinal in 1..=tail.segments {
+            let bytes = self.journal.load(self.history_id(&saved.identity, ordinal as u64)).map_err(|error| error.to_string())?.ok_or(INVALID)?;
+            encoded_bytes = encoded_bytes.saturating_add(bytes.len());
+            if encoded_bytes > super::MAX_HISTORY_BYTES {
+                return Err(INVALID.into());
+            }
+            let commits: Vec<Commit> = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
+            if commits.is_empty() || commits.len() > HISTORY_SEGMENT_EDITS || commits.len() > tail.archived_edits - saved.confirmed.len() {
+                return Err(INVALID.into());
+            }
+            saved.confirmed.extend(commits);
+        }
+        saved.confirmed.extend(tail.commits.iter().cloned());
+        if saved.confirmed.len() != total || saved.confirmed.iter().enumerate().any(|(index, commit)| commit.revision != index as u64 + 1) {
+            return Err(INVALID.into());
+        }
+        saved.version = JOURNAL_VERSION;
+        saved.pending = pending;
+        saved.next_sequence = next_sequence;
+        self.history.replace(Some(tail));
+        Ok(saved)
+    }
+
+    fn stage_commit(&self, identity: &[u8; 32], tail: &mut HistoryTail, commit: &Commit, bytes: usize) -> Result<(), String> {
+        if commit.revision != (tail.archived_edits + tail.commits.len()) as u64 + 1 {
+            return Err("The encrypted room history has an unexpected revision.".into());
+        }
+        if !tail.commits.is_empty() && (tail.commits.len() >= HISTORY_SEGMENT_EDITS || tail.bytes.saturating_add(bytes) > HISTORY_SEGMENT_BYTES) {
+            let ordinal = tail.segments + 1;
+            let sealed = encode_record(&tail.commits)?;
+            self.journal.store(self.history_id(identity, ordinal as u64), &sealed).map_err(|error| error.to_string())?;
+            tail.segments = ordinal;
+            tail.archived_edits += tail.commits.len();
+            tail.commits.clear();
+            tail.bytes = 0;
+        }
+        tail.commits.push(commit.clone());
+        tail.bytes += bytes;
+        Ok(())
+    }
+
+    fn write_history_head(&self, identity: &[u8; 32], tail: HistoryTail, pending: &VecDeque<Proposal>, next_sequence: u64) -> Result<(), String> {
+        let head = HistoryHead { tail, next_sequence, pending: pending.clone() };
+        self.journal.store(self.history_id(identity, 0), &encode_record(&head)?).map_err(|error| error.to_string())?;
+        self.history.replace(Some(head.tail));
+        Ok(())
+    }
+
     fn new(root: &Path, path: &str, guest_of: Option<ActorId>) -> Result<Self, String> {
         let canonical = designcraft_engine::io::canonicalize(path).map_err(|_| "Could not find the saved document for collaboration.")?;
         let mut hash = Sha256::new();
@@ -607,7 +814,16 @@ impl Durable {
         } else {
             None
         };
-        Ok(Self { journal, record, _lease: lease, stored: Default::default(), hosts })
+        Ok(Self {
+            journal,
+            record,
+            _lease: lease,
+            stored: Default::default(),
+            confirmed_blobs: Default::default(),
+            pending_blobs: Default::default(),
+            history: Default::default(),
+            hosts,
+        })
     }
 
     fn stage_host(&mut self, previous: [u8; 32], actor: ActorId) -> Result<(), String> {
@@ -718,7 +934,27 @@ impl Durable {
         }
     }
 
-    fn write(&self, record: &[u8], blobs: &Blobs) -> Result<(), String> {
+    fn write_proposal_blobs<'a>(&self, proposals: impl Iterator<Item = &'a Proposal>) -> Result<(), String> {
+        for proposal in proposals {
+            self.store_blobs(&proposal.blobs()?)?;
+        }
+        Ok(())
+    }
+
+    fn retire_pending_blobs(&self, pending: &VecDeque<Proposal>) {
+        let current = pending.iter().flat_map(Proposal::blob_refs).collect();
+        let previous = self.pending_blobs.replace(current);
+        let pending = self.pending_blobs.borrow();
+        let confirmed = self.confirmed_blobs.borrow();
+        let mut stored = self.stored.borrow_mut();
+        // Only a successful head write can make previous pending artwork disposable.
+        for id in previous.difference(&pending).filter(|id| !confirmed.contains(id)) {
+            stored.remove(id);
+            self.delete_parts(*id, (id.length as usize).div_ceil(JOURNAL_PART));
+        }
+    }
+
+    fn store_blobs(&self, blobs: &Blobs) -> Result<(), String> {
         let mut stored = self.stored.borrow_mut();
         // Write immutable sidecars before the record that references them.
         for (&id, body) in blobs {
@@ -732,10 +968,15 @@ impl Durable {
                 stored.insert(id);
             }
         }
+        Ok(())
+    }
+
+    fn write(&self, record: &[u8], blobs: &Blobs) -> Result<(), String> {
+        self.store_blobs(blobs)?;
         self.journal.store(self.record, record).map_err(|error| error.to_string())?;
         // A declined queued edit no longer needs its encrypted artwork. Once the
         // metadata is committed, interrupted cleanup cannot damage the journal.
-        stored.retain(|id| {
+        self.stored.borrow_mut().retain(|id| {
             if blobs.contains_key(id) {
                 return true;
             }
