@@ -58,8 +58,40 @@ fn assert_comment(app: &DesignApp, checkpoint: &Checkpoint) {
     assert!(comments.next().is_none());
 }
 
+// A real process restart must also restore encrypted artwork outside the bounded
+// JSON record, both from the seed and from a later placement.
+fn save_artwork_checkpoint(root: &Path) {
+    let (mut doc, id, _) = embedded_image_fixture();
+    let pixels = artwork_fixture_with_side(589, 832);
+    let asset = std::sync::Arc::make_mut(doc.assets.get_mut(&id).unwrap());
+    asset.data = designcraft_doc::AssetData::embedded(pixels);
+    asset.pixels = Some((832, 832));
+    let mut source = editor(&doc, "Studio artwork");
+    source.run("file.saveAs", json!({"path": root.join("Artwork.designcraft")})).unwrap();
+    drop(source);
+    let mut host = reopened(root, "Artwork");
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "durable artwork host", |apps| room(apps[0]).can_edit());
+    let artwork = root.join("placed.png");
+    std::fs::write(&artwork, artwork_fixture_with_side(3775, 1032)).unwrap();
+    host.open_picked("place", artwork.to_str().unwrap().into()).unwrap();
+    wait_for(&mut [&mut host], "journal a multi-chunk placement", |apps| room(apps[0]).revision == 1);
+}
+
+fn restore_artwork_checkpoint(root: &Path) {
+    let mut host = reopened(root, "Artwork");
+    host.connect_collaboration(true).unwrap();
+    assert_eq!(room(&host).revision, 1);
+    let doc = document(&host);
+    let placed = doc.assets.values().find(|asset| asset.name == "placed.png").unwrap();
+    assert_eq!(placed.data.embedded_bytes().unwrap().as_slice(), std::fs::read(root.join("placed.png")).unwrap());
+    let seed = doc.assets.values().find(|asset| asset.id != placed.id).unwrap();
+    assert_eq!(seed.data.embedded_bytes().unwrap().as_slice(), artwork_fixture_with_side(589, 832));
+}
+
 /// Stage exactly one outbox entry, without polling the host or delivering the guest's edit.
 fn save_checkpoint(root: &Path) {
+    save_artwork_checkpoint(root);
     let seed = Document::new(&NewDocument::default());
     let mut initial = editor(&seed, "Fixture");
     let host_path = root.join("Host.designcraft");
@@ -138,6 +170,7 @@ fn read_checkpoint(root: &Path) -> Checkpoint {
 }
 
 fn restore_checkpoint(root: &Path) {
+    restore_artwork_checkpoint(root);
     let checkpoint = read_checkpoint(root);
     let mut host = reopened(root, "Host");
     assert_eq!(fingerprint(document(&host)).unwrap(), checkpoint.document);

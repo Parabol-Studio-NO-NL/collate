@@ -144,6 +144,8 @@ pub(crate) struct WaitingSave {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod collaboration;
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+pub use collaboration::server as room_server;
 
 pub struct DesignApp {
     pending_pdf: Option<ImportedFile>,

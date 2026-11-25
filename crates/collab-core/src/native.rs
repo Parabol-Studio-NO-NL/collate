@@ -72,19 +72,19 @@ pub enum Event {
 pub struct Session {
     hosted: bool,
     generation: Arc<AtomicU64>,
+    routes: host::Routes,
     outgoing: mpsc::Sender<Outgoing>,
     events: mpsc::Receiver<Event>,
     stopping: CancellationToken,
 }
 
 enum Mode {
-    Host { relay: bool },
+    Host { relay: bool, port: Option<u16>, access: Option<[u8; 32]> },
     Guest(Ticket),
 }
 
 struct Outgoing {
     generation: u64,
-    peer: Option<ActorId>,
     bytes: Vec<u8>,
 }
 
@@ -94,7 +94,12 @@ impl Session {
     }
 
     pub fn host_with_identity(display_name: &str, relay: bool, identity: Identity) -> Result<Self, String> {
-        Self::launch(display_name, identity, Mode::Host { relay })
+        Self::launch(display_name, identity, Mode::Host { relay, port: None, access: None })
+    }
+
+    /// Bind a dedicated host to a predictable UDP port for office/VPS firewalls.
+    pub fn persistent_host(display_name: &str, relay: bool, identity: Identity, port: u16, access: [u8; 32]) -> Result<Self, String> {
+        Self::launch(display_name, identity, Mode::Host { relay, port: Some(port), access: Some(access) })
     }
 
     pub fn join(invitation: &str, display_name: &str) -> Result<Self, String> {
@@ -117,13 +122,14 @@ impl Session {
         let (report, events) = mpsc::channel(QUEUE_CAPACITY);
         let stopping = CancellationToken::new();
         let generation = Arc::new(AtomicU64::new(0));
-        let worker = Worker { inbox, report, stopping: stopping.clone(), generation: generation.clone() };
+        let routes = host::Routes::default();
+        let worker = Worker { inbox, report, routes: routes.clone(), stopping: stopping.clone(), generation: generation.clone() };
         let runtime = Builder::new_current_thread().enable_all().build().map_err(|_| "Could not initialize peer networking.")?;
         thread::Builder::new()
             .name("codesign-peers".into())
             .spawn(move || runtime.block_on(worker.run(local, identity, mode)))
             .map_err(|_| "Could not start peer networking.")?;
-        Ok(Self { hosted, generation, outgoing, events, stopping })
+        Ok(Self { hosted, generation, routes, outgoing, events, stopping })
     }
 
     pub fn try_event(&mut self) -> Option<Event> {
@@ -135,7 +141,7 @@ impl Session {
         if self.hosted {
             return Err("The host applies its own application messages locally.".into());
         }
-        self.send(None, bytes)
+        self.send(bytes)
     }
 
     /// Send an application-approved message to every currently connected guest.
@@ -152,10 +158,16 @@ impl Session {
         if !self.hosted {
             return Err("Only the host can send approved room messages.".into());
         }
-        self.send(peer, bytes)
+        if self.generation.load(Ordering::Acquire) == 0 {
+            return Err("The peer session is offline.".into());
+        }
+        if bytes.is_empty() || bytes.len() > MAX_PAYLOAD {
+            return Err("The application message has an invalid size.".into());
+        }
+        self.routes.send(peer, bytes)
     }
 
-    fn send(&self, peer: Option<ActorId>, bytes: Vec<u8>) -> Result<(), String> {
+    fn send(&self, bytes: Vec<u8>) -> Result<(), String> {
         if bytes.is_empty() || bytes.len() > MAX_PAYLOAD {
             return Err("The application message has an invalid size.".into());
         }
@@ -163,7 +175,7 @@ impl Session {
         if generation == 0 {
             return Err("The peer session is offline.".into());
         }
-        self.outgoing.try_send(Outgoing { generation, peer, bytes }).map_err(|error| match error {
+        self.outgoing.try_send(Outgoing { generation, bytes }).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => "The peer session is catching up.".into(),
             mpsc::error::TrySendError::Closed(_) => "The peer session is offline.".into(),
         })
@@ -177,6 +189,7 @@ impl Drop for Session {
 }
 
 struct Worker {
+    routes: host::Routes,
     inbox: mpsc::Receiver<Outgoing>,
     report: mpsc::Sender<Event>,
     stopping: CancellationToken,
@@ -193,17 +206,17 @@ impl Worker {
     }
 
     async fn connect(&mut self, local: Peer, identity: Identity, mode: Mode) -> Result<(), String> {
-        let relay = match &mode {
-            Mode::Host { relay } => *relay,
-            Mode::Guest(ticket) => ticket.relay,
+        let (relay, port) = match &mode {
+            Mode::Host { relay, port, .. } => (*relay, *port),
+            Mode::Guest(ticket) => (ticket.relay, None),
         };
         let hosted = matches!(mode, Mode::Host { .. });
-        let endpoint = bind(identity, relay, hosted).await?;
+        let endpoint = bind(identity, relay, hosted, port).await?;
         let stop = self.stopping.clone();
         let result = tokio::select! {
             _ = stop.cancelled() => Ok(()),
             result = async { match mode {
-                Mode::Host { relay } => host::run(self, &endpoint, local, relay).await,
+                Mode::Host { relay, access, .. } => host::run(self, &endpoint, local, relay, access).await,
                 Mode::Guest(ticket) => self.guest(&endpoint, &ticket, &local).await,
             }} => result,
         };
@@ -317,8 +330,17 @@ fn valid_roster(host: &Peer, peers: &[Peer], expected_host: ActorId, local: Acto
     peers.iter().all(|peer| distinct.insert(peer.actor) && wire::display_name(&peer.name).is_ok())
 }
 
-async fn bind(identity: Identity, relay: bool, host: bool) -> Result<Endpoint, String> {
+async fn bind(identity: Identity, relay: bool, host: bool, port: Option<u16>) -> Result<Endpoint, String> {
     let builder = if relay { Endpoint::builder(presets::N0) } else { Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled) };
+    let builder = if let Some(port) = port {
+        builder
+            .clear_ip_transports()
+            .bind_addr((std::net::Ipv4Addr::UNSPECIFIED, port))
+            .and_then(|b| b.bind_addr_with_opts((std::net::Ipv6Addr::UNSPECIFIED, port), iroh::endpoint::BindOpts::default().set_is_required(false)))
+            .map_err(|_| "Invalid host bind address.")?
+    } else {
+        builder
+    };
     let builder = if host { builder.alpns(vec![ALPN.into()]) } else { builder };
     builder.secret_key(identity.0).bind().await.map_err(|_| "Could not start peer networking.".into())
 }

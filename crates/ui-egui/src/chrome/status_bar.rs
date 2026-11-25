@@ -242,8 +242,8 @@ pub fn status_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                 ui.add_space(12.0);
                 crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(&app.ui.language, "[Basic] (working) ▾")).font(small.clone()));
                 ui.add_space(8.0);
-                // Preflight: overset text is an error.
-                let errors = panels::preflight_errors(app, ui.ctx());
+                let issues = crate::preflight_worker::issues(app, ui.ctx());
+                let errors = issues.as_ref().map(|rows| panels::preflight_error_count(rows));
                 let (r, dot) = ui.allocate_exact_size(vec2(9.0, 9.0), Sense::click());
                 ui.painter().circle_filled(
                     r.center(),
@@ -279,10 +279,42 @@ pub fn status_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                 if dot.double_clicked() || menu.response.double_clicked() {
                     show_preflight(app);
                 }
+                if app.session.is_deferring()
+                    && let Some(issues) = issues
+                {
+                    shared_font_notice(app, ui, &issues, &small);
+                }
                 ui.add_space(12.0);
                 ui.label(egui::RichText::new(&app.ui.status).font(small).color(t.text_dim));
             });
         });
     let r = resp.response.rect;
     ui.painter().line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, t.border));
+}
+
+/// Use the local preflight result for the shared document. Keep the notice visible while
+/// fonts are missing, without interrupting typing or changing a teammate's font choices.
+fn shared_font_notice(app: &mut DesignApp, ui: &mut egui::Ui, issues: &[designcraft_engine::cmd::preflight::Issue], font: &egui::FontId) {
+    let missing = issues.iter().filter(|issue| matches!(issue.kind, "missingFont" | "missingFontStyle"));
+    let count = missing.clone().count();
+    if count == 0 {
+        return;
+    }
+    let lang = &app.ui.language;
+    let label = crate::i18n::tr(lang, "Missing fonts ({count})").replace("{count}", &count.to_string());
+    let menu = crate::menus::menu_button(ui, egui::RichText::new(label).font(font.clone()), |ui| {
+        crate::rtl::label(ui, crate::i18n::tr(lang, "Install the missing fonts on this device, then reload fonts."));
+        for issue in missing {
+            crate::rtl::label(ui, &issue.message);
+        }
+        let reload = ui.button(crate::i18n::tr(lang, "Reload Fonts")).clicked();
+        if reload {
+            ui.close();
+        }
+        reload
+    });
+    ui.ctx().accesskit_node_builder(menu.response.id, |node| node.set_live(egui::accesskit::Live::Polite));
+    if menu.inner == Some(true) {
+        let _ = app.run("font.reload", json!({}));
+    }
 }

@@ -1,0 +1,13 @@
+[package]
+name = "collate-room-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Always-on peer for one Collate document"
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+designcraft-ui-egui = { workspace = true }

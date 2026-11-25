@@ -4,16 +4,19 @@ use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use designcraft_collab_core::MAX_PAYLOAD;
 use sha2::{Digest, Sha256};
 
+use super::attachments::{BlobCursor, Blobs};
 use super::seed::{MAX_SEED_BYTES, SEED_CHUNK_BYTES, SeedAdvertisement, SeedChunk, SeedDownload};
 use super::{Message, encode};
 
 pub(super) struct WireEdit {
     bytes: Vec<u8>,
     offer: Option<SeedAdvertisement>,
+    pub(super) blobs: Blobs,
+    pub(super) artwork_size: u64,
 }
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct SendCursor(SendState);
+pub(super) struct SendCursor(SendState, BlobCursor);
 
 #[derive(Clone, Copy, Default)]
 enum SendState {
@@ -29,7 +32,16 @@ impl WireEdit {
             return Err("The shared edit has an unsupported size.".into());
         }
         let offer = (bytes.len() > MAX_PAYLOAD).then(|| SeedAdvertisement { length: bytes.len() as u32, digest: Sha256::digest(&bytes).into() });
-        Ok(Self { bytes, offer })
+        Ok(Self { bytes, offer, blobs: Blobs::new(), artwork_size: 0 })
+    }
+
+    pub(super) fn progress(&self, cursor: &SendCursor) -> Option<super::attachments::ArtworkProgress> {
+        cursor.1.progress(&self.blobs)
+    }
+
+    /// Binds a receipt to the exact confirmed actor, sequence, operation metadata and blob IDs.
+    pub(super) fn digest(&self) -> [u8; 32] {
+        Sha256::digest(&self.bytes).into()
     }
 
     pub(super) fn len(&self) -> usize {
@@ -37,7 +49,10 @@ impl WireEdit {
     }
 
     /// Advance only after the transport accepts this frame. A rejected frame can be retried with the same cursor.
-    pub(super) fn send_next(&self, cursor: &mut SendCursor, send: impl FnOnce(Vec<u8>) -> Result<(), String>) -> Result<bool, String> {
+    pub(super) fn send_next(&self, cursor: &mut SendCursor, mut send: impl FnMut(Vec<u8>) -> Result<(), String>) -> Result<bool, String> {
+        if let Some(sent) = cursor.1.next(&self.blobs, &mut send) {
+            return sent.map(|_| false);
+        }
         let (frame, next) = match (cursor.0, self.offer) {
             (SendState::Start, None) => (self.bytes.clone(), SendState::Finished),
             (SendState::Start, Some(offer)) => (encode(Message::EditOffer(offer))?, SendState::Chunk(0)),

@@ -60,11 +60,16 @@ impl DesignApp {
     fn place_path(&mut self, path: &str, append: bool) -> Result<Value, String> {
         if self.session.is_deferring() {
             #[cfg(not(target_arch = "wasm32"))]
-            if path.to_ascii_lowercase().ends_with(".pdf")
-                && let Ok(bytes) = designcraft_engine::Session::read_shared_placement(path)
-                && designcraft_render::is_pdf(&bytes)
-            {
+            if path.to_ascii_lowercase().ends_with(".pdf") {
                 let name = std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |name| name.to_string_lossy().into_owned());
+                let bytes = match designcraft_engine::Session::read_shared_placement(path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.status(&message);
+                        return self.report_import("file.place", name, Err(message));
+                    }
+                };
                 // Hold the inspected PDF through confirmation, as for a file delivered by the picker.
                 self.cancel_pdf_import();
                 return self.import_file(ImportedFile { request: self.import_request("place"), name, bytes }, false);
@@ -198,6 +203,11 @@ impl DesignApp {
         let file = self.pending_pdf.take().ok_or("PDF import cancelled: no pending file")?;
         let rest = std::mem::take(&mut self.pending_pdf_rest);
         self.activate_import_target(&file.request)?;
+        if self.session.is_deferring() {
+            let placed = self.place_shared_file(file, json!({"pdfPage": page, "pdfCrop": crop}))?;
+            self.import_delivered(rest, true);
+            return Ok(placed);
+        }
         let params = json!({"name": file.name, "base64": designcraft_engine::cmd::base64_encode(&file.bytes), "pdfPage": page, "pdfCrop": crop, "append": append});
         if file.request.purpose != "place" {
             return self.open_file("file.place", params);
@@ -334,6 +344,9 @@ impl DesignApp {
                 self.pending_pdf = Some(file);
                 return Ok(Value::Null);
             }
+        }
+        if place && self.session.is_deferring() && format != Some(craft_file_formats::Format::Ase) {
+            return self.place_shared_file(file, json!({}));
         }
         let b64 = designcraft_engine::cmd::base64_encode(&file.bytes);
         if format == Some(craft_file_formats::Format::Ase) || file.request.purpose == "swatches" {
@@ -492,10 +505,24 @@ impl DesignApp {
         self.open_named_file(cmd, params, file)
     }
 
+    fn place_shared_file(&mut self, file: ImportedFile, mut params: Value) -> Result<Value, String> {
+        params["name"] = json!(file.name);
+        let result = self.session.place_shared_bytes(&params, file.bytes).map_err(|e| e.to_string());
+        self.after_engine();
+        if let Err(e) = &result {
+            self.status(e.clone());
+        }
+        self.report_import("file.place", file.name, result)
+    }
+
     /// [`Self::open_file`] for a command whose params don't name the file: `file` is shown in the
     /// alert or warnings.
     pub fn open_named_file(&mut self, cmd: &str, params: Value, file: String) -> Result<Value, String> {
         let r = self.run(cmd, params);
+        self.report_import(cmd, file, r)
+    }
+
+    fn report_import(&mut self, cmd: &str, file: String, r: Result<Value, String>) -> Result<Value, String> {
         if let Err(e) = &r {
             let title = if cmd == "file.place" || cmd == "place.load" { "Can't Place the File" } else { "Can't Open the File" };
             if self.ui.dialog.as_ref().is_some_and(|d| d.id == "findChange") {

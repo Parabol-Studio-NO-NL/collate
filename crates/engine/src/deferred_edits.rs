@@ -24,12 +24,13 @@ pub(crate) struct DeferredEdits {
     ready: bool,
     durable: bool,
     pending: Option<DeferredEdit>,
+    placement: Option<Vec<u8>>,
 }
 
 impl Session {
     /// Enable deferred commits for one open document, or restore standalone operation.
     pub fn defer_document_edits(&mut self, uid: Option<u64>) {
-        self.deferred_edits = uid.map(|uid| DeferredEdits { uid, ready: false, durable: false, pending: None });
+        self.deferred_edits = uid.map(|uid| DeferredEdits { uid, ready: false, durable: false, pending: None, placement: None });
     }
 
     pub fn set_deferred_edit_durable(&mut self, durable: bool) {
@@ -46,6 +47,24 @@ impl Session {
         if let Some(edits) = self.deferred_edits.as_mut() {
             edits.ready = ready && edits.pending.is_none();
         }
+    }
+
+    /// Run the normal placement command with bytes already delivered by the file picker.
+    /// Keeping them out of the command parameters avoids a second, base64-encoded copy.
+    pub fn place_shared_bytes(&mut self, params: &serde_json::Value, bytes: Vec<u8>) -> Result<serde_json::Value> {
+        if !self.is_deferring() {
+            return Err(EngineError::Other("The shared document is no longer active.".into()));
+        }
+        if let Some(edits) = &mut self.deferred_edits {
+            edits.placement = Some(bytes);
+        }
+        let result = self.execute("file.place", params);
+        self.take_shared_placement();
+        result
+    }
+
+    pub(crate) fn take_shared_placement(&mut self) -> Option<Vec<u8>> {
+        self.deferred_edits.as_mut()?.placement.take()
     }
 
     pub fn take_deferred_edit(&mut self) -> Option<DeferredEdit> {
@@ -114,6 +133,7 @@ impl Session {
                             | "file.saveAs"
                             | "file.saveACopy"
                             | "file.recovery.save"
+                            | "font.reload"
                     ))
         {
             return Err(EngineError::Other("This command is unavailable while editing a shared document.".into()));

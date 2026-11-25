@@ -23,8 +23,12 @@ fn room(app: &DesignApp) -> &Room {
 }
 
 fn wait_for(apps: &mut [&mut DesignApp], stage: &str, done: impl Fn(&[&mut DesignApp]) -> bool) {
+    wait_for_with_deadline(apps, stage, Duration::from_secs(30), done);
+}
+
+fn wait_for_with_deadline(apps: &mut [&mut DesignApp], stage: &str, timeout: Duration, done: impl Fn(&[&mut DesignApp]) -> bool) {
     let ctx = egui::Context::default();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
     loop {
         for app in apps.iter_mut() {
             app.poll_collaboration(&ctx);
@@ -86,10 +90,14 @@ fn assert_converged_layout(doc: &Document, seed: &Document, shape: ItemId, text_
     assert_eq!(story.text, "ABλCD");
 }
 
-fn artwork_fixture(mut noise: u32) -> Vec<u8> {
+fn artwork_fixture(noise: u32) -> Vec<u8> {
+    artwork_fixture_with_side(noise, 128)
+}
+
+fn artwork_fixture_with_side(mut noise: u32, side: u32) -> Vec<u8> {
     use craft_image_codecs::{ChannelLayout, Format, Image};
 
-    let pixels = (0..128 * 128 * 4)
+    let pixels = (0..side * side * 4)
         .map(|_| {
             noise ^= noise << 13;
             noise ^= noise >> 17;
@@ -97,7 +105,7 @@ fn artwork_fixture(mut noise: u32) -> Vec<u8> {
             noise.to_le_bytes()[0]
         })
         .collect();
-    let image = Image::from_u8(128, 128, ChannelLayout::Rgba, pixels).unwrap();
+    let image = Image::from_u8(side, side, ChannelLayout::Rgba, pixels).unwrap();
     craft_image_codecs::encode(&image, Format::Png, &Default::default()).unwrap()
 }
 
@@ -1438,5 +1446,10 @@ fn concurrent_editor_text_inserts_and_deletes_keep_the_other_peers_atoms() {
     assert_eq!(*document(&guest), unchanged);
 }
 
+mod font_notice;
+mod seed_artwork;
+
 #[cfg(target_os = "macos")]
 mod restart;
+
+mod large_artwork;

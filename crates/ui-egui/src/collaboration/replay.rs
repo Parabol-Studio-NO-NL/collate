@@ -22,13 +22,15 @@ pub(super) fn restore(seed: &Document, opened: &Document, confirmed: Vec<Commit>
     let mut history = Vec::with_capacity(confirmed.len());
     let mut inverses = Vec::with_capacity(confirmed.len());
     let mut history_bytes = 0;
+    let mut artwork_size = super::seed_document::artwork_size(seed);
     for commit in confirmed {
         if commit.revision != history.len() as u64 + 1 {
             return Err("The local collaboration journal has a missing revision.".into());
         }
         let bytes = encode_edit(Message::Commit(commit.clone()))?;
         history_bytes += bytes.len();
-        if history_bytes > MAX_HISTORY_BYTES {
+        artwork_size += bytes.artwork_size;
+        if history_bytes > MAX_HISTORY_BYTES || artwork_size > designcraft_collab::artwork::MAX_ARTWORK_BYTES as u64 {
             return Err("The local collaboration journal exceeds its history limit.".into());
         }
         let edits = &commit.proposal.edits;

@@ -18,7 +18,22 @@ pub use pdf_artwork::PDF_MIME;
 
 pub const MAX_IMAGE_SIDE: u32 = 12_000;
 pub const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
-pub const MAX_ARTWORK_BYTES: usize = 2 * 1024 * 1024;
+pub use designcraft_doc::MAX_SHARED_ARTWORK_BYTES as MAX_ARTWORK_BYTES;
+const INLINE_ARTWORK_BYTES: usize = 2 * 1024 * 1024;
+
+/// Identifies immutable bytes independently of a local filename or asset allocation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobId {
+    pub digest: [u8; 32],
+    pub length: u32,
+}
+
+impl BlobId {
+    pub fn valid(self) -> bool {
+        (1..=MAX_ARTWORK_BYTES).contains(&(self.length as usize))
+    }
+}
 const MAX_POINTS: f64 = 1_000_000.0;
 const MAX_SCALE: f64 = 10_000.0;
 
@@ -39,7 +54,12 @@ pub struct Placement {
 struct Artwork {
     name: String,
     mime: String,
-    bytes: Arc<str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    length: Option<u32>,
+    #[serde(skip)]
+    body: Option<Arc<Vec<u8>>>,
 }
 
 impl Placement {
@@ -66,9 +86,37 @@ impl Placement {
             if bytes.len() > MAX_ARTWORK_BYTES {
                 return Err(Error::Limit);
             }
-            Some(Artwork { name: asset.name.clone(), mime: asset.mime.clone(), bytes: STANDARD_NO_PAD.encode(bytes).into() })
+            let external = bytes.len() > INLINE_ARTWORK_BYTES;
+            Some(Artwork {
+                name: asset.name.clone(),
+                mime: asset.mime.clone(),
+                bytes: (!external).then(|| STANDARD_NO_PAD.encode(bytes).into()),
+                length: external.then_some(bytes.len() as u32),
+                body: if external { asset.data.embedded_bytes().cloned() } else { None },
+            })
         };
         Ok(Self { digest: Sha256::digest(bytes).into(), size: graphic.size, transform: graphic.xf.as_coeffs(), pdf, artwork })
+    }
+
+    /// Bytes retained by this placement in room history, including earlier inline records.
+    pub fn artwork_size(&self) -> u64 {
+        let Some(artwork) = &self.artwork else { return 0 };
+        artwork.length.map(u64::from).unwrap_or_else(|| artwork.bytes.as_deref().map_or(0, |b| b.len() as u64 * 3 / 4))
+    }
+
+    pub fn blob(&self) -> Option<(BlobId, Option<&Arc<Vec<u8>>>)> {
+        let artwork = self.artwork.as_ref()?;
+        Some((BlobId { digest: self.digest, length: artwork.length? }, artwork.body.as_ref()))
+    }
+
+    /// The transport or durable store has checked this immutable body's length and digest.
+    pub fn attach_verified(&mut self, body: Arc<Vec<u8>>) -> Result<(), Error> {
+        let artwork = self.artwork.as_mut().ok_or(Error::UnknownResource)?;
+        if artwork.bytes.is_some() || artwork.length.map(|v| v as usize) != Some(body.len()) || body.len() > MAX_ARTWORK_BYTES {
+            return Err(Error::Invalid("artwork attachment"));
+        }
+        artwork.body = Some(body);
+        Ok(())
     }
 
     pub(crate) fn install(&self, document: &mut Document) -> Result<Graphic, Error> {
@@ -153,16 +201,24 @@ impl Placement {
 }
 
 impl Artwork {
-    fn decode_bytes(&self, digest: [u8; 32]) -> Result<Vec<u8>, Error> {
-        if self.bytes.len() > (MAX_ARTWORK_BYTES * 4).div_ceil(3) {
+    fn decode_bytes(&self, digest: [u8; 32]) -> Result<Arc<Vec<u8>>, Error> {
+        check_name(&self.name)?;
+        if let Some(len) = self.length {
+            let data = self.body.as_ref().ok_or(Error::UnknownResource)?;
+            if self.bytes.is_some() || len as usize != data.len() || data.len() > MAX_ARTWORK_BYTES {
+                return Err(Error::Limit);
+            }
+            return Ok(data.clone());
+        }
+        let bytes = self.bytes.as_deref().ok_or(Error::UnknownResource)?;
+        if bytes.len() > (INLINE_ARTWORK_BYTES * 4).div_ceil(3) {
             return Err(Error::Limit);
         }
-        check_name(&self.name)?;
-        let data = STANDARD_NO_PAD.decode(self.bytes.as_bytes()).map_err(|_| Error::Invalid("image data"))?;
+        let data = STANDARD_NO_PAD.decode(bytes.as_bytes()).map_err(|_| Error::Invalid("image data"))?;
         if <[u8; 32]>::from(Sha256::digest(&data)) != digest {
             return Err(Error::Invalid("image data"));
         }
-        Ok(data)
+        Ok(Arc::new(data))
     }
 
     fn decode_raster(&self, id: AssetId, digest: [u8; 32]) -> Result<Asset, Error> {

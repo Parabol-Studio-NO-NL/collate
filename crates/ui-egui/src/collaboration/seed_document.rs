@@ -1,6 +1,6 @@
 //! Bounded native seed bundles with exact object IDs and embedded graphics.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -8,14 +8,14 @@ use std::sync::Arc;
 use craft_image_codecs::Format;
 use craft_zip::{Archive, Compression, Limits, Writer, preflight};
 use designcraft_collab::artwork::{
-    MAX_ARTWORK_BYTES, MAX_IMAGE_PIXELS, PDF_MIME, pdf_dimensions, raster_dimensions as image_dimensions, raster_format as image_format,
+    BlobId, MAX_ARTWORK_BYTES, MAX_IMAGE_PIXELS, PDF_MIME, pdf_dimensions, raster_dimensions as image_dimensions, raster_format as image_format,
     valid_dimensions,
 };
-use designcraft_doc::{Asset, AssetData, Document, Storage};
-use serde::Deserialize;
+use designcraft_doc::{Asset, AssetData, AssetId, Document, Storage};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::seed::MAX_SEED_BYTES;
+use super::{attachments::Blobs, seed::MAX_SEED_BYTES};
 
 pub(super) const MAX_MODEL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 8 * 1024 * 1024;
@@ -80,6 +80,96 @@ pub(super) fn fingerprint(doc: &Document) -> Result<[u8; 32], String> {
         fingerprint.update(Sha256::digest(data));
     }
     Ok(fingerprint.finalize().into())
+}
+
+const BUNDLE_MAGIC: &[u8] = b"Collate shared assets v1\n";
+type Members = BTreeMap<AssetId, (BlobId, Option<BlobId>)>;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest<D> {
+    document: D,
+    members: Members,
+}
+
+pub(super) fn artwork_size(doc: &Document) -> u64 {
+    doc.assets
+        .values()
+        .flat_map(|asset| std::iter::once(&asset.data).chain(asset.proxy.iter().map(|p| &p.data)))
+        .filter_map(AssetData::embedded_bytes)
+        .map(|body| body.len() as u64)
+        .sum()
+}
+
+pub(super) fn bundle(doc: &Document) -> Result<(Vec<u8>, Blobs), String> {
+    let size = artwork_size(doc);
+    if size <= (MAX_SEED_BYTES / 2) as u64 {
+        return Ok((encode(doc)?, Blobs::new()));
+    }
+    if size > MAX_ARTWORK_BYTES as u64 {
+        return Err(TOO_LARGE.into());
+    }
+    validate_model(doc)?;
+    payloads(doc, true)?;
+    let mut blobs = Blobs::new();
+    let mut identify = |data: &AssetData| -> Result<BlobId, String> {
+        let body = data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
+        let id = BlobId { length: u32::try_from(body.len()).map_err(|_| TOO_LARGE)?, digest: Sha256::digest(body.as_slice()).into() };
+        blobs.entry(id).or_insert_with(|| body.clone());
+        Ok(id)
+    };
+    let mut members = Members::new();
+    for (&id, asset) in &doc.assets {
+        members.insert(id, (identify(&asset.data)?, asset.proxy.as_ref().map(|p| identify(&p.data)).transpose()?));
+    }
+    let mut output = ModelBytes(BUNDLE_MAGIC.into());
+    serde_json::to_writer(&mut output, &Manifest { document: doc, members }).map_err(|_| TOO_LARGE)?;
+    Ok((output.0, blobs))
+}
+
+/// The loader must authenticate the supplied digest. Reject all metadata and length
+/// violations before opening any files or allocating memory for artwork.
+pub(super) fn restore_bundle(bytes: &[u8], mut load: impl FnMut(BlobId) -> Result<Arc<Vec<u8>>, String>) -> Result<Document, String> {
+    if bytes.len() > MAX_SEED_BYTES {
+        return Err(TOO_LARGE.into());
+    }
+    let Some(manifest) = bytes.strip_prefix(BUNDLE_MAGIC) else { return decode(bytes) };
+    let Manifest { mut document, members }: Manifest<Document> = serde_json::from_slice(manifest).map_err(|_| INVALID)?;
+    validate_model(&document)?;
+    if document.assets.len() != members.len() {
+        return Err(INVALID.into());
+    }
+    let mut total = 0u64;
+    for (&id, asset) in &document.assets {
+        let &(body, proxy) = members.get(&id).ok_or(INVALID)?;
+        if !body.valid() || asset.proxy.is_some() != proxy.is_some() || proxy.is_some_and(|p| !p.valid() || u64::from(p.length) > MAX_PROXY_BYTES) {
+            return Err(INVALID.into());
+        }
+        total += u64::from(body.length) + proxy.map_or(0, |p| u64::from(p.length));
+    }
+    if total > MAX_ARTWORK_BYTES as u64 {
+        return Err(TOO_LARGE.into());
+    }
+    let mut loaded = Blobs::new();
+    let mut resolve = |id: BlobId| -> Result<AssetData, String> {
+        if let std::collections::btree_map::Entry::Vacant(entry) = loaded.entry(id) {
+            let data = load(id)?;
+            if data.len() != id.length as usize {
+                return Err(INVALID.into());
+            }
+            entry.insert(data);
+        }
+        Ok(AssetData::embedded(loaded[&id].clone()))
+    };
+    for (id, (body, preview)) in members {
+        let asset = Arc::make_mut(document.assets.get_mut(&id).ok_or(INVALID)?);
+        asset.data = resolve(body)?;
+        if let (Some(proxy), Some(preview)) = (&mut asset.proxy, preview) {
+            proxy.data = resolve(preview)?;
+        }
+    }
+    payloads(&document, true)?;
+    Ok(document)
 }
 
 pub(super) fn encode(doc: &Document) -> Result<Vec<u8>, String> {
@@ -261,7 +351,7 @@ fn payloads(doc: &Document, verify_image_body: bool) -> Result<Vec<(String, &[u8
     let mut pixels = 0u64;
     for asset in doc.assets.values() {
         let data = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?.as_slice();
-        if data.len() > MAX_SEED_BYTES {
+        if data.len() > MAX_ARTWORK_BYTES {
             return Err(TOO_LARGE.into());
         }
         let remaining = MAX_IMAGE_PIXELS.min(MAX_TOTAL_PIXELS - pixels);
@@ -290,7 +380,7 @@ fn payloads(doc: &Document, verify_image_body: bool) -> Result<Vec<(String, &[u8
             entries.push((asset_name("proxies", asset.id.0, &proxy.mime)?, data));
         }
     }
-    if expanded_size(&entries) > MAX_EXPANDED_BYTES {
+    if expanded_size(&entries) > MAX_ARTWORK_BYTES as u64 {
         return Err(TOO_LARGE.into());
     }
     Ok(entries)

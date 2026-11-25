@@ -1050,6 +1050,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "collate-room-server"
+version = "0.21.0"
+dependencies = [
+ "designcraft-ui-egui",
+]
+
+[[package]]
 name = "color"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2361,6 +2368,7 @@ name = "designcraft-ui-egui"
 version = "0.21.0"
 dependencies = [
  "base64 0.22.1",
+ "craft-atomic",
  "craft-dialogs",
  "craft-file-formats",
  "craft-image-codecs",

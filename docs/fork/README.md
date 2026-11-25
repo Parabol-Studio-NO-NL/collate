@@ -14,13 +14,26 @@ Draw a new frame with the Type tool or click an unassigned frame to start a stor
 
 Use **Insert Pages…** or **Delete Pages** in standard facing-page and single-sided documents. Retained frames and selections follow their pages as spreads change. Deleting a page can remove its unreferenced supported frames, and comments on removed pages or frames remain available as orphaned threads. Page edits are declined if they would move artwork to a different page or change where a bookmark or page link points.
 
-Use **File > Place** or drag one PDF, PNG, JPEG, GIF or WebP file of up to 2 MiB onto the canvas. Select an existing frame to replace its artwork with **File > Place**, or drop the file on the frame. Without a selected frame, **File > Place** puts the artwork at the first page margin. For a multi-page PDF, **File > Place** opens the standard page and crop options. A drop uses the first page and its default crop. Room members receive the embedded file and its filename, including the original vector data for PDFs. The invitation includes compatible artwork already embedded in the document. Linked files, other artwork formats and custom spread editing remain pending. Partially supported edits are rejected as a unit.
+Use **File > Place** or drag one PNG, JPEG, GIF, WebP or PDF onto the canvas. A room supports up to 1 GiB of retained artwork, including its starting document and artwork needed to replay earlier edits. An empty room can accept a single 1 GiB image. Raster images also have a limit of 12,000 pixels per side and 16,777,216 pixels per image. The PDF reader accepts files up to 512 MiB. Select an existing frame to replace its artwork with **File > Place**, or drop the file on the frame. Without a selected frame, **File > Place** puts the artwork at the first page margin. For a multi-page PDF, **File > Place** opens the standard page and crop options. A drop uses the first page and its default crop. Room members receive the embedded file and its filename, including the original vector data for PDFs. The invitation includes compatible artwork already embedded in the document. Open **Share** to see progress for a large artwork transfer. Linked files, other artwork formats and custom spread editing remain pending. Partially supported edits are rejected as a unit.
 
 Use the existing **Layers** panel to create or reorder shared layers, change options such as name, visibility and lock, and merge or remove layers. Collate rejects removal that would leave layer guides, unsupported nested or anchored content, or protected frame references. Duplicating a populated layer remains a standalone edit. Each participant chooses their own active layer.
 
 Shared undo and redo apply to your own simple text edits while preserving other collaborators' typing, deletions and formatting. They also cover frame properties, order and comment resolution when no teammate has since changed the same target. Artwork and structural edits remain outside shared undo.
 
-Font files stay on each Mac. Collate uses DesignCraft's local missing-font fallback, which can change line breaks and output. Participants should install the same licensed fonts before reviewing page composition or exporting. Embed supported linked images before starting a room so their appearance travels with the document.
+Font files stay on each participant’s computer. When a shared document uses a missing family or style, select **Missing fonts** in the status bar to see which faces this computer needs. Install the same licensed fonts and choose **Reload Fonts**. Until then, fallback fonts may change line breaks and output. Embed supported linked images before starting a room so their appearance travels with the document.
+
+### Try collaboration on one Mac
+
+Start sharing a saved test document, then launch another instance from Terminal with its own preferences. On the second Home screen, select **Join shared document…**, enter a different display name, paste the first instance’s invitation and choose **Join and receive document**. Place an image or edit text in either window and check the other. If you save the guest’s copy, choose a different file from the host’s.
+
+```sh
+guest_profile="$(mktemp -d)"
+open -n -a Collate --env "DESIGNCRAFT_CONFIG_DIR=$guest_profile"
+```
+
+### Keep a document available
+
+The standalone room server hosts one document from an office machine or a Linux VPS. People can leave and rejoin with the same invitation while the address remains reachable. The server keeps confirmed edits after all editors quit. See the [Mac and Linux setup guide](room-server.md).
 
 ## Shape the paragraph rag
 
@@ -37,7 +50,7 @@ Open **Window > Type & Tables > Rag Options**, or open **Rag Options** from the 
 
 The repeating patterns restart in each column or threaded frame. **Off** restores the paragraph’s usual alignment. **Paragraph language** sets the default for the selected paragraphs. Words with an explicit character language keep it. Expand **Hyphenation settings** or **Fitting limits** to adjust how the composer breaks and fits lines.
 
-Choose **New Paragraph Style…** to save the settings for reuse. Existing styles have a **Rag Options** section in **Paragraph Style Options**. In a shared document, everyone uses collaboration protocol 13. Peers can apply existing styles, edit patterns and insets, change paragraph language, and switch hyphenation on or off. Define advanced fitting and hyphenation settings in a style before starting a room.
+Choose **New Paragraph Style…** to save the settings for reuse. Existing styles have a **Rag Options** section in **Paragraph Style Options**. Everyone in a shared document needs the same collaboration protocol version. Peers can apply existing styles, edit patterns and insets, change paragraph language, and switch hyphenation on or off. Define advanced fitting and hyphenation settings in a style before starting a room.
 
 ## Calculate a modular baseline grid
 
