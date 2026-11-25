@@ -25,7 +25,7 @@ use std::{
 };
 
 use designcraft_collab::automerge_stories::StoryTransaction;
-use designcraft_collab::{Operation, PROTOCOL_VERSION, Replica, layers::LayerEdit};
+use designcraft_collab::{Operation, Replica, RoomProtocol, layers::LayerEdit};
 use designcraft_collab_core::{ActorId, Event, MAX_PAYLOAD, Peer, Session as Transport};
 use designcraft_doc::{Document, LayerId, PageId, Selection, SpreadRef};
 use designcraft_engine::{DeferredEdit, Session};
@@ -42,8 +42,6 @@ use self::{
 };
 use crate::DesignApp;
 
-const MAX_HISTORY: usize = if cfg!(feature = "automerge-rooms") { 16_384 } else { 1024 };
-const MAX_HISTORY_BYTES: usize = (if cfg!(feature = "automerge-rooms") { 64 } else { 8 }) * 1024 * 1024;
 const MAX_QUEUED_STORY_EDITS: usize = 64;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -95,27 +93,32 @@ struct Packet {
     message: Message,
 }
 
+#[cfg(test)]
 fn encode(message: Message) -> Result<Vec<u8>, String> {
-    let bytes = encode_packet(message)?;
+    encode_for_protocol(message, RoomProtocol::default())
+}
+
+fn encode_for_protocol(message: Message, protocol: RoomProtocol) -> Result<Vec<u8>, String> {
+    let bytes = encode_packet(message, protocol)?;
     if bytes.len() > MAX_PAYLOAD {
         return Err("The edit is too large to share in one step.".into());
     }
     Ok(bytes)
 }
 
-fn encode_packet(message: Message) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(&Packet { version: PROTOCOL_VERSION, message }).map_err(|_| "Could not encode the collaboration message.".into())
+fn encode_packet(message: Message, protocol: RoomProtocol) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&Packet { version: protocol.version(), message }).map_err(|_| "Could not encode the collaboration message.".into())
 }
 
-fn encode_edit(message: Message) -> Result<WireEdit, String> {
+fn encode_edit_for_protocol(message: Message, protocol: RoomProtocol) -> Result<WireEdit, String> {
     let can_chunk = matches!(&message, Message::Propose(proposal) | Message::Commit(Commit { proposal, .. }) if accepts_chunked_edit(proposal));
     let (blobs, artwork_size) = match &message {
         Message::Propose(p) | Message::Commit(Commit { proposal: p, .. }) => (p.blobs()?, p.artwork_size()),
         _ => (attachments::Blobs::new(), 0),
     };
     attachments::total(&blobs)?;
-    let bytes = if can_chunk { encode_packet(message)? } else { encode(message)? };
-    let mut wire = WireEdit::new(bytes)?;
+    let bytes = if can_chunk { encode_packet(message, protocol)? } else { encode_for_protocol(message, protocol)? };
+    let mut wire = WireEdit::for_room(bytes, protocol)?;
     wire.blobs = blobs;
     wire.artwork_size = artwork_size;
     Ok(wire)
@@ -142,6 +145,7 @@ struct Delivery {
 
 struct Room {
     transport: Transport,
+    protocol: RoomProtocol,
     #[cfg(unix)]
     server_journal: Option<server::Journal>,
     storage: Storage,
@@ -198,6 +202,7 @@ struct RoomConflict {
     revision: u64,
     path: String,
     previous: [u8; 32],
+    protocol: RoomProtocol,
     focus_start: bool,
 }
 
@@ -255,7 +260,7 @@ impl DesignApp {
 
     /// Complete a story draft in the input event, before paint and without polling the transport.
     pub(crate) fn apply_local_story_edit(&mut self, id: &str, inside_story: bool) -> Result<(), String> {
-        if !cfg!(feature = "automerge-rooms") || !designcraft_engine::is_deferred_story_command(id, inside_story) {
+        if !designcraft_engine::is_deferred_story_command(id, inside_story) {
             return Ok(());
         }
         let Some(room) =
@@ -358,10 +363,14 @@ impl DesignApp {
 
     fn install_downloaded_seed(&mut self, joining: PendingJoin, seed_download: JoinedSeed) -> Result<(), String> {
         let JoinedSeed { document: doc, originals } = seed_download;
-        let seed = fingerprint(&doc)?;
+        let protocol = joining.protocol;
+        let seed = seed_document::Fingerprints::for_room(protocol).canonical(&doc)?;
         let identity = joining.identity.to_bytes();
-        let storage =
-            if originals.is_pending() { Storage::ephemeral_preview(doc.clone(), identity) } else { Storage::ephemeral(doc.clone(), identity)? };
+        let storage = if originals.is_pending() {
+            Storage::ephemeral_preview_for_protocol(doc.clone(), identity, protocol)
+        } else {
+            Storage::ephemeral_for_protocol(doc.clone(), identity, protocol)?
+        };
         let state = designcraft_engine::DocState::new(doc, None);
         let uid = state.uid;
         self.session.add_document(state);
@@ -385,11 +394,12 @@ impl DesignApp {
         if !matches!(room.mode, Mode::Guest { .. }) {
             return Err("Only a guest can reconnect through a new invitation.".into());
         }
-        let host = Transport::invitation_host(&c.join_code)?;
-        if room.host != Some(host) {
+        let (protocol, ticket) = compatible_invitation(&c.join_code)?;
+        let host = Transport::invitation_host(ticket)?;
+        if room.host != Some(host) || room.protocol != protocol {
             return Err("Use a current invitation from the same room host.".into());
         }
-        let connection = Transport::join_with_identity(&c.join_code, &c.name, room.storage.identity())?;
+        let connection = Transport::join_with_identity(ticket, &c.name, room.storage.identity())?;
         room.transport = connection;
         room.mode = Mode::Guest { ready: false, hello_sent: false };
         room.online = false;
@@ -413,7 +423,7 @@ impl DesignApp {
         if host {
             self.collaboration.room_conflict = None;
         }
-        self.connect_to_room(host, OpenRoom::Active)
+        self.connect_to_room(host, OpenRoom::Active, None)
     }
 
     fn start_new_room_from_current(&mut self) -> Result<(), String> {
@@ -423,14 +433,21 @@ impl DesignApp {
             .take()
             .filter(|conflict| conflict.applies(&self.session))
             .ok_or("Select Start sharing again to check this document version.")?;
-        self.connect_to_room(true, OpenRoom::NewHost(conflict.previous))
+        self.connect_to_room(true, OpenRoom::NewHost(conflict.previous), Some(conflict.protocol))
     }
 
     fn open_saved_room_copy(&mut self) -> Result<(), String> {
         let st = self.session.active().ok_or("Open the saved document before recovering a room.")?;
-        let previous = self.collaboration.room_conflict.as_ref().filter(|conflict| conflict.applies(&self.session)).map(|conflict| conflict.previous);
-        let (storage, saved) = Storage::open(self.session.recovery_dir.as_deref(), st.path.as_deref(), &st.doc, None, OpenRoom::SavedHost(previous))?;
-        let recovered = replay::restore(&storage.seed, &storage.seed, saved.confirmed)?;
+        let conflict = self.collaboration.room_conflict.as_ref().filter(|conflict| conflict.applies(&self.session));
+        let (storage, saved) = Storage::open_for_protocol(
+            self.session.recovery_dir.as_deref(),
+            st.path.as_deref(),
+            &st.doc,
+            None,
+            OpenRoom::SavedHost(conflict.map(|c| c.previous)),
+            conflict.map(|c| c.protocol),
+        )?;
+        let recovered = replay::restore_for_room(&storage.seed, &storage.seed, saved.confirmed, storage.protocol)?;
         self.session.add_document(designcraft_engine::DocState::new(recovered.document, None));
         self.collaboration.open = false;
         self.collaboration.room_conflict = None;
@@ -439,22 +456,27 @@ impl DesignApp {
         Ok(())
     }
 
-    fn connect_to_room(&mut self, host: bool, room: OpenRoom) -> Result<(), String> {
+    fn connect_to_room(&mut self, host: bool, room: OpenRoom, preferred_protocol: Option<RoomProtocol>) -> Result<(), String> {
         let st = self.session.active().ok_or("Open the saved document before connecting.")?;
         if st.interaction.is_some() || st.preview_stash.is_some() {
             return Err("Finish the current document edit before connecting.".into());
         }
         let c = &mut self.collaboration;
-        let guest_of = if host { None } else { Some(Transport::invitation_host(&c.join_code)?) };
+        let invitation = (!host).then(|| compatible_invitation(&c.join_code)).transpose()?;
+        let guest_of = invitation.map(|(_, ticket)| Transport::invitation_host(ticket)).transpose()?;
         if cfg!(target_os = "macos") && self.session.recovery_dir.is_some() && (st.path.is_none() || st.is_dirty()) {
             return Err("Save the seed document before starting or joining a room.".into());
         }
         let mut opened = (*st.doc).clone();
         seed_document::prepare_local_copy(&mut opened)?;
-        let (storage, saved) = Storage::open(self.session.recovery_dir.as_deref(), st.path.as_deref(), &opened, guest_of, room)?;
-        let seed = fingerprint(&storage.seed)?;
+        let requested_protocol = invitation.map(|(p, _)| p).or(preferred_protocol);
+        let (storage, saved) =
+            Storage::open_for_protocol(self.session.recovery_dir.as_deref(), st.path.as_deref(), &opened, guest_of, room, requested_protocol)?;
+        let protocol = storage.protocol;
+        let mut fingerprints = seed_document::Fingerprints::for_room(protocol);
+        let seed = fingerprints.canonical(&storage.seed)?;
         let uid = st.uid;
-        let recovered = match replay::restore_cached(&storage.seed, &opened, saved.confirmed, &mut seed_document::Fingerprints::default()) {
+        let recovered = match replay::restore_cached_for_room(&storage.seed, &opened, saved.confirmed, &mut fingerprints, protocol) {
             Ok(recovered) => recovered,
             Err(issue) => {
                 if host
@@ -463,21 +485,23 @@ impl DesignApp {
                     && let Some(previous) = storage.host_room_id()
                     && let Some(path) = st.path.clone()
                 {
-                    c.room_conflict = Some(RoomConflict { doc_uid: uid, revision: st.revision, path, previous, focus_start: true });
+                    c.room_conflict = Some(RoomConflict { doc_uid: uid, revision: st.revision, path, previous, protocol, focus_start: true });
                 }
                 return Err(issue.into_message());
             }
         };
         let revision = recovered.history.len() as u64;
         if saved.pending.iter().any(|pending| {
-            host || pending.base > revision || pending.sequence >= saved.next_sequence || pending.validate_story_transaction().is_err()
+            host || pending.base > revision
+                || pending.sequence >= saved.next_sequence
+                || pending.validate_story_transaction_for_protocol(protocol).is_err()
         }) {
             return Err("The local collaboration journal has an invalid pending edit.".into());
         }
-        let (transport, mode) = if host {
-            (Transport::host_with_identity(&c.name, c.relay, storage.identity())?, Mode::Host { delivery: BTreeMap::new() })
+        let (transport, mode) = if let Some((_, ticket)) = invitation {
+            (Transport::join_with_identity(ticket, &c.name, storage.identity())?, Mode::Guest { ready: false, hello_sent: false })
         } else {
-            (Transport::join_with_identity(&c.join_code, &c.name, storage.identity())?, Mode::Guest { ready: false, hello_sent: false })
+            (Transport::host_with_identity(&c.name, c.relay, storage.identity())?, Mode::Host { delivery: BTreeMap::new() })
         };
         if !matches!(room, OpenRoom::NewHost(_)) {
             storage.write(recovered.history.iter().map(|(commit, _)| commit), &saved.pending, saved.next_sequence)?;
@@ -496,7 +520,7 @@ impl DesignApp {
         room.next_sequence = saved.next_sequence;
         room.revision = revision;
         room.pending = saved.pending;
-        if cfg!(feature = "automerge-rooms") && !host && durable && (revision != 0 || !room.pending.is_empty()) {
+        if protocol.is_automerge() && !host && durable && (revision != 0 || !room.pending.is_empty()) {
             room.has_joined = true;
             room.local = Some(Peer { actor: room.storage.identity().actor(), name: c.name.clone() });
         }
@@ -511,19 +535,25 @@ impl DesignApp {
     }
 }
 
-fn fingerprint(doc: &Document) -> Result<[u8; 32], String> {
-    seed_document::Fingerprints::default().canonical(doc)
+fn compatible_invitation(code: &str) -> Result<(RoomProtocol, &str), String> {
+    let invitation = RoomProtocol::parse_invitation(code);
+    if !invitation.0.is_supported() {
+        return Err("Update Collate to join this room.".into());
+    }
+    Ok(invitation)
 }
 
 impl Room {
     fn new(transport: Transport, mode: Mode, storage: Storage, doc_uid: u64, seed: [u8; 32]) -> Self {
         let seed_artwork = seed_document::artwork_size(&storage.seed);
-        let replica = Replica::new(&storage.seed);
+        let protocol = storage.protocol;
+        let replica = Replica::for_room(&storage.seed, protocol);
         Self {
             transport,
             #[cfg(unix)]
             server_journal: None,
             mode,
+            protocol,
             storage,
             doc_uid,
             seed,
@@ -593,13 +623,15 @@ impl Room {
             && self.local.is_some()
             && self.pending.is_empty()
             && match self.mode {
-                Mode::Host { .. } => self.online && self.history.len() < MAX_HISTORY && self.history_bytes < MAX_HISTORY_BYTES,
+                Mode::Host { .. } => {
+                    self.online && self.history.len() < self.protocol.history_limit() && self.history_bytes < self.protocol.history_byte_limit()
+                }
                 Mode::Guest { ready, .. } => ready || self.has_joined && !self.online && self.storage.is_durable(),
             }
     }
 
     fn can_draft_story(&self) -> bool {
-        cfg!(feature = "automerge-rooms")
+        self.protocol.is_automerge()
             && !self.fatal
             && !self.story_queue_blocked
             && self.local.is_some()
@@ -642,7 +674,7 @@ impl Room {
             }
         }
         self.advance_delivery();
-        self.seed_delivery.advance(&self.transport, &self.storage.seed_blobs);
+        self.seed_delivery.advance(&self.transport, &self.storage.seed_blobs, self.protocol);
         self.advance_proposal();
         self.advance_original_delivery();
     }
@@ -677,7 +709,7 @@ impl Room {
             return;
         }
         if self.sending_proposal.is_none() && self.last_send.is_none_or(|last| last.elapsed() >= Duration::from_secs(2)) {
-            self.sending_proposal = match encode_edit(Message::Propose(pending.clone())) {
+            self.sending_proposal = match encode_edit_for_protocol(Message::Propose(pending.clone()), self.protocol) {
                 Ok(mut wire) => {
                     // The ordered transport delivered the attachments before the
                     // proposal. Retry just its metadata while waiting for a receipt.
@@ -716,7 +748,7 @@ impl Room {
                 self.last_send = None;
             }
             Event::Ready { .. } => {}
-            Event::Invitation(code) if !self.fatal => self.invitation = Some(code),
+            Event::Invitation(code) if !self.fatal => self.invitation = Some(self.protocol.decorate_invitation(code)),
             Event::Invitation(_) => {}
             Event::PeerJoined(peer) => {
                 self.peers.insert(peer.actor, peer);
@@ -734,7 +766,7 @@ impl Room {
             Event::Message { actor, bytes } => self.on_packet(session, actor, &bytes),
             Event::Disconnected => self.disconnected(),
             Event::Failed(error)
-                if cfg!(feature = "automerge-rooms") && matches!(self.mode, Mode::Guest { .. }) && self.has_joined && self.storage.is_durable() =>
+                if self.protocol.is_automerge() && matches!(self.mode, Mode::Guest { .. }) && self.has_joined && self.storage.is_durable() =>
             {
                 self.disconnected();
                 if !self.story_queue_blocked {
@@ -778,7 +810,7 @@ impl Room {
             return;
         }
         let Ok(packet) = serde_json::from_slice::<Packet>(bytes) else { return };
-        if packet.version != PROTOCOL_VERSION {
+        if packet.version != self.protocol.version() {
             if matches!(self.mode, Mode::Host { .. }) {
                 self.reply(actor, Message::Incompatible);
             } else {
@@ -815,7 +847,10 @@ impl Room {
             Err(_) => return self.drop_transfer(actor),
         };
         self.receiving_edits.remove(&actor);
-        let Ok(Packet { version: PROTOCOL_VERSION, message }) = serde_json::from_slice(&bytes) else { return self.drop_transfer(actor) };
+        let Ok(Packet { version, message }) = serde_json::from_slice(&bytes) else { return self.drop_transfer(actor) };
+        if version != self.protocol.version() {
+            return self.drop_transfer(actor);
+        }
         match message {
             Message::Propose(ref proposal) if self.serving(actor) && accepts_chunked_edit(proposal) => {
                 self.on_guest_message(session, actor, message);
@@ -839,7 +874,7 @@ impl Room {
     fn on_guest_message(&mut self, session: &mut Session, actor: ActorId, message: Message) {
         match message {
             Message::RequestSeed => self.provide_seed(actor),
-            Message::RequestOriginal { blob } if self.serving(actor) => self.provide_original(actor, blob),
+            Message::RequestOriginal { blob } if self.protocol.is_automerge() && self.serving(actor) => self.provide_original(actor, blob),
             Message::Hello { seed, revision } => {
                 if seed != self.seed || revision > self.revision {
                     self.reply(actor, Message::Incompatible);
@@ -932,7 +967,7 @@ impl Room {
             && let Some(pending) = self.pending.front().filter(|p| p.sequence == sequence)
         {
             let candidate = Commit { revision, actor: local.actor, proposal: pending.clone(), correction: None };
-            if encode_edit(Message::Commit(candidate.clone())).is_ok_and(|wire| wire.digest() == digest) {
+            if encode_edit_for_protocol(Message::Commit(candidate.clone()), self.protocol).is_ok_and(|wire| wire.digest() == digest) {
                 return self.commit(session, candidate);
             }
         }
@@ -953,7 +988,7 @@ impl Room {
     }
 
     fn reply(&self, actor: ActorId, message: Message) {
-        if let Ok(bytes) = encode(message) {
+        if let Ok(bytes) = encode_for_protocol(message, self.protocol) {
             let _ = self.transport.send_to(actor, bytes);
         }
     }
@@ -967,7 +1002,7 @@ impl Room {
                         let sent = if state.receipt == Some(state.sent) {
                             let receipt =
                                 Message::ArtworkReceipt { revision: commit.revision, sequence: commit.proposal.sequence, digest: wire.digest() };
-                            encode(receipt).and_then(|frame| self.transport.send_to(actor, frame)).map(|_| true)
+                            encode_for_protocol(receipt, self.protocol).and_then(|frame| self.transport.send_to(actor, frame)).map(|_| true)
                         } else {
                             wire.send_next(&mut state.cursor, |frame| self.transport.send_to(actor, frame))
                         };
@@ -985,7 +1020,7 @@ impl Room {
                     }
                     if state.sent == self.history.len()
                         && !state.announced
-                        && let Ok(bytes) = encode(Message::CaughtUp { revision: self.revision })
+                        && let Ok(bytes) = encode_for_protocol(Message::CaughtUp { revision: self.revision }, self.protocol)
                         && self.transport.send_to(actor, bytes).is_ok()
                     {
                         state.announced = true;
@@ -995,7 +1030,7 @@ impl Room {
             Mode::Guest { hello_sent, .. } => {
                 if !*hello_sent
                     && self.online
-                    && let Ok(bytes) = encode(Message::Hello { seed: self.seed, revision: self.revision })
+                    && let Ok(bytes) = encode_for_protocol(Message::Hello { seed: self.seed, revision: self.revision }, self.protocol)
                     && self.transport.submit(bytes).is_ok()
                 {
                     *hello_sent = true;
@@ -1008,7 +1043,7 @@ impl Room {
         let actor = self.local.as_ref().ok_or("The collaboration connection is still starting.")?.actor;
         self.error = None;
         let local = self.story_draft.as_ref().map_or(&self.replica, |draft| &draft.visible);
-        if cfg!(feature = "automerge-rooms")
+        if self.protocol.is_automerge()
             && let Some(story_sync::Captured { transaction, selection, replica }) = story_sync::capture(local, actor, &edit, self.next_sequence)?
         {
             if matches!(self.mode, Mode::Guest { .. }) {
@@ -1066,7 +1101,7 @@ impl Room {
         let actor = self.local.as_ref().ok_or("The collaboration connection is still starting.")?.actor;
         let proposal = Proposal { sequence: self.next_sequence, base: self.revision, edits, history_action, story_transaction };
         let next_sequence = self.next_sequence.checked_add(1).ok_or("The shared room reached its edit limit.")?;
-        let wire = encode_edit(Message::Propose(proposal.clone()))?;
+        let wire = encode_edit_for_protocol(Message::Propose(proposal.clone()), self.protocol)?;
         self.check_artwork_budget(wire.artwork_size)?;
         if matches!(self.mode, Mode::Host { .. }) {
             self.next_sequence = next_sequence;
@@ -1107,10 +1142,10 @@ impl Room {
             }
             return Ok(());
         }
-        if proposal.base > self.revision || proposal.sequence == 0 || self.history.len() >= MAX_HISTORY {
+        if proposal.base > self.revision || proposal.sequence == 0 || self.history.len() >= self.protocol.history_limit() {
             return Err("The edit has an invalid revision or the room is full.".into());
         }
-        proposal.validate_story_transaction()?;
+        proposal.validate_story_transaction_for_protocol(self.protocol)?;
         if proposal.edits.iter().any(Operation::is_text_compensation) {
             return Err("A text undo or redo must be requested through shared history.".into());
         }
@@ -1237,9 +1272,10 @@ impl Room {
             return Err("The confirmed edit has an invalid sequence.".into());
         }
         history::verify_text_compensation(&commit, self.history.iter().map(|(original, _)| original), &self.inverses)?;
-        let bytes = encode_edit(Message::Commit(commit.clone()))?;
+        let bytes = encode_edit_for_protocol(Message::Commit(commit.clone()), self.protocol)?;
         self.check_artwork_budget(bytes.artwork_size)?;
-        if self.history.len() >= MAX_HISTORY || self.history_bytes.saturating_add(bytes.len()) > MAX_HISTORY_BYTES {
+        if self.history.len() >= self.protocol.history_limit() || self.history_bytes.saturating_add(bytes.len()) > self.protocol.history_byte_limit()
+        {
             return Err("The shared room reached its history limit.".into());
         }
         let st = session.document_by_uid_mut(self.doc_uid).ok_or("The shared document closed.")?;
@@ -1248,7 +1284,7 @@ impl Room {
         let mut replica = self.replica.clone();
         let inverse = commit.apply_document(&mut replica, &mut doc)?;
         if commit.proposal.edits.iter().any(Operation::changes_artwork) {
-            seed_document::check_artwork(&doc)?;
+            seed_document::check_artwork_for_room(&doc, self.protocol)?;
         }
         // Every committed checkpoint must fit the model bound during journal replay.
         let model_size = match &self.model_size {
@@ -1399,7 +1435,7 @@ impl Room {
     }
 
     fn relay_presence(&self, actor: ActorId, state: Presence) {
-        let Ok(bytes) = encode(Message::Presence { actor, state }) else { return };
+        let Ok(bytes) = encode_for_protocol(Message::Presence { actor, state }, self.protocol) else { return };
         if let Mode::Host { delivery, .. } = &self.mode {
             for (&peer, delivery) in delivery {
                 if peer != actor && delivery.announced {

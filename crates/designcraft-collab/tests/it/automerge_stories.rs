@@ -1,5 +1,5 @@
 use designcraft_collab::{
-    Error, Replica,
+    Error, Replica, RoomProtocol,
     automerge_stories::{AutomergeStories, StoryTransaction},
 };
 use designcraft_doc::{Hyperlink, HyperlinkDest, HyperlinkSource, StoryId};
@@ -128,14 +128,13 @@ fn native_room_replica_keeps_the_two_story_histories_separate() {
     assert!(book.story(legacy).unwrap().text.starts_with("Legacy note\n"));
 }
 
-#[cfg(not(feature = "automerge-rooms"))]
 #[test]
 fn protocol_15_rejects_automerge_comment_anchors_without_changing_the_story_model() {
     use designcraft_collab::{CommentAnchor, Operation, automerge_text::AutomergeText};
 
     let mut book = super::seed();
     let (_, story) = super::add_text_frame(&mut book, 0.0);
-    let mut recipient = Replica::new(&book);
+    let mut recipient = Replica::for_room(&book, RoomProtocol::Legacy);
     let native = book.story(story).unwrap();
     let anchor = AutomergeText::seed(native, &book.styles, &ALICE).unwrap().comment_anchor(0..4).unwrap();
     let incoming = Operation::CreateComment {

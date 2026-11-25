@@ -1,11 +1,11 @@
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use designcraft_collab_core::{ActorId, Identity};
 use designcraft_doc::Document;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{collections::VecDeque, fmt, path::Path, sync::Arc};
 
 use super::{Commit, MAX_QUEUED_STORY_EDITS, Proposal, attachments::Blobs, seed_document};
-use designcraft_collab::artwork::BlobId;
+use designcraft_collab::{RoomProtocol, artwork::BlobId};
 
 const JOURNAL_VERSION: u16 = 1;
 #[cfg(target_os = "macos")]
@@ -14,11 +14,14 @@ const SEGMENTED_JOURNAL_VERSION: u16 = 2;
 const HISTORY_SEGMENT_EDITS: usize = 64;
 #[cfg(target_os = "macos")]
 const HISTORY_SEGMENT_BYTES: usize = 512 * 1024;
-const QUEUED_OUTBOX: bool = cfg!(feature = "automerge-rooms");
-const MAX_PENDING: usize = if QUEUED_OUTBOX { MAX_QUEUED_STORY_EDITS } else { 1 };
+#[cfg(all(test, target_os = "macos"))]
+pub(super) const JOURNAL_DIRECTORY: &str = journal_directory(RoomProtocol::CURRENT);
+
 #[cfg(target_os = "macos")]
 // Keep the development path stable so existing protocol-16 journals can migrate in place.
-pub(super) const JOURNAL_DIRECTORY: &str = if cfg!(feature = "automerge-rooms") { "Collaboration-Protocol16" } else { "Collaboration" };
+const fn journal_directory(protocol: RoomProtocol) -> &'static str {
+    if protocol.is_automerge() { "Collaboration-Protocol16" } else { "Collaboration" }
+}
 
 #[cfg(target_os = "macos")]
 use designcraft_collab_core::journal::{Journal, MAX_RECORD_BYTES, RecordId, RecordLock, Role};
@@ -32,8 +35,20 @@ struct Record<'a> {
     seed: &'a str,
     next_sequence: u64,
     confirmed: Vec<&'a Commit>,
-    #[serde(serialize_with = "serialize_pending")]
-    pending: &'a VecDeque<Proposal>,
+    pending: PendingRecord<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum PendingRecord<'a> {
+    Legacy(Option<&'a Proposal>),
+    Queued(&'a VecDeque<Proposal>),
+}
+
+impl<'a> PendingRecord<'a> {
+    fn new(protocol: RoomProtocol, pending: &'a VecDeque<Proposal>) -> Self {
+        if protocol.is_automerge() { Self::Queued(pending) } else { Self::Legacy(pending.front()) }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -67,14 +82,39 @@ fn encode_record(record: &impl Serialize) -> Result<Vec<u8>, String> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SavedRoom {
+pub(super) struct SavedRoom<P = VecDeque<Proposal>> {
     version: u16,
     identity: [u8; 32],
     seed: SavedSeed,
     pub(super) next_sequence: u64,
     pub(super) confirmed: Vec<Commit>,
-    #[serde(default, deserialize_with = "deserialize_pending")]
-    pub(super) pending: VecDeque<Proposal>,
+    #[serde(default)]
+    pub(super) pending: P,
+}
+
+impl<P> SavedRoom<P> {
+    fn map_pending(self, map: impl FnOnce(P) -> VecDeque<Proposal>) -> SavedRoom {
+        SavedRoom {
+            version: self.version,
+            identity: self.identity,
+            seed: self.seed,
+            next_sequence: self.next_sequence,
+            confirmed: self.confirmed,
+            pending: map(self.pending),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(transparent)]
+struct QueuedPending(#[serde(deserialize_with = "deserialize_pending")] VecDeque<Proposal>);
+
+fn read_saved_room(bytes: &[u8], protocol: RoomProtocol) -> Result<SavedRoom, serde_json::Error> {
+    if protocol.is_automerge() {
+        serde_json::from_slice::<SavedRoom<QueuedPending>>(bytes).map(|saved| saved.map_pending(|pending| pending.0))
+    } else {
+        serde_json::from_slice::<SavedRoom<Option<Proposal>>>(bytes).map(|saved| saved.map_pending(|pending| pending.into_iter().collect()))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -93,7 +133,7 @@ struct HistoryTail {
 struct HistoryHead {
     tail: HistoryTail,
     next_sequence: u64,
-    #[serde(serialize_with = "serialize_pending", deserialize_with = "deserialize_pending")]
+    #[serde(deserialize_with = "deserialize_pending")]
     pending: VecDeque<Proposal>,
 }
 
@@ -102,7 +142,6 @@ struct HistoryHead {
 struct StoryOutboxRecord<'a> {
     confirmed_revision: u64,
     next_sequence: u64,
-    #[serde(serialize_with = "serialize_pending")]
     pending: &'a VecDeque<Proposal>,
 }
 
@@ -123,19 +162,12 @@ impl SavedRoom {
         // a newer sequence counter. A newer confirmed history also supersedes
         // the shadow, even when the last pending sequence did not change.
         if outbox.confirmed_revision == self.confirmed.len() as u64 && outbox.next_sequence > self.next_sequence {
-            validate_story_outbox(outbox.confirmed_revision, &outbox.pending, outbox.next_sequence)?;
+            validate_story_outbox(RoomProtocol::Automerge, outbox.confirmed_revision, &outbox.pending, outbox.next_sequence)?;
             self.pending = outbox.pending;
             self.next_sequence = outbox.next_sequence;
         }
         Ok(())
     }
-}
-
-fn serialize_pending<S: Serializer>(pending: &VecDeque<Proposal>, serializer: S) -> Result<S::Ok, S::Error> {
-    if pending.len() > MAX_PENDING {
-        return Err(serde::ser::Error::custom("too many pending proposals"));
-    }
-    if QUEUED_OUTBOX { pending.serialize(serializer) } else { pending.front().serialize(serializer) }
 }
 
 fn deserialize_pending<'de, D: Deserializer<'de>>(deserializer: D) -> Result<VecDeque<Proposal>, D::Error> {
@@ -158,11 +190,8 @@ fn deserialize_pending<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec
         }
 
         fn visit_seq<S: de::SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
-            if !QUEUED_OUTBOX {
-                return Err(de::Error::custom("queued proposals require a compatible room version"));
-            }
             let mut proposals = VecDeque::new();
-            while proposals.len() < MAX_PENDING {
+            while proposals.len() < MAX_QUEUED_STORY_EDITS {
                 let Some(proposal) = seq.next_element()? else { return Ok(proposals) };
                 proposals.push_back(proposal);
             }
@@ -176,8 +205,9 @@ fn deserialize_pending<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec
     deserializer.deserialize_any(PendingVisitor)
 }
 
-fn validate_pending(pending: &VecDeque<Proposal>, next_sequence: u64) -> Result<(), String> {
-    if pending.len() > MAX_PENDING {
+fn validate_pending(protocol: RoomProtocol, pending: &VecDeque<Proposal>, next_sequence: u64) -> Result<(), String> {
+    let max_pending = if protocol.is_automerge() { MAX_QUEUED_STORY_EDITS } else { 1 };
+    if pending.len() > max_pending {
         return Err("The collaboration journal has too many pending edits.".into());
     }
     if next_sequence == 0 {
@@ -193,17 +223,17 @@ fn validate_pending(pending: &VecDeque<Proposal>, next_sequence: u64) -> Result<
     Ok(())
 }
 
-fn validate_story_outbox(confirmed_revision: u64, pending: &VecDeque<Proposal>, next_sequence: u64) -> Result<(), String> {
-    if !QUEUED_OUTBOX {
+fn validate_story_outbox(protocol: RoomProtocol, confirmed_revision: u64, pending: &VecDeque<Proposal>, next_sequence: u64) -> Result<(), String> {
+    if !protocol.is_automerge() {
         return Err("Queued story recovery needs a compatible room version.".into());
     }
-    validate_pending(pending, next_sequence)?;
-    if pending.is_empty() || confirmed_revision > super::MAX_HISTORY as u64 {
+    validate_pending(protocol, pending, next_sequence)?;
+    if pending.is_empty() || confirmed_revision > protocol.history_limit() as u64 {
         return Err("The queued story recovery record is invalid.".into());
     }
     for proposal in pending {
         // A pure story proposal cannot contain an artwork operation or an undo request.
-        proposal.validate_story_transaction()?;
+        proposal.validate_story_transaction_for_protocol(protocol)?;
         if proposal.base > confirmed_revision || proposal.story_transaction.as_ref().is_none_or(|transaction| transaction.changes.is_empty()) {
             return Err("The queued story recovery record is invalid.".into());
         }
@@ -217,57 +247,59 @@ mod tests {
 
     use super::*;
 
-    fn legacy_record(pending: Value) -> Result<SavedRoom, serde_json::Error> {
-        serde_json::from_value(json!({
+    fn saved_record(protocol: RoomProtocol, pending: Value) -> Result<SavedRoom, serde_json::Error> {
+        let value = json!({
             "version": JOURNAL_VERSION, "identity": vec![0u8; 32], "seed": "",
             "next_sequence": 100, "confirmed": [], "pending": pending,
-        }))
+        });
+        read_saved_room(&serde_json::to_vec(&value)?, protocol)
     }
 
     fn proposal(sequence: u64) -> Value {
         json!({"sequence": sequence, "base": 0, "edits": []})
     }
 
-    fn encode(pending: &VecDeque<Proposal>) -> Result<Value, serde_json::Error> {
-        serde_json::to_value(Record { version: JOURNAL_VERSION, identity: &[0; 32], seed: "", next_sequence: 100, confirmed: Vec::new(), pending })
+    fn encode(protocol: RoomProtocol, pending: &VecDeque<Proposal>) -> Value {
+        serde_json::to_value(Record {
+            version: JOURNAL_VERSION,
+            identity: &[0; 32],
+            seed: "",
+            next_sequence: 100,
+            confirmed: Vec::new(),
+            pending: PendingRecord::new(protocol, pending),
+        })
+        .unwrap()
     }
 
     #[test]
-    fn older_journals_restore_and_current_protocol_writes_its_own_shape() {
-        let empty = legacy_record(Value::Null).unwrap();
-        let single = legacy_record(proposal(7)).unwrap();
-        assert!(empty.pending.is_empty());
-        assert_eq!(single.pending.front().unwrap().sequence, 7);
-        let empty = encode(&empty.pending).unwrap();
-        let single = encode(&single.pending).unwrap();
-        if QUEUED_OUTBOX {
-            assert_eq!(empty["pending"], json!([]));
-            assert_eq!(single["pending"], json!([proposal(7)]));
-        } else {
-            assert_eq!(empty["pending"], Value::Null);
-            assert_eq!(single["pending"], proposal(7));
+    fn legacy_and_automerge_journals_write_their_own_pending_shape() {
+        for (protocol, empty_value, single_value) in
+            [(RoomProtocol::Legacy, Value::Null, proposal(7)), (RoomProtocol::Automerge, json!([]), json!([proposal(7)]))]
+        {
+            let empty = saved_record(protocol, Value::Null).unwrap();
+            let single = saved_record(protocol, proposal(7)).unwrap();
+            assert!(empty.pending.is_empty());
+            assert_eq!(single.pending.front().unwrap().sequence, 7);
+            assert_eq!(encode(protocol, &empty.pending)["pending"], empty_value);
+            assert_eq!(encode(protocol, &single.pending)["pending"], single_value);
         }
     }
 
     #[test]
     fn pending_edits_retain_order_and_always_obey_the_protocol_bound() {
+        let protocol = RoomProtocol::Automerge;
         let encoded_queue = json!([proposal(7), proposal(9)]);
-        if QUEUED_OUTBOX {
-            let queue = legacy_record(encoded_queue.clone()).unwrap();
-            assert_eq!(encode(&queue.pending).unwrap()["pending"], encoded_queue);
-            let limit: Vec<_> = (1..=MAX_PENDING as u64).map(proposal).collect();
-            let at_limit = legacy_record(json!(limit)).unwrap();
-            assert_eq!(at_limit.pending.len(), MAX_PENDING);
-            let over_limit: Vec<_> = (1..=MAX_PENDING as u64 + 1).map(proposal).collect();
-            assert!(legacy_record(json!(over_limit)).is_err());
-            let out_of_order = legacy_record(json!([proposal(9), proposal(7)])).unwrap();
-            assert!(validate_pending(&out_of_order.pending, out_of_order.next_sequence).is_err());
-        } else {
-            assert!(legacy_record(encoded_queue).is_err());
-            let mut too_many = legacy_record(proposal(7)).unwrap().pending;
-            too_many.push_back(legacy_record(proposal(9)).unwrap().pending.pop_front().unwrap());
-            assert!(encode(&too_many).is_err(), "a beta journal cannot silently drop a pending edit");
-        }
+        let queue = saved_record(protocol, encoded_queue.clone()).unwrap();
+        assert_eq!(encode(protocol, &queue.pending)["pending"], encoded_queue);
+        assert!(saved_record(RoomProtocol::Legacy, encoded_queue).is_err());
+        assert!(validate_pending(RoomProtocol::Legacy, &queue.pending, queue.next_sequence).is_err());
+        let limit: Vec<_> = (1..=MAX_QUEUED_STORY_EDITS as u64).map(proposal).collect();
+        let at_limit = saved_record(protocol, json!(limit)).unwrap();
+        assert_eq!(at_limit.pending.len(), MAX_QUEUED_STORY_EDITS);
+        let over_limit: Vec<_> = (1..=MAX_QUEUED_STORY_EDITS as u64 + 1).map(proposal).collect();
+        assert!(saved_record(protocol, json!(over_limit)).is_err());
+        let out_of_order = saved_record(protocol, json!([proposal(9), proposal(7)])).unwrap();
+        assert!(validate_pending(protocol, &out_of_order.pending, out_of_order.next_sequence).is_err());
     }
 
     #[cfg(feature = "automerge-rooms")]
@@ -283,7 +315,7 @@ mod tests {
     #[cfg(feature = "automerge-rooms")]
     #[test]
     fn only_a_newer_story_outbox_against_the_saved_revision_is_recovered() {
-        let mut saved = legacy_record(Value::Null).unwrap();
+        let mut saved = saved_record(RoomProtocol::Automerge, Value::Null).unwrap();
         saved.confirmed.push(Commit {
             revision: 1,
             actor: ActorId([1; 32]),
@@ -304,13 +336,50 @@ mod tests {
     #[cfg(feature = "automerge-rooms")]
     #[test]
     fn a_current_story_outbox_with_incompatible_proposals_keeps_the_combined_record() {
-        let mut saved = legacy_record(story_proposal(7, 0)).unwrap();
+        let mut saved = saved_record(RoomProtocol::Automerge, story_proposal(7, 0)).unwrap();
         for pending in [json!([proposal(100)]), json!([story_proposal(100, 1)]), json!([story_proposal(101, 0)])] {
             assert!(saved.restore_story_outbox(shadow(0, 101, pending)).is_err());
             assert_eq!(saved.next_sequence, 100);
             assert_eq!(saved.pending.front().unwrap().sequence, 7);
         }
     }
+}
+
+/// Exercise both on-disk formats under the existing disposable-Keychain restart fixture.
+#[cfg(all(test, target_os = "macos", feature = "automerge-rooms"))]
+pub(super) fn verify_legacy_room_protocol_fallback(root: &Path) -> Result<(), String> {
+    let file = tempfile::NamedTempFile::new_in(root).map_err(|error| error.to_string())?;
+    let path = file.path().to_str();
+    let directory = root.join("Protocol selection");
+    let recovery = directory.join("Recovery");
+    let seed = Document::new(&designcraft_doc::build::NewDocument::default());
+    let open = |protocol| Storage::open_for_protocol(Some(&recovery), path, &seed, None, OpenRoom::Active, protocol);
+
+    let (legacy, _) = open(Some(RoomProtocol::Legacy))?;
+    legacy.write(std::iter::empty(), &VecDeque::new(), 1)?;
+    let legacy_actor = legacy.identity().actor();
+    drop(legacy);
+
+    let (selected, saved) = open(None)?;
+    assert_eq!(selected.protocol, RoomProtocol::Legacy);
+    assert_eq!(selected.identity().actor(), legacy_actor);
+    assert!(saved.pending.is_empty());
+    assert!(!directory.join(journal_directory(RoomProtocol::Automerge)).exists());
+    drop(selected);
+
+    let (automerge, _) = open(Some(RoomProtocol::Automerge))?;
+    automerge.write(std::iter::empty(), &VecDeque::new(), 1)?;
+    let automerge_actor = automerge.identity().actor();
+    assert_ne!(automerge_actor, legacy_actor);
+    drop(automerge);
+
+    let (selected, _) = open(None)?;
+    assert_eq!(selected.protocol, RoomProtocol::Automerge);
+    assert_eq!(selected.identity().actor(), automerge_actor);
+    let (legacy, _) = open(Some(RoomProtocol::Legacy))?;
+    assert_eq!(legacy.protocol, RoomProtocol::Legacy);
+    assert_eq!(legacy.identity().actor(), legacy_actor);
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -322,6 +391,7 @@ enum SavedSeed {
 
 pub(super) struct Storage {
     identity: [u8; 32],
+    pub(super) protocol: RoomProtocol,
     pub(super) seed: Arc<Document>,
     pub(super) archive: Vec<u8>,
     pub(super) seed_blobs: Blobs,
@@ -357,10 +427,14 @@ struct HostRooms {
 }
 
 impl Storage {
-    pub(super) fn ephemeral(document: Document, identity: [u8; 32]) -> Result<Self, String> {
-        let (archive, seed_blobs) = seed_document::bundle(&document)?;
+    pub(super) fn ephemeral_for_protocol(document: Document, identity: [u8; 32], protocol: RoomProtocol) -> Result<Self, String> {
+        if !protocol.is_supported() {
+            return Err("This room uses a different collaboration protocol.".into());
+        }
+        let (archive, seed_blobs) = seed_document::bundle_for_room(&document, protocol)?;
         Ok(Self {
             identity,
+            protocol,
             seed_blobs,
             seed: Arc::new(document),
             encoded_archive: STANDARD_NO_PAD.encode(&archive),
@@ -370,9 +444,10 @@ impl Storage {
         })
     }
 
-    pub(super) fn ephemeral_preview(document: Document, identity: [u8; 32]) -> Self {
+    pub(super) fn ephemeral_preview_for_protocol(document: Document, identity: [u8; 32], protocol: RoomProtocol) -> Self {
         Self {
             identity,
+            protocol,
             seed_blobs: Blobs::new(),
             seed: Arc::new(document),
             encoded_archive: String::new(),
@@ -382,6 +457,7 @@ impl Storage {
         }
     }
 
+    #[cfg(all(test, target_os = "macos", feature = "automerge-rooms"))]
     pub(super) fn open(
         recovery_dir: Option<&Path>,
         document_path: Option<&str>,
@@ -389,13 +465,28 @@ impl Storage {
         guest_of: Option<ActorId>,
         room: OpenRoom,
     ) -> Result<(Self, SavedRoom), String> {
+        Self::open_for_protocol(recovery_dir, document_path, document, guest_of, room, None)
+    }
+
+    pub(super) fn open_for_protocol(
+        recovery_dir: Option<&Path>,
+        document_path: Option<&str>,
+        document: &Document,
+        guest_of: Option<ActorId>,
+        room: OpenRoom,
+        requested: Option<RoomProtocol>,
+    ) -> Result<(Self, SavedRoom), String> {
+        let preferred = requested.unwrap_or_default();
+        if !preferred.is_supported() {
+            return Err("The local collaboration journal needs a compatible app version.".into());
+        }
         #[cfg(target_os = "macos")]
-        let mut durable = match (recovery_dir.and_then(Path::parent), document_path) {
-            (Some(root), Some(path)) => Some(Durable::new(root, path, guest_of)?),
-            _ => None,
-        };
+        let (protocol, mut durable) = Durable::open(recovery_dir, document_path, guest_of, requested, preferred)?;
         #[cfg(not(target_os = "macos"))]
-        let _ = (recovery_dir, document_path, guest_of);
+        let protocol = {
+            let _ = (recovery_dir, document_path, guest_of);
+            preferred
+        };
 
         let identity = Identity::generate();
         match room {
@@ -433,19 +524,21 @@ impl Storage {
             return Err("There is no saved room for this document.".into());
         }
         let mut saved = if let Some(bytes) = existing {
-            let saved: SavedRoom = serde_json::from_slice(&bytes).map_err(|_| "The local collaboration journal could not be read.")?;
+            let saved = read_saved_room(&bytes, protocol).map_err(|_| "The local collaboration journal could not be read.")?;
             #[cfg(target_os = "macos")]
-            let saved = if QUEUED_OUTBOX && saved.version == SEGMENTED_JOURNAL_VERSION {
-                durable.as_ref().ok_or("The room recovery directory is missing.")?.restore_history(saved)?
+            let saved = if protocol.is_automerge() && saved.version == SEGMENTED_JOURNAL_VERSION {
+                durable.as_ref().ok_or("The room recovery directory is missing.")?.restore_history(saved, protocol)?
             } else {
                 saved
             };
-            if saved.version != JOURNAL_VERSION || saved.next_sequence == 0 || saved.confirmed.len() > super::MAX_HISTORY {
+            if saved.version != JOURNAL_VERSION || saved.next_sequence == 0 || saved.confirmed.len() > protocol.history_limit() {
                 return Err("The local collaboration journal needs a compatible app version.".into());
             }
-            validate_pending(&saved.pending, saved.next_sequence)?;
+            validate_pending(protocol, &saved.pending, saved.next_sequence)?;
             #[cfg(target_os = "macos")]
-            let saved = if QUEUED_OUTBOX && let Some(durable) = durable.as_ref().filter(|durable| durable.record.role == Role::Guest) {
+            let saved = if protocol.is_automerge()
+                && let Some(durable) = durable.as_ref().filter(|durable| durable.record.role == Role::Guest)
+            {
                 durable.restore_story_outbox(saved)?
             } else {
                 saved
@@ -482,17 +575,21 @@ impl Storage {
         };
         let (seed, archive, seed_blobs) = match &saved.seed {
             SavedSeed::Model(seed) => {
-                let (archive, blobs) = seed_document::bundle(seed)?;
+                let (archive, blobs) = seed_document::bundle_for_room(seed, protocol)?;
                 ((**seed).clone(), archive, blobs)
             }
             SavedSeed::Archive(encoded) => {
                 let archive = STANDARD_NO_PAD.decode(encoded).map_err(|_| "The saved seed archive is invalid.")?;
                 let mut blobs = Blobs::new();
-                let doc = seed_document::restore_bundle(&archive, |id| {
-                    let body = read(id)?;
-                    blobs.insert(id, body.clone());
-                    Ok(body)
-                })?;
+                let doc = seed_document::restore_bundle_for_room(
+                    &archive,
+                    |id| {
+                        let body = read(id)?;
+                        blobs.insert(id, body.clone());
+                        Ok(body)
+                    },
+                    protocol,
+                )?;
                 (doc, archive, blobs)
             }
         };
@@ -504,7 +601,9 @@ impl Storage {
             proposal.attach(&blobs)?;
         }
         #[cfg(target_os = "macos")]
-        if QUEUED_OUTBOX && let Some(durable) = &durable {
+        if protocol.is_automerge()
+            && let Some(durable) = &durable
+        {
             durable
                 .confirmed_blobs
                 .borrow_mut()
@@ -513,6 +612,7 @@ impl Storage {
         }
         let storage = Self {
             identity: saved.identity,
+            protocol,
             seed_blobs,
             seed: Arc::new(seed),
             encoded_archive: STANDARD_NO_PAD.encode(&archive),
@@ -534,12 +634,12 @@ impl Storage {
         next_sequence: u64,
     ) -> Result<(), String> {
         let root = recovery_dir.and_then(Path::parent).ok_or("No collaboration recovery directory is configured.")?;
-        let durable = Durable::new(root, path, Some(host))?;
+        let durable = Durable::new(root, room_record(path, Some(host))?, self.protocol)?;
         if durable.journal.load(durable.record).map_err(|error| error.to_string())?.is_some() {
             return Err("This path already has a saved room. Keep this copy under a different name for recovery.".into());
         }
         if self.archive.is_empty() {
-            let (archive, blobs) = seed_document::bundle(&self.seed)?;
+            let (archive, blobs) = seed_document::bundle_for_room(&self.seed, self.protocol)?;
             self.encoded_archive = STANDARD_NO_PAD.encode(&archive);
             self.archive = archive;
             self.seed_blobs = blobs;
@@ -589,7 +689,7 @@ impl Storage {
     /// Persist a guest's speculative story edits independently of the confirmed
     /// document. Changes to confirmed history and outbox removal use `write`.
     pub(super) fn write_story_outbox(&self, confirmed_revision: u64, pending: &VecDeque<Proposal>, next_sequence: u64) -> Result<(), String> {
-        validate_story_outbox(confirmed_revision, pending, next_sequence)?;
+        validate_story_outbox(self.protocol, confirmed_revision, pending, next_sequence)?;
         #[cfg(target_os = "macos")]
         if let Some(durable) = &self.durable {
             if durable.record.role != Role::Guest {
@@ -611,12 +711,14 @@ impl Storage {
         pending: &VecDeque<Proposal>,
         next_sequence: u64,
     ) -> Result<(), String> {
-        validate_pending(pending, next_sequence)?;
+        validate_pending(self.protocol, pending, next_sequence)?;
         if !self.is_durable() {
             return Ok(());
         }
         #[cfg(target_os = "macos")]
-        if QUEUED_OUTBOX && let Some(durable) = &self.durable {
+        if self.protocol.is_automerge()
+            && let Some(durable) = &self.durable
+        {
             let existing = durable.history.borrow().clone();
             if let Some(tail) = existing {
                 durable.write_proposal_blobs(pending.iter())?;
@@ -639,7 +741,7 @@ impl Storage {
                 seed: &self.encoded_archive,
                 next_sequence: 1,
                 confirmed: Vec::new(),
-                pending: &VecDeque::new(),
+                pending: PendingRecord::Queued(&VecDeque::new()),
             };
             let base = encode_record(&base)?;
             durable.write_proposal_blobs(pending.iter())?;
@@ -662,13 +764,14 @@ impl Storage {
         pending: &VecDeque<Proposal>,
         next_sequence: u64,
     ) -> Result<(), String> {
+        validate_pending(self.protocol, pending, next_sequence)?;
         let record = Record {
             version: JOURNAL_VERSION,
             identity: &self.identity,
             seed: &self.encoded_archive,
             next_sequence,
             confirmed: confirmed.collect(),
-            pending,
+            pending: PendingRecord::new(self.protocol, pending),
         };
         #[cfg(target_os = "macos")]
         let bytes = encode_record(&record)?;
@@ -677,7 +780,7 @@ impl Storage {
         #[cfg(target_os = "macos")]
         if let Some(durable) = &self.durable {
             let mut blobs = self.seed_blobs.clone();
-            for proposal in record.confirmed.iter().map(|c| &c.proposal).chain(record.pending) {
+            for proposal in record.confirmed.iter().map(|c| &c.proposal).chain(pending) {
                 blobs.extend(proposal.blobs()?);
             }
             super::attachments::total(&blobs)?;
@@ -697,10 +800,12 @@ impl Storage {
         next_sequence: u64,
     ) -> Result<(), String> {
         #[cfg(target_os = "macos")]
-        if QUEUED_OUTBOX && let Some(durable) = &self.durable {
+        if self.protocol.is_automerge()
+            && let Some(durable) = &self.durable
+        {
             let existing = durable.history.borrow().clone();
             if let Some(mut tail) = existing {
-                validate_pending(pending, next_sequence)?;
+                validate_pending(self.protocol, pending, next_sequence)?;
                 durable.write_proposal_blobs(std::iter::once(&commit.proposal).chain(pending))?;
                 durable.stage_commit(&self.identity, &mut tail, commit, wire_bytes)?;
                 durable.write_history_head(&self.identity, tail, pending, next_sequence)?;
@@ -716,6 +821,23 @@ impl Storage {
 
 #[cfg(target_os = "macos")]
 impl Durable {
+    fn open(
+        recovery_dir: Option<&Path>,
+        document_path: Option<&str>,
+        guest_of: Option<ActorId>,
+        requested: Option<RoomProtocol>,
+        preferred: RoomProtocol,
+    ) -> Result<(RoomProtocol, Option<Self>), String> {
+        let (Some(root), Some(path)) = (recovery_dir.and_then(Path::parent), document_path) else { return Ok((preferred, None)) };
+        let record = room_record(path, guest_of)?;
+        let protocol = if requested.is_none() && guest_of.is_none() && preferred.is_automerge() {
+            Self::existing_host_protocol(root, record, preferred)?
+        } else {
+            preferred
+        };
+        Ok((protocol, Some(Self::new(root, record, protocol)?)))
+    }
+
     fn history_id(&self, identity: &[u8; 32], segment: u64) -> RecordId {
         let mut hash = Sha256::new();
         hash.update(b"Collate encrypted confirmed history v2");
@@ -725,22 +847,22 @@ impl Durable {
         RecordId { room: hash.finalize().into(), role: self.record.role }
     }
 
-    fn restore_history(&self, mut saved: SavedRoom) -> Result<SavedRoom, String> {
+    fn restore_history(&self, mut saved: SavedRoom, protocol: RoomProtocol) -> Result<SavedRoom, String> {
         const INVALID: &str = "The encrypted room history is incomplete or invalid.";
         if saved.next_sequence != 1 || !saved.pending.is_empty() || !saved.confirmed.is_empty() {
             return Err(INVALID.into());
         }
         let bytes = self.journal.load(self.history_id(&saved.identity, 0)).map_err(|error| error.to_string())?.ok_or(INVALID)?;
         let HistoryHead { tail, pending, next_sequence } = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
-        let total = tail.archived_edits.checked_add(tail.commits.len()).filter(|&edits| edits <= super::MAX_HISTORY).ok_or(INVALID)?;
-        if tail.segments > tail.archived_edits || tail.commits.len() > HISTORY_SEGMENT_EDITS || tail.bytes > super::MAX_HISTORY_BYTES {
+        let total = tail.archived_edits.checked_add(tail.commits.len()).filter(|&edits| edits <= protocol.history_limit()).ok_or(INVALID)?;
+        if tail.segments > tail.archived_edits || tail.commits.len() > HISTORY_SEGMENT_EDITS || tail.bytes > protocol.history_byte_limit() {
             return Err(INVALID.into());
         }
         let mut encoded_bytes = 0usize;
         for ordinal in 1..=tail.segments {
             let bytes = self.journal.load(self.history_id(&saved.identity, ordinal as u64)).map_err(|error| error.to_string())?.ok_or(INVALID)?;
             encoded_bytes = encoded_bytes.saturating_add(bytes.len());
-            if encoded_bytes > super::MAX_HISTORY_BYTES {
+            if encoded_bytes > protocol.history_byte_limit() {
                 return Err(INVALID.into());
             }
             let commits: Vec<Commit> = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
@@ -785,21 +907,29 @@ impl Durable {
         Ok(())
     }
 
-    fn new(root: &Path, path: &str, guest_of: Option<ActorId>) -> Result<Self, String> {
-        let canonical = designcraft_engine::io::canonicalize(path).map_err(|_| "Could not find the saved document for collaboration.")?;
-        let mut hash = Sha256::new();
-        hash.update(canonical.as_os_str().as_encoded_bytes());
-        if let Some(host) = guest_of {
-            hash.update(host.0);
+    fn existing_host_protocol(root: &Path, path_record: RecordId, preferred: RoomProtocol) -> Result<RoomProtocol, String> {
+        let index = host_index(path_record);
+        for protocol in [preferred, RoomProtocol::Legacy] {
+            // Discovery must not create the unused journal or hide a corrupt index
+            // by falling back to another room on the same document path.
+            let journal = Journal::new(root.join(journal_directory(protocol)));
+            if journal.load(index).map_err(|error| error.to_string())?.is_some()
+                || journal.load(path_record).map_err(|error| error.to_string())?.is_some()
+            {
+                return Ok(protocol);
+            }
         }
-        let path_record = RecordId { room: hash.finalize().into(), role: if guest_of.is_some() { Role::Guest } else { Role::Host } };
-        let journal = Journal::new(root.join(JOURNAL_DIRECTORY));
+        Ok(preferred)
+    }
+
+    fn new(root: &Path, path_record: RecordId, protocol: RoomProtocol) -> Result<Self, String> {
+        let journal = Journal::new(root.join(journal_directory(protocol)));
         // All host versions of the path share the existing writer lease. The
         // pointer and replacement can only be changed while that lease is held.
         let lease = journal.lock(path_record).map_err(|error| error.to_string())?;
         let mut record = path_record;
         let hosts = if path_record.role == Role::Host {
-            let index = host_record(b"Collate host room index v1", path_record.room, &[]);
+            let index = host_index(path_record);
             let records = if let Some(bytes) = journal.load(index).map_err(|error| error.to_string())? {
                 let (records, remaining) = bytes.as_chunks::<32>();
                 if !remaining.is_empty() || records.first() != Some(&path_record.room) || records.len() < 2 {
@@ -852,6 +982,23 @@ impl Durable {
         }
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn room_record(path: &str, guest_of: Option<ActorId>) -> Result<RecordId, String> {
+    let canonical = designcraft_engine::io::canonicalize(path).map_err(|_| "Could not find the saved document for collaboration.")?;
+    let mut hash = Sha256::new();
+    hash.update(canonical.as_os_str().as_encoded_bytes());
+    if let Some(host) = guest_of {
+        hash.update(host.0);
+    }
+    let role = if guest_of.is_some() { Role::Guest } else { Role::Host };
+    Ok(RecordId { room: hash.finalize().into(), role })
+}
+
+#[cfg(target_os = "macos")]
+fn host_index(path_record: RecordId) -> RecordId {
+    host_record(b"Collate host room index v1", path_record.room, &[])
 }
 
 #[cfg(target_os = "macos")]

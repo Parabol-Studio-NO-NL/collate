@@ -2,7 +2,7 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
-use designcraft_collab::{Error, Operation, Replica, automerge_stories::StoryTransaction, text::TextSplice};
+use designcraft_collab::{Error, Operation, Replica, RoomProtocol, automerge_stories::StoryTransaction, text::TextSplice};
 use designcraft_collab_core::ActorId;
 use designcraft_doc::{Document, StoryId, TextSel};
 use designcraft_engine::{DeferredEdit, DocState};
@@ -11,7 +11,7 @@ use web_time::Instant;
 use super::{
     Commit, Message, Proposal,
     edit_wire::{SendCursor, WireEdit},
-    encode_edit, operation_story,
+    encode_edit_for_protocol, operation_story,
 };
 
 pub(super) struct PendingSelection {
@@ -71,7 +71,8 @@ impl Sender {
                 {
                     break;
                 }
-                self.active = Some((proposal.sequence, encode_edit(Message::Propose(proposal.clone()))?, SendCursor::default()));
+                let wire = encode_edit_for_protocol(Message::Propose(proposal.clone()), RoomProtocol::Automerge)?;
+                self.active = Some((proposal.sequence, wire, SendCursor::default()));
             }
             let Some((sequence, wire, cursor)) = &mut self.active else { break };
             match wire.send_next(cursor, &mut send) {
@@ -127,7 +128,7 @@ pub(super) fn rebase(
     let mut document = (**confirmed).clone();
     let mut visible = replica.clone();
     for proposal in pending {
-        proposal.validate_story_transaction()?;
+        proposal.validate_story_transaction_for_protocol(replica.room_protocol())?;
         let transaction = proposal.story_transaction.as_ref().ok_or("A story outbox also contains structural changes.")?;
         visible.apply_automerge_text(&mut document, &actor.0, transaction).map_err(|error| error.to_string())?;
     }
@@ -185,9 +186,9 @@ fn resolve(updated: &Replica, mut selection: TextSel, anchor: &[u8], focus: &[u8
 }
 
 impl Proposal {
-    pub(super) fn validate_story_transaction(&self) -> Result<(), String> {
+    pub(super) fn validate_story_transaction_for_protocol(&self, protocol: RoomProtocol) -> Result<(), String> {
         if let Some(transaction) = &self.story_transaction {
-            if !cfg!(feature = "automerge-rooms") {
+            if !protocol.is_automerge() || !protocol.is_supported() {
                 return Err("This room does not accept Automerge story edits.".into());
             }
             if !self.edits.is_empty() || self.history_action.is_some() {
@@ -234,7 +235,7 @@ fn conflicts_with_story(transaction: &StoryTransaction, edit: &Operation) -> boo
 
 impl Commit {
     pub(super) fn apply_document(&self, replica: &mut Replica, document: &mut Document) -> Result<Option<Vec<Operation>>, String> {
-        self.proposal.validate_story_transaction()?;
+        self.proposal.validate_story_transaction_for_protocol(replica.room_protocol())?;
         if let Some(transaction) = &self.proposal.story_transaction {
             if self.correction.is_some() {
                 return Err("An Automerge story edit cannot be applied as an undo or redo.".into());

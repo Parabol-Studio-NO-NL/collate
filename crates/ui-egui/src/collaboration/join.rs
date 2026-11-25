@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use designcraft_collab::{PROTOCOL_VERSION, artwork::BlobId};
+use designcraft_collab::{RoomProtocol, artwork::BlobId};
 use designcraft_collab_core::{ActorId, Event, Identity, Peer, Session as Transport};
 use designcraft_doc::Document;
 use web_time::Instant;
 
 use super::attachments::{self, BlobCursor, BlobDownload, Blobs};
 use super::seed::{SEED_CHUNK_BYTES, SeedDownload, SeedUpload};
-use super::{Message, Mode, Packet, Room, encode, seed_document};
+use super::{Message, Mode, Packet, Room, compatible_invitation, encode_for_protocol, seed_document};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
 const SEND_BURST: usize = 32;
@@ -21,6 +21,7 @@ pub(super) struct JoinedSeed {
 }
 
 pub(super) struct PendingJoin {
+    pub(super) protocol: RoomProtocol,
     pub(super) transport: Transport,
     pub(super) identity: Identity,
     pub(super) host: ActorId,
@@ -38,10 +39,12 @@ impl PendingJoin {
     }
 
     pub(super) fn start(invite: &str, name: &str) -> Result<Self, String> {
+        let (protocol, invite) = compatible_invitation(invite)?;
         let host = Transport::invitation_host(invite)?;
         let identity = Identity::generate();
         let transport = Transport::join_with_identity(invite, name, Identity::from_bytes(&identity.to_bytes()))?;
         Ok(Self {
+            protocol,
             transport,
             identity,
             host,
@@ -89,7 +92,7 @@ impl PendingJoin {
         if Instant::now() >= self.deadline {
             return Err("The document download timed out. Check the connection and try again.".into());
         }
-        if self.local.is_some() && !self.requested && self.transport.submit(encode(Message::RequestSeed)?).is_ok() {
+        if self.local.is_some() && !self.requested && self.transport.submit(encode_for_protocol(Message::RequestSeed, self.protocol)?).is_ok() {
             self.requested = true;
         }
         Ok(None)
@@ -97,12 +100,12 @@ impl PendingJoin {
 
     fn read_seed(&mut self, bytes: &[u8]) -> Result<Option<JoinedSeed>, String> {
         if attachments::is_part(bytes) {
-            self.blobs.append_seed(bytes, designcraft_collab::artwork::MAX_ARTWORK_BYTES, seed_document::MAX_SEED_BLOBS)?;
+            self.blobs.append_seed(bytes, designcraft_collab::artwork::MAX_ARTWORK_BYTES, seed_document::max_seed_blobs(self.protocol))?;
             self.deadline = Instant::now() + TIMEOUT;
             return Ok(None);
         }
         let Ok(packet) = serde_json::from_slice::<Packet>(bytes) else { return Ok(None) };
-        if packet.version != PROTOCOL_VERSION {
+        if packet.version != self.protocol.version() {
             return Err("This room uses a different collaboration protocol.".into());
         }
         match packet.message {
@@ -116,10 +119,13 @@ impl PendingJoin {
                 self.deadline = Instant::now() + TIMEOUT;
                 bytes
                     .map(|bytes| {
-                        let (document, missing) = if seed_document::is_preview_seed(&bytes) {
+                        let (document, missing) = if self.protocol.is_automerge() && seed_document::is_preview_seed(&bytes) {
                             seed_document::restore_preview_seed(&bytes, |id| self.blobs.load(id))?
                         } else {
-                            (seed_document::restore_bundle(&bytes, |id| self.blobs.load(id))?, seed_document::OriginalTargets::new())
+                            (
+                                seed_document::restore_bundle_for_room(&bytes, |id| self.blobs.load(id), self.protocol)?,
+                                seed_document::OriginalTargets::new(),
+                            )
                         };
                         self.blobs.finish()?;
                         Ok(JoinedSeed { document, originals: OriginalDownloads { missing, ..Default::default() } })
@@ -195,7 +201,7 @@ impl OriginalDownloads {
             return Ok(());
         }
         if let Some((&id, _)) = self.missing.first_key_value()
-            && transport.submit(encode(Message::RequestOriginal { blob: id })?).is_ok()
+            && transport.submit(encode_for_protocol(Message::RequestOriginal { blob: id }, RoomProtocol::Automerge)?).is_ok()
         {
             self.transfer = Some(OriginalTransfer { id, bytes: BlobDownload::default(), requested: Instant::now() });
         }
@@ -262,7 +268,7 @@ impl SeedDelivery {
         })
     }
 
-    pub(super) fn enqueue(&mut self, archive: &[u8], document: &Arc<Document>, recipient: ActorId) -> Result<(), String> {
+    pub(super) fn enqueue(&mut self, archive: &[u8], document: &Arc<Document>, recipient: ActorId, protocol: RoomProtocol) -> Result<(), String> {
         if self.finished.contains(&recipient) {
             return Ok(());
         }
@@ -270,7 +276,7 @@ impl SeedDelivery {
             return Err("Could not prepare the room previews.".into());
         }
         if self.upload.is_none() && self.preparing.is_none() {
-            if seed_document::use_preview_seed(document) {
+            if protocol.is_automerge() && seed_document::use_preview_seed(document) {
                 let document = document.clone();
                 let (sender, receiver) = mpsc::sync_channel(1);
                 std::thread::Builder::new()
@@ -295,7 +301,7 @@ impl SeedDelivery {
         self.originals.remove(&peer);
     }
 
-    pub(super) fn advance(&mut self, transport: &Transport, blobs: &Blobs) {
+    pub(super) fn advance(&mut self, transport: &Transport, blobs: &Blobs, protocol: RoomProtocol) {
         if let Some(preparing) = &self.preparing {
             let received = match preparing.try_recv() {
                 Ok(preview) => preview,
@@ -310,7 +316,7 @@ impl SeedDelivery {
                 }
                 Err(_) => {
                     self.failed = true;
-                    if let Ok(bytes) = encode(Message::Incompatible) {
+                    if let Ok(bytes) = encode_for_protocol(Message::Incompatible, protocol) {
                         for &peer in self.peers.keys() {
                             let _ = transport.send_to(peer, bytes.clone());
                         }
@@ -334,7 +340,7 @@ impl SeedDelivery {
             }
 
             if offset.is_none() {
-                let Ok(bytes) = encode(Message::SeedOffer(upload.advertisement())) else { return false };
+                let Ok(bytes) = encode_for_protocol(Message::SeedOffer(upload.advertisement()), protocol) else { return false };
                 if transport.send_to(peer, bytes).is_err() {
                     return true;
                 }
@@ -347,7 +353,7 @@ impl SeedDelivery {
                     return false;
                 };
                 let next = cursor.saturating_add(SEED_CHUNK_BYTES).min(upload.advertisement().length);
-                let Ok(bytes) = encode(Message::SeedPart(chunk)) else { return false };
+                let Ok(bytes) = encode_for_protocol(Message::SeedPart(chunk), protocol) else { return false };
                 if transport.send_to(peer, bytes).is_err() {
                     return true;
                 }
@@ -382,7 +388,7 @@ impl SeedDelivery {
 
 impl Room {
     pub(super) fn provide_seed(&mut self, peer: ActorId) {
-        if self.peers.contains_key(&peer) && self.seed_delivery.enqueue(&self.storage.archive, &self.storage.seed, peer).is_err() {
+        if self.peers.contains_key(&peer) && self.seed_delivery.enqueue(&self.storage.archive, &self.storage.seed, peer, self.protocol).is_err() {
             self.reply(peer, Message::Incompatible);
         }
     }

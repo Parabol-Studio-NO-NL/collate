@@ -6,10 +6,11 @@ use sha2::{Digest, Sha256};
 
 use super::attachments::{BlobCursor, Blobs};
 use super::seed::{MAX_SEED_BYTES, SEED_CHUNK_BYTES, SeedAdvertisement, SeedChunk, SeedDownload};
-use super::{Message, encode};
+use super::{Message, RoomProtocol, encode_for_protocol};
 
 pub(super) struct WireEdit {
     bytes: Vec<u8>,
+    protocol: RoomProtocol,
     offer: Option<SeedAdvertisement>,
     pub(super) blobs: Blobs,
     pub(super) artwork_size: u64,
@@ -27,12 +28,17 @@ enum SendState {
 }
 
 impl WireEdit {
+    #[cfg(test)]
     pub(super) fn new(bytes: Vec<u8>) -> Result<Self, String> {
+        Self::for_room(bytes, RoomProtocol::default())
+    }
+
+    pub(super) fn for_room(bytes: Vec<u8>, protocol: RoomProtocol) -> Result<Self, String> {
         if bytes.is_empty() || bytes.len() > MAX_SEED_BYTES {
             return Err("The shared edit has an unsupported size.".into());
         }
         let offer = (bytes.len() > MAX_PAYLOAD).then(|| SeedAdvertisement { length: bytes.len() as u32, digest: Sha256::digest(&bytes).into() });
-        Ok(Self { bytes, offer, blobs: Blobs::new(), artwork_size: 0 })
+        Ok(Self { bytes, protocol, offer, blobs: Blobs::new(), artwork_size: 0 })
     }
 
     pub(super) fn progress(&self, cursor: &SendCursor) -> Option<super::attachments::ArtworkProgress> {
@@ -55,11 +61,11 @@ impl WireEdit {
         }
         let (frame, next) = match (cursor.0, self.offer) {
             (SendState::Start, None) => (self.bytes.clone(), SendState::Finished),
-            (SendState::Start, Some(offer)) => (encode(Message::EditOffer(offer))?, SendState::Chunk(0)),
+            (SendState::Start, Some(offer)) => (encode_for_protocol(Message::EditOffer(offer), self.protocol)?, SendState::Chunk(0)),
             (SendState::Chunk(offset), Some(offer)) if offset < offer.length => {
                 let end = (offset + SEED_CHUNK_BYTES).min(offer.length);
                 let data = STANDARD_NO_PAD.encode(&self.bytes[offset as usize..end as usize]);
-                let frame = encode(Message::EditPart(SeedChunk { offset, data }))?;
+                let frame = encode_for_protocol(Message::EditPart(SeedChunk { offset, data }), self.protocol)?;
                 let next = if end == offer.length { SendState::Finished } else { SendState::Chunk(end) };
                 (frame, next)
             }

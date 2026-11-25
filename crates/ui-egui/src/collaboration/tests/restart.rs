@@ -197,6 +197,8 @@ fn save_checkpoint(root: &Path) {
     room_restart::verify_fresh_room_keeps_the_previous_room(root);
     save_artwork_checkpoint(root);
     #[cfg(feature = "automerge-rooms")]
+    super::super::storage::verify_legacy_room_protocol_fallback(root).unwrap();
+    #[cfg(feature = "automerge-rooms")]
     save_story_checkpoint(root);
     #[cfg(feature = "automerge-rooms")]
     super::optimistic::durable_guest_replays_offline_queue(root);

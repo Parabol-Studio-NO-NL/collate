@@ -16,8 +16,61 @@ mod validation;
 pub use operations::{Appearance, Change, CommentAnchor, CommentReply, CommentThread, Geometry, InitialTextFormat, Operation, ShapeFrame, SharedId};
 pub use replica::Replica;
 
-/// The room protocol must identify the exact adapter schema used by all replicas.
-pub const PROTOCOL_VERSION: u16 = if cfg!(feature = "automerge-rooms") { 17 } else { 15 };
+/// A room selects its adapter schema when it starts. Every peer uses that schema.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomProtocol {
+    Legacy,
+    Automerge,
+}
+
+impl Default for RoomProtocol {
+    fn default() -> Self {
+        Self::CURRENT
+    }
+}
+
+impl RoomProtocol {
+    pub const CURRENT: Self = if cfg!(feature = "automerge-rooms") { Self::Automerge } else { Self::Legacy };
+    const INVITATION_MARKER: &str = "collate-room-17:";
+
+    pub const fn version(self) -> u16 {
+        match self {
+            Self::Legacy => 15,
+            Self::Automerge => 17,
+        }
+    }
+
+    pub const fn is_automerge(self) -> bool {
+        matches!(self, Self::Automerge)
+    }
+
+    pub const fn is_supported(self) -> bool {
+        !self.is_automerge() || cfg!(feature = "automerge-rooms")
+    }
+
+    pub const fn history_limit(self) -> usize {
+        if self.is_automerge() { 16_384 } else { 1024 }
+    }
+
+    pub const fn history_byte_limit(self) -> usize {
+        (if self.is_automerge() { 64 } else { 8 }) * 1024 * 1024
+    }
+
+    /// Existing invites remain byte-for-byte valid for legacy rooms.
+    pub fn decorate_invitation(self, ticket: String) -> String {
+        if self.is_automerge() { format!("{}{ticket}", Self::INVITATION_MARKER) } else { ticket }
+    }
+
+    /// Split the application version from the underlying peer ticket.
+    pub fn parse_invitation(invitation: &str) -> (Self, &str) {
+        const APP_LINK: &str = "codesign-collab://join#";
+        let invitation = invitation.trim();
+        let bare = invitation.strip_prefix(APP_LINK).unwrap_or(invitation);
+        bare.strip_prefix(Self::INVITATION_MARKER).map_or((Self::Legacy, invitation), |ticket| (Self::Automerge, ticket))
+    }
+}
+
+pub const PROTOCOL_VERSION: u16 = RoomProtocol::CURRENT.version();
 pub const MAX_OPERATIONS: usize = 64;
 
 #[derive(Debug, Error, PartialEq, Eq)]

@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
 #[cfg(test)]
 use craft_image_codecs::Format;
 use craft_zip::{Archive, Compression, Limits, Writer, preflight};
+use designcraft_collab::RoomProtocol;
 use designcraft_collab::artwork::{
     BlobId, MAX_ARTWORK_BYTES, MAX_IMAGE_PIXELS, PDF_MIME, pdf_dimensions, raster_dimensions as image_dimensions, raster_format as image_format,
     valid_dimensions,
@@ -19,12 +20,11 @@ use super::{attachments::Blobs, seed::MAX_SEED_BYTES};
 
 pub(super) const MAX_MODEL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 8 * 1024 * 1024;
-const PROGRESSIVE: bool = cfg!(feature = "automerge-rooms");
-const MAX_ASSETS: usize = if PROGRESSIVE { 512 } else { 128 };
-pub(super) const MAX_SEED_BLOBS: usize = MAX_ASSETS * 2;
+const LEGACY_MAX_ASSETS: usize = 128;
+const AUTOMERGE_MAX_ASSETS: usize = 512;
 const MAX_PROXY_BYTES: u64 = 1024 * 1024;
 const MAX_PROXY_PIXELS: u64 = 1024 * 1024;
-const MAX_TOTAL_PIXELS: u64 = if PROGRESSIVE { (MAX_IMAGE_PIXELS + MAX_PROXY_PIXELS) * MAX_ASSETS as u64 } else { 32 * 1024 * 1024 };
+const LEGACY_TOTAL_PIXELS: u64 = 32 * 1024 * 1024;
 const SCREEN_PREVIEW_SIDE: u32 = 256;
 const SCREEN_PREVIEW_BYTES: usize = 64 * 1024;
 // The native File > New page size ceiling, in points (216 inches).
@@ -34,6 +34,18 @@ const INVALID: &str = "The received document bundle is invalid.";
 const TOO_LARGE: &str = "The shared document exceeds the room size limit.";
 const UNSUPPORTED_LINKS: &str = "Shared documents cannot contain linked assets, linked stories or data merges.";
 const UNSUPPORTED_ASSET: &str = "Shared documents support embedded PNG, JPEG, GIF, WebP and PDF artwork.";
+
+fn max_assets(protocol: RoomProtocol) -> usize {
+    if protocol.is_automerge() { AUTOMERGE_MAX_ASSETS } else { LEGACY_MAX_ASSETS }
+}
+
+pub(super) fn max_seed_blobs(protocol: RoomProtocol) -> usize {
+    max_assets(protocol) * 2
+}
+
+fn total_pixels(protocol: RoomProtocol) -> u64 {
+    if protocol.is_automerge() { (MAX_IMAGE_PIXELS + MAX_PROXY_PIXELS) * AUTOMERGE_MAX_ASSETS as u64 } else { LEGACY_TOTAL_PIXELS }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,12 +123,17 @@ pub(super) fn updated_story_model_size(
 /// bytes. Replacing the data, even with the same length, gets a distinct entry.
 #[derive(Default)]
 pub(super) struct Fingerprints {
+    protocol: RoomProtocol,
     digests: BTreeMap<*const Vec<u8>, (Weak<Vec<u8>>, [u8; 32])>,
     #[cfg(test)]
     pub(super) bytes_hashed: u64,
 }
 
 impl Fingerprints {
+    pub(super) fn for_room(protocol: RoomProtocol) -> Self {
+        Self { protocol, ..Self::default() }
+    }
+
     fn digest(&mut self, body: &Arc<Vec<u8>>) -> [u8; 32] {
         self.digests
             .entry(Arc::as_ptr(body))
@@ -132,19 +149,18 @@ impl Fingerprints {
 
     pub(super) fn canonical(&mut self, doc: &Document) -> Result<[u8; 32], String> {
         let mut canonical = doc.clone();
+        let automerge = self.protocol.is_automerge();
         canonical.compact_assets_with_hash(|asset| {
-            asset
-                .data
-                .shared_reference()
-                .map(|(digest, _)| digest)
+            let declared = if automerge { asset.data.shared_reference().map(|(digest, _)| digest) } else { None };
+            declared
                 .or_else(|| asset.data.embedded_bytes().map(|body| self.digest(body)))
                 .map_or(asset.data.key().0, |digest| u64::from_be_bytes(std::array::from_fn(|i| digest[i])))
         });
         self.fingerprint(&canonical)
     }
 
-    fn fingerprint(&mut self, doc: &Document) -> Result<[u8; 32], String> {
-        validate_model(doc)?;
+    pub(super) fn fingerprint(&mut self, doc: &Document) -> Result<[u8; 32], String> {
+        validate_model(doc, self.protocol)?;
         let mut normalized = doc.clone();
         normalized.created = 0;
         normalized.modified = 0;
@@ -154,7 +170,7 @@ impl Fingerprints {
         fingerprint.update(b"CoDesign native seed\0");
         fingerprint.update((model.len() as u64).to_be_bytes());
         fingerprint.update(model);
-        if PROGRESSIVE && doc.assets.values().any(|asset| asset.data.shared_original_pending()) {
+        if self.protocol.is_automerge() && doc.assets.values().any(|asset| asset.data.shared_original_pending()) {
             if artwork_size(doc) > MAX_ARTWORK_BYTES as u64 {
                 return Err(TOO_LARGE.into());
             }
@@ -177,7 +193,7 @@ impl Fingerprints {
                 }
             }
         } else {
-            for (name, data) in payloads(doc, false)? {
+            for (name, data) in payloads(doc, false, self.protocol)? {
                 add_fingerprint_member(&mut fingerprint, &name, self.digest(data));
             }
         }
@@ -238,7 +254,7 @@ pub(super) struct PreviewSeed {
 }
 
 pub(super) fn use_preview_seed(doc: &Document) -> bool {
-    PROGRESSIVE && doc.assets.values().any(|asset| asset.mime != PDF_MIME && asset.data.len() > SCREEN_PREVIEW_BYTES as u64)
+    doc.assets.values().any(|asset| asset.mime != PDF_MIME && asset.data.len() > SCREEN_PREVIEW_BYTES as u64)
 }
 
 pub(super) fn is_preview_seed(bytes: &[u8]) -> bool {
@@ -258,8 +274,8 @@ pub(super) fn artwork_size(doc: &Document) -> u64 {
 /// Network-only seed. The ordinary native file and encrypted journal keep their
 /// complete artwork and never serialize these preview-only handles.
 pub(super) fn preview_seed(doc: &Document) -> Result<PreviewSeed, String> {
-    validate_model(doc)?;
-    payloads(doc, false)?;
+    validate_model(doc, RoomProtocol::Automerge)?;
+    payloads(doc, false, RoomProtocol::Automerge)?;
     let mut eager = Blobs::new();
     let mut originals = Blobs::new();
     let mut members = BTreeMap::new();
@@ -304,12 +320,12 @@ pub(super) fn restore_preview_seed(
     bytes: &[u8],
     mut load: impl FnMut(BlobId) -> Result<Arc<Vec<u8>>, String>,
 ) -> Result<(Document, OriginalTargets), String> {
-    if !PROGRESSIVE || bytes.len() > MAX_SEED_BYTES {
+    if bytes.len() > MAX_SEED_BYTES {
         return Err(INVALID.into());
     }
     let manifest = bytes.strip_prefix(PREVIEW_MAGIC).ok_or(INVALID)?;
     let PreviewManifest { mut document, members }: PreviewManifest<Document> = serde_json::from_slice(manifest).map_err(|_| INVALID)?;
-    validate_model(&document)?;
+    validate_model(&document, RoomProtocol::Automerge)?;
     if document.assets.len() != members.len() {
         return Err(INVALID.into());
     }
@@ -375,16 +391,21 @@ pub(super) fn verify_original(asset: &Asset, bytes: &[u8]) -> Result<(), String>
     original_dimensions(asset, bytes, MAX_IMAGE_PIXELS, true).map(|_| ())
 }
 
+#[cfg(test)]
 pub(super) fn bundle(doc: &Document) -> Result<(Vec<u8>, Blobs), String> {
+    bundle_for_room(doc, RoomProtocol::default())
+}
+
+pub(super) fn bundle_for_room(doc: &Document, protocol: RoomProtocol) -> Result<(Vec<u8>, Blobs), String> {
     let size = artwork_size(doc);
     if size <= (MAX_SEED_BYTES / 2) as u64 {
-        return Ok((encode(doc)?, Blobs::new()));
+        return Ok((encode_for_room(doc, protocol)?, Blobs::new()));
     }
     if size > MAX_ARTWORK_BYTES as u64 {
         return Err(TOO_LARGE.into());
     }
-    validate_model(doc)?;
-    payloads(doc, !PROGRESSIVE)?;
+    validate_model(doc, protocol)?;
+    payloads(doc, !protocol.is_automerge(), protocol)?;
     let mut blobs = Blobs::new();
     let mut identify = |data: &AssetData| -> Result<BlobId, String> {
         let body = data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
@@ -401,15 +422,24 @@ pub(super) fn bundle(doc: &Document) -> Result<(Vec<u8>, Blobs), String> {
     Ok((output.0, blobs))
 }
 
+#[cfg(test)]
+pub(super) fn restore_bundle(bytes: &[u8], load: impl FnMut(BlobId) -> Result<Arc<Vec<u8>>, String>) -> Result<Document, String> {
+    restore_bundle_for_room(bytes, load, RoomProtocol::default())
+}
+
 /// The loader must authenticate the supplied digest. Reject all metadata and length
 /// violations before opening any files or allocating memory for artwork.
-pub(super) fn restore_bundle(bytes: &[u8], mut load: impl FnMut(BlobId) -> Result<Arc<Vec<u8>>, String>) -> Result<Document, String> {
+pub(super) fn restore_bundle_for_room(
+    bytes: &[u8],
+    mut load: impl FnMut(BlobId) -> Result<Arc<Vec<u8>>, String>,
+    protocol: RoomProtocol,
+) -> Result<Document, String> {
     if bytes.len() > MAX_SEED_BYTES {
         return Err(TOO_LARGE.into());
     }
-    let Some(manifest) = bytes.strip_prefix(BUNDLE_MAGIC) else { return decode(bytes) };
+    let Some(manifest) = bytes.strip_prefix(BUNDLE_MAGIC) else { return decode_for_room(bytes, protocol) };
     let Manifest { mut document, members }: Manifest<Document> = serde_json::from_slice(manifest).map_err(|_| INVALID)?;
-    validate_model(&document)?;
+    validate_model(&document, protocol)?;
     if document.assets.len() != members.len() {
         return Err(INVALID.into());
     }
@@ -442,13 +472,18 @@ pub(super) fn restore_bundle(bytes: &[u8], mut load: impl FnMut(BlobId) -> Resul
             proxy.data = resolve(preview)?;
         }
     }
-    payloads(&document, true)?;
+    payloads(&document, true, protocol)?;
     Ok(document)
 }
 
+#[cfg(test)]
 pub(super) fn encode(doc: &Document) -> Result<Vec<u8>, String> {
-    validate_model(doc)?;
-    let payloads = payloads(doc, true)?;
+    encode_for_room(doc, RoomProtocol::default())
+}
+
+fn encode_for_room(doc: &Document, protocol: RoomProtocol) -> Result<Vec<u8>, String> {
+    validate_model(doc, protocol)?;
+    let payloads = payloads(doc, true, protocol)?;
     let model = model_bytes(doc)?;
     let metadata = serde_json::to_vec(&serde_json::json!({
         "format": "designcraft",
@@ -475,11 +510,16 @@ pub(super) fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub(super) fn decode(bytes: &[u8]) -> Result<Document, String> {
+    decode_for_room(bytes, RoomProtocol::default())
+}
+
+fn decode_for_room(bytes: &[u8], protocol: RoomProtocol) -> Result<Document, String> {
     if bytes.is_empty() || bytes.len() > MAX_SEED_BYTES {
         return Err(TOO_LARGE.into());
     }
-    let max_entries = (NATIVE_MEMBERS.len() + 2 * MAX_ASSETS) as u64;
+    let max_entries = (NATIVE_MEMBERS.len() + max_seed_blobs(protocol)) as u64;
     let directory = preflight::preflight(bytes, preflight::Limits { max_entries, max_central_directory_bytes: 128 * 1024, max_name_bytes: 80 })
         .map_err(|_| INVALID)?;
     let mut archive = Archive::open(bytes, Limits { max_entries, max_total_bytes: MAX_EXPANDED_BYTES }).map_err(|_| INVALID)?;
@@ -490,7 +530,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Document, String> {
 
     let model = member(&mut archive, "document.json", MAX_MODEL_BYTES as u64)?;
     let mut doc: Document = serde_json::from_slice(&model).map_err(|_| INVALID)?;
-    validate_model(&doc)?;
+    validate_model(&doc, protocol)?;
     let mut expected: BTreeSet<_> = NATIVE_MEMBERS.into_iter().map(str::to_owned).collect();
     for asset in doc.assets.values() {
         expected.insert(asset_name("assets", asset.id.0, &asset.mime)?);
@@ -511,7 +551,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Document, String> {
             proxy.data = AssetData::embedded(member(&mut archive, &name, MAX_PROXY_BYTES)?);
         }
     }
-    payloads(&doc, true)?;
+    payloads(&doc, true, protocol)?;
     Ok(doc)
 }
 
@@ -565,8 +605,8 @@ pub(super) fn prepare_local_copy(doc: &mut Document) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_model(doc: &Document) -> Result<(), String> {
-    if doc.assets.len() > MAX_ASSETS {
+fn validate_model(doc: &Document, protocol: RoomProtocol) -> Result<(), String> {
+    if doc.assets.len() > max_assets(protocol) {
         return Err(TOO_LARGE.into());
     }
     if !valid_layout(doc)
@@ -669,18 +709,19 @@ fn check_proxy(proxy: &Proxy, limit: u64, verify: bool) -> Result<&Arc<Vec<u8>>,
     Ok(bytes)
 }
 
-fn payloads(doc: &Document, verify_image_body: bool) -> Result<Vec<(String, &Arc<Vec<u8>>)>, String> {
+fn payloads(doc: &Document, verify_image_body: bool, protocol: RoomProtocol) -> Result<Vec<(String, &Arc<Vec<u8>>)>, String> {
     let mut entries = Vec::new();
     let mut pixels = 0u64;
+    let total_pixels = total_pixels(protocol);
     for asset in doc.assets.values() {
         let data = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
-        let remaining = MAX_IMAGE_PIXELS.min(MAX_TOTAL_PIXELS - pixels);
+        let remaining = MAX_IMAGE_PIXELS.min(total_pixels - pixels);
         let dimensions = original_dimensions(asset, data, remaining, verify_image_body)?;
         pixels += u64::from(dimensions.0) * u64::from(dimensions.1);
         entries.push((asset_name("assets", asset.id.0, &asset.mime)?, data));
 
         if let Some(proxy) = &asset.proxy {
-            let data = check_proxy(proxy, MAX_PROXY_PIXELS.min(MAX_TOTAL_PIXELS - pixels), verify_image_body)?;
+            let data = check_proxy(proxy, MAX_PROXY_PIXELS.min(total_pixels - pixels), verify_image_body)?;
             pixels += u64::from(proxy.pixels.0) * u64::from(proxy.pixels.1);
             entries.push((asset_name("proxies", asset.id.0, &proxy.mime)?, data));
         }
@@ -691,14 +732,14 @@ fn payloads(doc: &Document, verify_image_body: bool) -> Result<Vec<(String, &Arc
     Ok(entries)
 }
 
-pub(super) fn check_artwork(doc: &Document) -> Result<(), String> {
-    if doc.assets.len() > MAX_ASSETS {
+pub(super) fn check_artwork_for_room(doc: &Document, protocol: RoomProtocol) -> Result<(), String> {
+    if doc.assets.len() > max_assets(protocol) {
         return Err(TOO_LARGE.into());
     }
-    if PROGRESSIVE && doc.assets.values().any(|asset| asset.data.shared_original_pending()) {
-        Fingerprints::default().fingerprint(doc).map(|_| ())
+    if protocol.is_automerge() && doc.assets.values().any(|asset| asset.data.shared_original_pending()) {
+        Fingerprints::for_room(protocol).fingerprint(doc).map(|_| ())
     } else {
-        payloads(doc, false).map(|_| ())
+        payloads(doc, false, protocol).map(|_| ())
     }
 }
 
@@ -761,6 +802,64 @@ mod tests {
         MAX_EXPANDED_BYTES, MAX_MODEL_BYTES, MAX_SEED_BYTES, UNSUPPORTED_LINKS, decode, embedded_image_fixture, encode, fingerprint, model_bytes,
         test_png,
     };
+
+    #[test]
+    fn a_legacy_room_keeps_its_seed_asset_limit_in_any_build() {
+        use super::{LEGACY_MAX_ASSETS, RoomProtocol, bundle_for_room, check_artwork_for_room, restore_bundle_for_room};
+
+        let (mut book, original, _) = embedded_image_fixture();
+        let template = (*book.assets[&original]).clone();
+        for _ in 0..LEGACY_MAX_ASSETS {
+            let id = AssetId(book.alloc());
+            book.assets.insert(id, Arc::new(designcraft_doc::Asset { id, ..template.clone() }));
+        }
+        assert!(check_artwork_for_room(&book, RoomProtocol::Legacy).is_err());
+        assert!(bundle_for_room(&book, RoomProtocol::Legacy).is_err());
+
+        check_artwork_for_room(&book, RoomProtocol::Automerge).unwrap();
+        let (archive, blobs) = bundle_for_room(&book, RoomProtocol::Automerge).unwrap();
+        let load = |id| Ok(blobs[&id].clone());
+        assert!(restore_bundle_for_room(&archive, load, RoomProtocol::Legacy).is_err());
+        assert_eq!(restore_bundle_for_room(&archive, load, RoomProtocol::Automerge).unwrap(), book);
+    }
+
+    #[test]
+    fn loaded_seeds_have_the_same_canonical_identity_for_both_room_protocols() {
+        use super::{Fingerprints, RoomProtocol};
+
+        let (seed, _, _) = embedded_image_fixture();
+        let original = Fingerprints::for_room(RoomProtocol::Legacy).canonical(&seed).unwrap();
+        assert_eq!(Fingerprints::for_room(RoomProtocol::Automerge).canonical(&seed).unwrap(), original);
+    }
+
+    #[test]
+    fn a_legacy_room_retains_its_aggregate_pixel_limit_below_the_asset_count_limit() {
+        use designcraft_doc::{Document, build::NewDocument};
+        use designcraft_engine::{DocState, Session};
+
+        use super::{PDF_MIME, RoomProtocol, check_artwork_for_room};
+
+        // Vector pages give large nominal pixel dimensions without allocating a large raster.
+        let mut source = Session::new();
+        let page = Document::new(&NewDocument { width: 4096.0, height: 4096.0, ..Default::default() });
+        source.add_document(DocState::new(page, None));
+        let pdf = source.execute("file.exportPdf", &serde_json::json!({})).unwrap();
+        let bytes = designcraft_engine::cmd::base64_decode(pdf["base64"].as_str().unwrap());
+
+        let (mut book, original, _) = embedded_image_fixture();
+        let asset = Arc::make_mut(book.assets.get_mut(&original).unwrap());
+        asset.mime = PDF_MIME.into();
+        asset.pixels = None;
+        asset.data = AssetData::embedded(bytes);
+        let asset = asset.clone();
+        check_artwork_for_room(&book, RoomProtocol::Legacy).unwrap();
+        for _ in 0..2 {
+            let id = AssetId(book.alloc());
+            book.assets.insert(id, Arc::new(designcraft_doc::Asset { id, ..asset.clone() }));
+        }
+        assert!(check_artwork_for_room(&book, RoomProtocol::Legacy).is_err());
+        check_artwork_for_room(&book, RoomProtocol::Automerge).unwrap();
+    }
 
     #[test]
     fn text_only_model_accounting_matches_the_native_document_size() {

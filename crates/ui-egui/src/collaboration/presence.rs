@@ -9,7 +9,7 @@ use egui::{Color32, Rect, Stroke, StrokeKind};
 use serde::{Deserialize, Serialize};
 use web_time::Instant;
 
-use super::{Message, Mode, encode};
+use super::{Message, Mode, encode_for_protocol};
 use crate::{DesignApp, canvas::Xf};
 
 const INTERVAL: Duration = Duration::from_millis(85);
@@ -64,7 +64,7 @@ impl DesignApp {
             if matches!(room.mode, Mode::Host { .. }) {
                 room.relay_presence(local.actor, state);
             } else if matches!(room.mode, Mode::Guest { ready: true, .. })
-                && let Ok(bytes) = encode(Message::Presence { actor: local.actor, state })
+                && let Ok(bytes) = encode_for_protocol(Message::Presence { actor: local.actor, state }, room.protocol)
             {
                 let _ = room.transport.submit(bytes);
             }

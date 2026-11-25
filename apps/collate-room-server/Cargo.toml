@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Always-on peer for one Collate document"
 
+[features]
+automerge-rooms = ["designcraft-ui-egui/automerge-rooms"]
+
 [lints]
 workspace = true
 
