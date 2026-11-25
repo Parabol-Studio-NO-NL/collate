@@ -49,7 +49,12 @@ impl Sender {
         }
     }
 
-    pub(super) fn advance(&mut self, pending: &VecDeque<Proposal>, mut send: impl FnMut(Vec<u8>) -> Result<(), String>) -> Result<(), String> {
+    pub(super) fn advance(
+        &mut self,
+        pending: &VecDeque<Proposal>,
+        protocol: RoomProtocol,
+        mut send: impl FnMut(Vec<u8>) -> Result<(), String>,
+    ) -> Result<(), String> {
         let Some(front) = pending.front() else { return Ok(()) };
         if self.active.as_ref().is_some_and(|(sequence, _, _)| *sequence < front.sequence) {
             // A delayed acknowledgement arrived during a redundant resend. The receiver
@@ -71,7 +76,7 @@ impl Sender {
                 {
                     break;
                 }
-                let wire = encode_edit_for_protocol(Message::Propose(proposal.clone()), RoomProtocol::Automerge)?;
+                let wire = encode_edit_for_protocol(Message::Propose(proposal.clone()), protocol)?;
                 self.active = Some((proposal.sequence, wire, SendCursor::default()));
             }
             let Some((sequence, wire, cursor)) = &mut self.active else { break };

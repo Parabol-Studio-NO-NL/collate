@@ -21,6 +21,7 @@ pub use replica::Replica;
 pub enum RoomProtocol {
     Legacy,
     Automerge,
+    AutomergeArtwork,
 }
 
 impl Default for RoomProtocol {
@@ -30,18 +31,24 @@ impl Default for RoomProtocol {
 }
 
 impl RoomProtocol {
-    pub const CURRENT: Self = if cfg!(feature = "automerge-rooms") { Self::Automerge } else { Self::Legacy };
-    const INVITATION_MARKER: &str = "collate-room-17:";
+    pub const CURRENT: Self = if cfg!(feature = "automerge-rooms") { Self::AutomergeArtwork } else { Self::Legacy };
+    const AUTOMERGE_INVITATION: &str = "collate-room-17:";
+    const ARTWORK_INVITATION: &str = "collate-room-18:";
 
     pub const fn version(self) -> u16 {
         match self {
             Self::Legacy => 15,
             Self::Automerge => 17,
+            Self::AutomergeArtwork => 18,
         }
     }
 
     pub const fn is_automerge(self) -> bool {
-        matches!(self, Self::Automerge)
+        matches!(self, Self::Automerge | Self::AutomergeArtwork)
+    }
+
+    pub const fn supports_print_artwork(self) -> bool {
+        matches!(self, Self::AutomergeArtwork)
     }
 
     pub const fn is_supported(self) -> bool {
@@ -58,7 +65,11 @@ impl RoomProtocol {
 
     /// Existing invites remain byte-for-byte valid for legacy rooms.
     pub fn decorate_invitation(self, ticket: String) -> String {
-        if self.is_automerge() { format!("{}{ticket}", Self::INVITATION_MARKER) } else { ticket }
+        match self {
+            Self::Legacy => ticket,
+            Self::Automerge => format!("{}{ticket}", Self::AUTOMERGE_INVITATION),
+            Self::AutomergeArtwork => format!("{}{ticket}", Self::ARTWORK_INVITATION),
+        }
     }
 
     /// Split the application version from the underlying peer ticket.
@@ -66,7 +77,13 @@ impl RoomProtocol {
         const APP_LINK: &str = "codesign-collab://join#";
         let invitation = invitation.trim();
         let bare = invitation.strip_prefix(APP_LINK).unwrap_or(invitation);
-        bare.strip_prefix(Self::INVITATION_MARKER).map_or((Self::Legacy, invitation), |ticket| (Self::Automerge, ticket))
+        if let Some(ticket) = bare.strip_prefix(Self::ARTWORK_INVITATION) {
+            (Self::AutomergeArtwork, ticket)
+        } else if let Some(ticket) = bare.strip_prefix(Self::AUTOMERGE_INVITATION) {
+            (Self::Automerge, ticket)
+        } else {
+            (Self::Legacy, invitation)
+        }
     }
 }
 
@@ -79,6 +96,8 @@ pub enum Error {
     UnsupportedEdit,
     #[error("This type of object cannot be edited in a shared document yet.")]
     UnsupportedObject,
+    #[error("Start a new room to share PSD or TIFF artwork.")]
+    ArtworkNeedsNewRoom,
     #[error("The shared object is no longer available.")]
     UnknownObject,
     #[error("The shared edit points to a missing document resource.")]

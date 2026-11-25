@@ -29,6 +29,7 @@ impl Header {
         match self.version {
             1 => Ok(RoomProtocol::Legacy),
             2 if RoomProtocol::Automerge.is_supported() => Ok(RoomProtocol::Automerge),
+            3 if RoomProtocol::AutomergeArtwork.is_supported() => Ok(RoomProtocol::AutomergeArtwork),
             _ => Err("Unsupported room data version.".into()),
         }
     }
@@ -166,7 +167,11 @@ pub fn init(files: Arc<dyn RoomFiles>, mut doc: Document) -> Result<(), String> 
     let protocol = RoomProtocol::default();
     let (bytes, blobs) = seed_document::bundle_for_room(&doc, protocol)?;
     let header = Header {
-        version: if protocol.is_automerge() { 2 } else { 1 },
+        version: match protocol {
+            RoomProtocol::Legacy => 1,
+            RoomProtocol::Automerge => 2,
+            RoomProtocol::AutomergeArtwork => 3,
+        },
         seed: seed_document::Fingerprints::for_room(protocol).fingerprint(&doc)?,
         identity: Identity::generate().to_bytes(),
         access: Identity::generate().to_bytes(),

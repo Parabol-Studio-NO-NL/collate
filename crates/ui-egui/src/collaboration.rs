@@ -714,7 +714,7 @@ impl Room {
         }
         let (Mode::Guest { ready: true, .. }, Some(pending)) = (&self.mode, self.pending.front()) else { return };
         if pending.story_transaction.is_some() {
-            if let Err(error) = self.story_sender.advance(&self.pending, |frame| self.transport.submit(frame)) {
+            if let Err(error) = self.story_sender.advance(&self.pending, self.protocol, |frame| self.transport.submit(frame)) {
                 self.stop_with_error(&error);
             }
             return;

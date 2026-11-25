@@ -43,7 +43,7 @@ fn the_same_build_joins_legacy_and_automerge_rooms() {
     use super::super::{Message, OpenRoom, Packet};
 
     let seed = Document::new(&NewDocument::default());
-    for protocol in [RoomProtocol::Legacy, RoomProtocol::Automerge] {
+    for protocol in [RoomProtocol::Legacy, RoomProtocol::Automerge, RoomProtocol::AutomergeArtwork] {
         let mut host = editor(&seed, "Host");
         let created = host.run("frame.create", json!({"rect":[30,40,280,180],"content":"text","text":"Proof"})).unwrap();
         let story = StoryId(created["story"].as_u64().unwrap());
