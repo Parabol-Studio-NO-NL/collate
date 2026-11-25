@@ -25,7 +25,7 @@ pub use paragraph::ParagraphFormatChange;
 /// Includes deleted anchors. Resetting the allowance requires a new seed and room epoch.
 pub const MAX_STORY_ATOMS: usize = 16_384;
 pub const MAX_EDIT_ATOMS: usize = 512;
-const MAX_BATCH_ATOMS: usize = 1_024;
+const MAX_BATCH_ATOMS: usize = MAX_STORY_ATOMS;
 const MAX_STORY_BATCHES: usize = 1_024;
 const MAX_FORMAT_NAME_BYTES: usize = 128;
 
