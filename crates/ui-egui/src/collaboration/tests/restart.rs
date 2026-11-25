@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
+#[path = "room_restart.rs"]
+mod room_restart;
+
 const CHILD_ROOT: &str = "COLLATE_TEST_ROOM_RESTART_ROOT";
 const COMMENT: &str = "Check the recovered cover frame.";
 
@@ -99,6 +102,7 @@ fn restore_artwork_checkpoint(root: &Path) {
 
 /// Stage exactly one outbox entry, without polling the host or delivering the guest's edit.
 fn save_checkpoint(root: &Path) {
+    room_restart::verify_fresh_room_keeps_the_previous_room(root);
     save_artwork_checkpoint(root);
     let seed = Document::new(&NewDocument::default());
     let mut initial = editor(&seed, "Fixture");

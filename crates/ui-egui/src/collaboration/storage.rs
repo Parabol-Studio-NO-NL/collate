@@ -52,12 +52,27 @@ pub(super) struct Storage {
     durable: Option<Durable>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum OpenRoom {
+    Active,
+    NewHost([u8; 32]),
+    SavedHost(Option<[u8; 32]>),
+}
+
 #[cfg(target_os = "macos")]
 struct Durable {
     journal: Journal,
     record: RecordId,
     _lease: RecordLock,
     stored: std::cell::RefCell<std::collections::BTreeSet<BlobId>>,
+    hosts: Option<HostRooms>,
+}
+
+#[cfg(target_os = "macos")]
+struct HostRooms {
+    index: RecordId,
+    records: Vec<[u8; 32]>,
+    staged: bool,
 }
 
 impl Storage {
@@ -79,14 +94,32 @@ impl Storage {
         document_path: Option<&str>,
         document: &Document,
         guest_of: Option<ActorId>,
+        room: OpenRoom,
     ) -> Result<(Self, SavedRoom), String> {
         #[cfg(target_os = "macos")]
-        let durable = match (recovery_dir.and_then(Path::parent), document_path) {
+        let mut durable = match (recovery_dir.and_then(Path::parent), document_path) {
             (Some(root), Some(path)) => Some(Durable::new(root, path, guest_of)?),
             _ => None,
         };
         #[cfg(not(target_os = "macos"))]
         let _ = (recovery_dir, document_path, guest_of);
+
+        let identity = Identity::generate();
+        match room {
+            OpenRoom::Active => {}
+            OpenRoom::NewHost(previous) => {
+                #[cfg(target_os = "macos")]
+                durable.as_mut().ok_or("No collaboration recovery directory is configured.")?.stage_host(previous, identity.actor())?;
+                #[cfg(not(target_os = "macos"))]
+                return Err(unavailable_host_record(previous));
+            }
+            OpenRoom::SavedHost(previous) => {
+                #[cfg(target_os = "macos")]
+                durable.as_mut().ok_or("No collaboration recovery directory is configured.")?.select_saved_host(previous)?;
+                #[cfg(not(target_os = "macos"))]
+                return Err(unavailable_host_record(previous));
+            }
+        }
 
         #[cfg(target_os = "macos")]
         let existing = match durable.as_ref() {
@@ -96,6 +129,16 @@ impl Storage {
         #[cfg(not(target_os = "macos"))]
         let existing: Option<Vec<u8>> = None;
 
+        #[cfg(target_os = "macos")]
+        if existing.is_none()
+            && matches!(room, OpenRoom::Active)
+            && durable.as_ref().and_then(|durable| durable.hosts.as_ref()).is_some_and(|hosts| hosts.records.len() > 1)
+        {
+            return Err("The active room is missing from local recovery.".into());
+        }
+        if existing.is_none() && matches!(room, OpenRoom::SavedHost(_)) {
+            return Err("There is no saved room for this document.".into());
+        }
         let mut saved = if let Some(bytes) = existing {
             let saved: SavedRoom = serde_json::from_slice(&bytes).map_err(|_| "The local collaboration journal could not be read.")?;
             if saved.version != JOURNAL_VERSION || saved.next_sequence == 0 || saved.confirmed.len() > super::MAX_HISTORY {
@@ -107,7 +150,7 @@ impl Storage {
             seed.compact_assets();
             SavedRoom {
                 version: JOURNAL_VERSION,
-                identity: Identity::generate().to_bytes(),
+                identity: identity.to_bytes(),
                 seed: SavedSeed::Model(Box::new(seed)),
                 next_sequence: 1,
                 confirmed: Vec::new(),
@@ -200,6 +243,29 @@ impl Storage {
         false
     }
 
+    pub(super) fn host_room_id(&self) -> Option<[u8; 32]> {
+        #[cfg(target_os = "macos")]
+        return self.durable.as_ref().filter(|durable| durable.hosts.is_some()).map(|durable| durable.record.room);
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+
+    pub(super) fn activate(&mut self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if let Some(durable) = self.durable.as_ref()
+            && let Some(hosts) = &durable.hosts
+            && hosts.staged
+        {
+            self.write(std::iter::empty(), None, 1)?;
+            let records: Vec<_> = hosts.records.iter().flatten().copied().collect();
+            durable.journal.store(hosts.index, &records).map_err(|error| error.to_string())?;
+            if let Some(hosts) = self.durable.as_mut().and_then(|durable| durable.hosts.as_mut()) {
+                hosts.staged = false;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn write<'a>(
         &self,
         confirmed: impl Iterator<Item = &'a Commit>,
@@ -242,11 +308,71 @@ impl Durable {
         if let Some(host) = guest_of {
             hash.update(host.0);
         }
-        let record = RecordId { room: hash.finalize().into(), role: if guest_of.is_some() { Role::Guest } else { Role::Host } };
+        let path_record = RecordId { room: hash.finalize().into(), role: if guest_of.is_some() { Role::Guest } else { Role::Host } };
         let journal = Journal::new(root.join("Collaboration"));
-        let lease = journal.lock(record).map_err(|error| error.to_string())?;
-        Ok(Self { journal, record, _lease: lease, stored: Default::default() })
+        // All host versions of the path share the existing writer lease. The
+        // pointer and replacement can only be changed while that lease is held.
+        let lease = journal.lock(path_record).map_err(|error| error.to_string())?;
+        let mut record = path_record;
+        let hosts = if path_record.role == Role::Host {
+            let index = host_record(b"Collate host room index v1", path_record.room, &[]);
+            let records = if let Some(bytes) = journal.load(index).map_err(|error| error.to_string())? {
+                let (records, remaining) = bytes.as_chunks::<32>();
+                if !remaining.is_empty() || records.first() != Some(&path_record.room) || records.len() < 2 {
+                    return Err("The saved room index is invalid.".into());
+                }
+                records.to_vec()
+            } else {
+                vec![path_record.room]
+            };
+            record.room = *records.last().ok_or("The saved room index is invalid.")?;
+            Some(HostRooms { index, records, staged: false })
+        } else {
+            None
+        };
+        Ok(Self { journal, record, _lease: lease, stored: Default::default(), hosts })
     }
+
+    fn stage_host(&mut self, previous: [u8; 32], actor: ActorId) -> Result<(), String> {
+        let hosts = self.hosts.as_mut().ok_or("Only the host can start a new room.")?;
+        if previous != self.record.room {
+            return Err("The saved room changed. Select Start sharing again to check this version.".into());
+        }
+        self.record = host_record(b"Collate host room version v1", hosts.index.room, &actor.0);
+        if hosts.records.contains(&self.record.room) || self.journal.load(self.record).map_err(|error| error.to_string())?.is_some() {
+            return Err("Could not create a new room identity. Try starting a new room again.".into());
+        }
+        hosts.records.push(self.record.room);
+        hosts.staged = true;
+        Ok(())
+    }
+
+    fn select_saved_host(&mut self, requested: Option<[u8; 32]>) -> Result<(), String> {
+        let hosts = self.hosts.as_ref().ok_or("Only the host can recover a saved room.")?;
+        if let Some(id) = requested {
+            if !hosts.records.contains(&id) {
+                return Err("The saved room is unavailable.".into());
+            }
+            self.record.room = id;
+        } else if let Some(previous) = hosts.records.iter().rev().nth(1) {
+            self.record.room = *previous;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_record(domain: &[u8], seed: [u8; 32], identity: &[u8]) -> RecordId {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update(seed);
+    hash.update(identity);
+    RecordId { room: hash.finalize().into(), role: Role::Host }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unavailable_host_record(_: impl Sized) -> String {
+    "Saved rooms are unavailable on this platform.".into()
 }
 
 #[cfg(not(target_os = "macos"))]

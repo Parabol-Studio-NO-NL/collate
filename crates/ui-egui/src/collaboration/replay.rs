@@ -11,13 +11,39 @@ pub(super) struct RoomReplay {
     pub(super) history_bytes: usize,
 }
 
-pub(super) fn restore(seed: &Document, opened: &Document, confirmed: Vec<Commit>) -> Result<RoomReplay, String> {
-    restore_cached(seed, opened, confirmed, &mut Fingerprints::default())
+#[derive(Debug)]
+pub(super) enum RestoreIssue {
+    Diverged(&'static str),
+    Other(String),
 }
 
-pub(super) fn restore_cached(seed: &Document, opened: &Document, confirmed: Vec<Commit>, cache: &mut Fingerprints) -> Result<RoomReplay, String> {
+impl RestoreIssue {
+    pub(super) fn into_message(self) -> String {
+        match self {
+            Self::Diverged(message) => message.into(),
+            Self::Other(message) => message,
+        }
+    }
+}
+
+impl From<String> for RestoreIssue {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+pub(super) fn restore(seed: &Document, opened: &Document, confirmed: Vec<Commit>) -> Result<RoomReplay, String> {
+    restore_cached(seed, opened, confirmed, &mut Fingerprints::default()).map_err(RestoreIssue::into_message)
+}
+
+pub(super) fn restore_cached(
+    seed: &Document,
+    opened: &Document,
+    confirmed: Vec<Commit>,
+    cache: &mut Fingerprints,
+) -> Result<RoomReplay, RestoreIssue> {
     if opened.created != seed.created {
-        return Err("The saved document is from a different room copy. Open the original file to resume.".into());
+        return Err(RestoreIssue::Diverged("The saved document is from a different room copy. Open the original file to resume."));
     }
     let opened_fingerprint = cache.canonical(opened)?;
     let mut found_opened = cache.canonical(seed)? == opened_fingerprint;
@@ -29,13 +55,13 @@ pub(super) fn restore_cached(seed: &Document, opened: &Document, confirmed: Vec<
     let mut artwork_size = super::seed_document::artwork_size(seed);
     for commit in confirmed {
         if commit.revision != history.len() as u64 + 1 {
-            return Err("The local collaboration journal has a missing revision.".into());
+            return Err(RestoreIssue::Other("The local collaboration journal has a missing revision.".into()));
         }
         let bytes = encode_edit(Message::Commit(commit.clone()))?;
         history_bytes += bytes.len();
         artwork_size += bytes.artwork_size;
         if history_bytes > MAX_HISTORY_BYTES || artwork_size > designcraft_collab::artwork::MAX_ARTWORK_BYTES as u64 {
-            return Err("The local collaboration journal exceeds its history limit.".into());
+            return Err(RestoreIssue::Other("The local collaboration journal exceeds its history limit.".into()));
         }
         let edits = &commit.proposal.edits;
         super::history::verify_text_compensation(&commit, history.iter().map(|(original, _)| original), &inverses)?;
@@ -48,7 +74,7 @@ pub(super) fn restore_cached(seed: &Document, opened: &Document, confirmed: Vec<
         history.push((commit, bytes));
     }
     if !found_opened {
-        return Err("The saved document has changes outside this room. Open a room copy to resume.".into());
+        return Err(RestoreIssue::Diverged("The saved document has changes outside this room. Open a room copy to resume."));
     }
     // Save can update local file metadata without changing the room revision.
     document.modified = opened.modified;

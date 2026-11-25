@@ -32,7 +32,7 @@ use self::{
     join::{PendingJoin, SeedDelivery},
     presence::Presence,
     seed::{SeedAdvertisement, SeedChunk, SeedDownload},
-    storage::Storage,
+    storage::{OpenRoom, Storage},
 };
 use crate::DesignApp;
 
@@ -174,6 +174,20 @@ struct CommentDraft {
     needs_text_selection: bool,
 }
 
+struct RoomConflict {
+    doc_uid: u64,
+    revision: u64,
+    path: String,
+    previous: [u8; 32],
+    focus_start: bool,
+}
+
+impl RoomConflict {
+    fn applies(&self, session: &Session) -> bool {
+        session.active().is_some_and(|state| state.uid == self.doc_uid && state.revision == self.revision && state.path.as_ref() == Some(&self.path))
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Collaboration {
     pub(crate) open: bool,
@@ -183,6 +197,7 @@ pub(crate) struct Collaboration {
     room: Option<Room>,
     joining: Option<PendingJoin>,
     message: Option<String>,
+    room_conflict: Option<RoomConflict>,
     comment: String,
     reply_to: Option<designcraft_collab::SharedId>,
     comment_needs_text_selection: bool,
@@ -264,6 +279,7 @@ impl DesignApp {
         c.joining = Some(PendingJoin::start(&c.join_code, &c.name)?);
         c.join_code.clear();
         c.message = None;
+        c.room_conflict = None;
         Ok(())
     }
 
@@ -331,6 +347,36 @@ impl DesignApp {
     }
 
     fn connect_collaboration(&mut self, host: bool) -> Result<(), String> {
+        if host {
+            self.collaboration.room_conflict = None;
+        }
+        self.connect_to_room(host, OpenRoom::Active)
+    }
+
+    fn start_new_room_from_current(&mut self) -> Result<(), String> {
+        let conflict = self
+            .collaboration
+            .room_conflict
+            .take()
+            .filter(|conflict| conflict.applies(&self.session))
+            .ok_or("Select Start sharing again to check this document version.")?;
+        self.connect_to_room(true, OpenRoom::NewHost(conflict.previous))
+    }
+
+    fn open_saved_room_copy(&mut self) -> Result<(), String> {
+        let st = self.session.active().ok_or("Open the saved document before recovering a room.")?;
+        let previous = self.collaboration.room_conflict.as_ref().filter(|conflict| conflict.applies(&self.session)).map(|conflict| conflict.previous);
+        let (storage, saved) = Storage::open(self.session.recovery_dir.as_deref(), st.path.as_deref(), &st.doc, None, OpenRoom::SavedHost(previous))?;
+        let recovered = replay::restore(&storage.seed, &storage.seed, saved.confirmed)?;
+        self.session.add_document(designcraft_engine::DocState::new(recovered.document, None));
+        self.collaboration.open = false;
+        self.collaboration.room_conflict = None;
+        self.collaboration.message = None;
+        self.after_engine();
+        Ok(())
+    }
+
+    fn connect_to_room(&mut self, host: bool, room: OpenRoom) -> Result<(), String> {
         let st = self.session.active().ok_or("Open the saved document before connecting.")?;
         if st.interaction.is_some() || st.preview_stash.is_some() {
             return Err("Finish the current document edit before connecting.".into());
@@ -342,10 +388,23 @@ impl DesignApp {
         }
         let mut opened = (*st.doc).clone();
         seed_document::prepare_local_copy(&mut opened)?;
-        let (storage, saved) = Storage::open(self.session.recovery_dir.as_deref(), st.path.as_deref(), &opened, guest_of)?;
+        let (storage, saved) = Storage::open(self.session.recovery_dir.as_deref(), st.path.as_deref(), &opened, guest_of, room)?;
         let seed = fingerprint(&storage.seed)?;
         let uid = st.uid;
-        let recovered = replay::restore(&storage.seed, &opened, saved.confirmed)?;
+        let recovered = match replay::restore_cached(&storage.seed, &opened, saved.confirmed, &mut seed_document::Fingerprints::default()) {
+            Ok(recovered) => recovered,
+            Err(issue) => {
+                if host
+                    && matches!(room, OpenRoom::Active)
+                    && matches!(issue, replay::RestoreIssue::Diverged(_))
+                    && let Some(previous) = storage.host_room_id()
+                    && let Some(path) = st.path.clone()
+                {
+                    c.room_conflict = Some(RoomConflict { doc_uid: uid, revision: st.revision, path, previous, focus_start: true });
+                }
+                return Err(issue.into_message());
+            }
+        };
         let revision = recovered.history.len() as u64;
         if saved.pending.as_ref().is_some_and(|pending| host || pending.base > revision || pending.sequence >= saved.next_sequence) {
             return Err("The local collaboration journal has an invalid pending edit.".into());
@@ -355,7 +414,9 @@ impl DesignApp {
         } else {
             (Transport::join_with_identity(&c.join_code, &c.name, storage.identity())?, Mode::Guest { ready: false, hello_sent: false })
         };
-        storage.write(recovered.history.iter().map(|(commit, _)| commit), saved.pending.as_ref(), saved.next_sequence)?;
+        if !matches!(room, OpenRoom::NewHost(_)) {
+            storage.write(recovered.history.iter().map(|(commit, _)| commit), saved.pending.as_ref(), saved.next_sequence)?;
+        }
         let durable = storage.is_durable();
         if let Some(st) = self.session.active_mut() {
             install_confirmed(st, recovered.document);
@@ -372,6 +433,7 @@ impl DesignApp {
         room.pending = saved.pending;
         c.room = Some(room);
         c.message = None;
+        c.room_conflict = None;
         self.session.defer_document_edits(Some(uid));
         self.session.set_deferred_edit_durable(durable);
         Ok(())
@@ -519,13 +581,19 @@ impl Room {
 
     fn on_event(&mut self, session: &mut Session, event: Event) {
         match event {
-            Event::Ready { local, host } => {
+            Event::Ready { local, host } if !self.fatal => {
+                if let Err(error) = self.storage.activate() {
+                    self.stop_with_error(&error);
+                    return;
+                }
                 self.local = Some(local);
                 self.online = true;
                 self.host = Some(host);
                 self.last_send = None;
             }
-            Event::Invitation(code) => self.invitation = Some(code),
+            Event::Ready { .. } => {}
+            Event::Invitation(code) if !self.fatal => self.invitation = Some(code),
+            Event::Invitation(_) => {}
             Event::PeerJoined(peer) => {
                 self.peers.insert(peer.actor, peer);
             }

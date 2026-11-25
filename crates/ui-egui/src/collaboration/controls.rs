@@ -11,6 +11,8 @@ use crate::{DesignApp, i18n::tr};
 
 enum Action {
     Connect(bool),
+    StartNewRoom,
+    OpenSavedRoomCopy,
     ReceiveSeed,
     CancelDownload,
     Reconnect,
@@ -41,6 +43,16 @@ impl DesignApp {
         match action {
             Some(Action::Connect(host)) => {
                 if let Err(error) = self.connect_collaboration(host) {
+                    self.collaboration.message = if host && self.collaboration.room_conflict.is_some() { None } else { Some(error) };
+                }
+            }
+            Some(Action::StartNewRoom) => {
+                if let Err(error) = self.start_new_room_from_current() {
+                    self.collaboration.message = Some(error);
+                }
+            }
+            Some(Action::OpenSavedRoomCopy) => {
+                if let Err(error) = self.open_saved_room_copy() {
                     self.collaboration.message = Some(error);
                 }
             }
@@ -140,7 +152,32 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         ui.checkbox(&mut c.relay, tr(lang, "Allow internet relay"));
         let has_name = !c.name.trim().is_empty();
         let has_document = session.active().is_some();
-        let host = ui.add_enabled(has_name && has_document, Button::new(tr(lang, "Start sharing"))).clicked();
+        let host = if let Some(conflict) = c.room_conflict.as_mut().filter(|conflict| conflict.applies(session)) {
+            let message = ui.label(tr(
+                lang,
+                "This document differs from the saved room. Starting a new room keeps the previous room and creates a new invitation.",
+            ));
+            ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
+            let start = ui.add_enabled(has_name, room_button(lang, "Start a new room from this version"));
+            if std::mem::take(&mut conflict.focus_start) && start.enabled() {
+                start.request_focus();
+            }
+            if start.clicked() {
+                Some(Action::StartNewRoom)
+            } else if ui.add(room_button(lang, "Open saved room copy")).clicked() {
+                Some(Action::OpenSavedRoomCopy)
+            } else {
+                None
+            }
+        } else {
+            let host = ui.add_enabled(has_name && has_document, Button::new(tr(lang, "Start sharing"))).clicked().then_some(Action::Connect(true));
+            if cfg!(target_os = "macos") && session.recovery_dir.is_some() && session.active().is_some_and(|state| state.path.is_some()) {
+                let recovery = ui.collapsing(tr(lang, "Room recovery"), |ui| ui.add(room_button(lang, "Open saved room copy")).clicked());
+                if recovery.body_returned == Some(true) { Some(Action::OpenSavedRoomCopy) } else { host }
+            } else {
+                host
+            }
+        };
         ui.separator();
         ui.label(tr(lang, "Invitation code"));
         ui.add(TextEdit::singleline(&mut c.join_code).password(true).char_limit(4096).hint_text(tr(lang, "Invitation code")));
@@ -150,7 +187,7 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         if let Some(message) = &c.message {
             ui.label(tr(lang, message));
         }
-        return if download { Some(Action::ReceiveSeed) } else { (host || join).then_some(Action::Connect(host)) };
+        return host.or(if download { Some(Action::ReceiveSeed) } else { join.then_some(Action::Connect(false)) });
     };
 
     let status = if room.fatal {
@@ -241,6 +278,10 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         });
     }
     action
+}
+
+fn room_button<'a>(lang: &str, label: &'a str) -> Button<'a> {
+    Button::new(tr(lang, label)).min_size(egui::vec2(0.0, 24.0))
 }
 
 fn artwork_progress(ui: &mut Ui, lang: &str, progress: super::attachments::ArtworkProgress) {
