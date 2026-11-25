@@ -1,13 +1,13 @@
 use std::ops::Range;
 
-use designcraft_collab::{CommentAnchor, Operation, SharedId};
+use designcraft_collab::{CommentAnchor, Operation, RoomProtocol, SharedId};
 use designcraft_doc::{Document, StoryId, TextSel};
 use designcraft_engine::Session;
 use egui::{Button, Context, TextEdit, Ui, Window};
 use serde_json::json;
 
 use super::{Collaboration, Mode, Room, history::HistoryAction, presence};
-use crate::{DesignApp, i18n::tr};
+use crate::{DesignApp, app::file_dialogs::Bound, i18n::tr};
 
 enum Action {
     Connect(bool),
@@ -17,6 +17,8 @@ enum Action {
     CancelDownload,
     Reconnect,
     Disconnect,
+    ChooseArtworkFolder,
+    ClearArtworkFolder,
     History(HistoryAction),
     Comment(Box<Operation>),
     SelectCommentText(StoryId, Range<usize>),
@@ -71,6 +73,17 @@ impl DesignApp {
                     room.error = Some(error);
                 }
             }
+            Some(Action::ChooseArtworkFolder) => {
+                let title = tr(&self.ui.language, "Choose shared artwork folder").to_string();
+                if let Err(error) = self.ask_folder(&title, Bound::App, |app, path| {
+                    app.collaboration.artwork_folder = Some(path.into());
+                    app.collaboration.message = None;
+                    Ok(serde_json::Value::Null)
+                }) {
+                    self.collaboration.message = Some(error);
+                }
+            }
+            Some(Action::ClearArtworkFolder) => self.collaboration.artwork_folder = None,
             Some(Action::Disconnect) => {
                 if let Some(room) = self.collaboration.room.as_mut()
                     && let Err(error) = room.clear_pending(&mut self.session)
@@ -150,6 +163,7 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         ui.label(tr(lang, "Your name"));
         ui.add(TextEdit::singleline(&mut c.name).char_limit(60).hint_text(tr(lang, "Your name")));
         ui.checkbox(&mut c.relay, tr(lang, "Allow internet relay"));
+        let folder = if RoomProtocol::Automerge.is_supported() { show_artwork_folder(c, lang, ui) } else { None };
         let has_name = !c.name.trim().is_empty();
         let has_document = session.active().is_some();
         let host = if let Some(conflict) = c.room_conflict.as_mut().filter(|conflict| conflict.applies(session)) {
@@ -187,7 +201,7 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         if let Some(message) = &c.message {
             ui.label(tr(lang, message));
         }
-        return host.or(if download { Some(Action::ReceiveSeed) } else { join.then_some(Action::Connect(false)) });
+        return folder.or(host).or(if download { Some(Action::ReceiveSeed) } else { join.then_some(Action::Connect(false)) });
     };
 
     if let Some(progress) = room.artwork_progress().filter(|_| room.online && !room.fatal) {
@@ -265,6 +279,30 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         });
     }
     action
+}
+
+fn show_artwork_folder(c: &Collaboration, lang: &str, ui: &mut Ui) -> Option<Action> {
+    ui.collapsing(tr(lang, "Shared artwork folder"), |ui| {
+        ui.label(tr(lang, "Choose the same synced folder on each computer to share large originals."));
+        if let Some(path) = &c.artwork_folder {
+            let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+            let selected = tr(lang, "Selected folder: {name}").replace("{name}", &name);
+            let message = ui.label(selected);
+            ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
+        }
+        ui.horizontal(|ui| {
+            if ui.add(room_button(lang, "Choose folder…")).clicked() {
+                Some(Action::ChooseArtworkFolder)
+            } else if c.artwork_folder.is_some() && ui.add(room_button(lang, "Clear folder")).clicked() {
+                Some(Action::ClearArtworkFolder)
+            } else {
+                None
+            }
+        })
+        .inner
+    })
+    .body_returned
+    .flatten()
 }
 
 fn room_status(room: &Room, session: &Session) -> &'static str {

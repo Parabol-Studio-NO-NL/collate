@@ -1,19 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use designcraft_collab::{RoomProtocol, artwork::BlobId};
 use designcraft_collab_core::{ActorId, Event, Identity, Peer, Session as Transport};
-use designcraft_doc::Document;
+use designcraft_doc::{Asset, Document};
 use web_time::Instant;
 
 use super::attachments::{self, BlobCursor, BlobDownload, Blobs};
 use super::seed::{SEED_CHUNK_BYTES, SeedDownload, SeedUpload};
+use super::shared_artwork::SharedArtworkFolder;
 use super::{Message, Mode, Packet, Room, compatible_invitation, encode_for_protocol, seed_document};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
 const SEND_BURST: usize = 32;
 const ORIGINAL_BURST: usize = 2;
+const FOLDER_GRACE: Duration = Duration::from_millis(150);
 
 pub(super) struct JoinedSeed {
     pub(super) document: Document,
@@ -143,6 +146,8 @@ pub(super) struct OriginalDownloads {
     missing: seed_document::OriginalTargets,
     transfer: Option<OriginalTransfer>,
     verification: Option<OriginalVerification>,
+    folder_read: Option<FolderRead>,
+    checked_folder: Option<BlobId>,
     failed: bool,
 }
 
@@ -157,6 +162,18 @@ struct OriginalVerification {
     result: mpsc::Receiver<Result<Arc<Vec<u8>>, String>>,
 }
 
+struct FolderRead {
+    id: BlobId,
+    started: Instant,
+    result: mpsc::Receiver<Option<Arc<Vec<u8>>>>,
+}
+
+enum FolderResult {
+    Reading,
+    Original(Arc<Vec<u8>>),
+    Unavailable,
+}
+
 impl OriginalDownloads {
     pub(super) fn is_pending(&self) -> bool {
         !self.missing.is_empty()
@@ -164,6 +181,7 @@ impl OriginalDownloads {
 
     pub(super) fn disconnect(&mut self) {
         self.transfer = None;
+        self.checked_folder = None;
         self.failed = false;
     }
 
@@ -171,7 +189,7 @@ impl OriginalDownloads {
         self.transfer.as_ref()?.bytes.progress()
     }
 
-    fn advance(&mut self, transport: &Transport, connected: bool) -> Result<(), String> {
+    fn advance(&mut self, transport: &Transport, connected: bool, folder: Option<&Path>) -> Result<(), String> {
         if let Some(check) = &self.verification {
             let result = match check.result.try_recv() {
                 Ok(result) => result,
@@ -181,16 +199,7 @@ impl OriginalDownloads {
             let id = check.id;
             self.verification = None;
             let bytes = result.inspect_err(|_| self.failed = true)?;
-            if let Some(assets) = self.missing.remove(&id) {
-                for asset in assets {
-                    if !asset.data.install_verified_original(bytes.clone()) {
-                        return Err("Could not install the verified shared original.".into());
-                    }
-                }
-            }
-        }
-        if !connected || self.failed {
-            return Ok(());
+            self.install(id, &bytes)?;
         }
         if let Some(transfer) = &self.transfer {
             if transfer.bytes.expired() || transfer.bytes.reserved() == 0 && transfer.requested.elapsed() >= TIMEOUT {
@@ -200,12 +209,68 @@ impl OriginalDownloads {
             }
             return Ok(());
         }
-        if let Some((&id, _)) = self.missing.first_key_value()
-            && transport.submit(encode_for_protocol(Message::RequestOriginal { blob: id }, RoomProtocol::Automerge)?).is_ok()
-        {
+        let Some((&id, assets)) = self.missing.first_key_value() else { return Ok(()) };
+        if let (Some(folder), Some(asset)) = (folder, assets.first().cloned()) {
+            match self.read_folder(folder, id, asset) {
+                FolderResult::Reading => return Ok(()),
+                FolderResult::Original(body) => return self.install(id, &body),
+                FolderResult::Unavailable => {}
+            }
+        }
+        if !connected || self.failed {
+            return Ok(());
+        }
+        if transport.submit(encode_for_protocol(Message::RequestOriginal { blob: id }, RoomProtocol::Automerge)?).is_ok() {
             self.transfer = Some(OriginalTransfer { id, bytes: BlobDownload::default(), requested: Instant::now() });
         }
         Ok(())
+    }
+
+    fn install(&mut self, id: BlobId, bytes: &Arc<Vec<u8>>) -> Result<(), String> {
+        if let Some(assets) = self.missing.remove(&id) {
+            for asset in assets {
+                if !asset.data.install_verified_original(bytes.clone()) {
+                    return Err("Could not install the verified shared original.".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_folder(&mut self, folder: &Path, id: BlobId, asset: Arc<Asset>) -> FolderResult {
+        if let Some(read) = &self.folder_read {
+            let matching = read.id == id;
+            match read.result.try_recv() {
+                Ok(Some(body)) if matching => {
+                    self.folder_read = None;
+                    return FolderResult::Original(body);
+                }
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => self.folder_read = None,
+                Err(mpsc::TryRecvError::Empty) => {
+                    // A sync client can take a long time to materialize a file. Keep
+                    // the network moving and allow only one outstanding folder read.
+                    return if matching && read.started.elapsed() < FOLDER_GRACE { FolderResult::Reading } else { FolderResult::Unavailable };
+                }
+            }
+        }
+        if self.checked_folder == Some(id) {
+            return FolderResult::Unavailable;
+        }
+        self.checked_folder = Some(id);
+        let folder = folder.to_path_buf();
+        let (sender, result) = mpsc::sync_channel(1);
+        if std::thread::Builder::new()
+            .name("collate-shared-artwork".into())
+            .spawn(move || {
+                let body = SharedArtworkFolder::open(&folder).and_then(|folder| folder.load(id)).ok().flatten();
+                let _ = sender.send(body.filter(|bytes| seed_document::verify_original(&asset, bytes).is_ok()));
+            })
+            .is_err()
+        {
+            return FolderResult::Unavailable;
+        }
+        self.folder_read = Some(FolderRead { id, started: Instant::now(), result });
+        FolderResult::Reading
     }
 
     fn receive(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -268,7 +333,14 @@ impl SeedDelivery {
         })
     }
 
-    pub(super) fn enqueue(&mut self, archive: &[u8], document: &Arc<Document>, recipient: ActorId, protocol: RoomProtocol) -> Result<(), String> {
+    pub(super) fn enqueue(
+        &mut self,
+        archive: &[u8],
+        document: &Arc<Document>,
+        recipient: ActorId,
+        protocol: RoomProtocol,
+        artwork_folder: Option<&Path>,
+    ) -> Result<(), String> {
         if self.finished.contains(&recipient) {
             return Ok(());
         }
@@ -278,11 +350,21 @@ impl SeedDelivery {
         if self.upload.is_none() && self.preparing.is_none() {
             if protocol.is_automerge() && seed_document::use_preview_seed(document) {
                 let document = document.clone();
+                let artwork_folder = artwork_folder.map(Path::to_path_buf);
                 let (sender, receiver) = mpsc::sync_channel(1);
                 std::thread::Builder::new()
                     .name("collate-room-previews".into())
                     .spawn(move || {
-                        let _ = sender.send(seed_document::preview_seed(&document));
+                        let preview = seed_document::preview_seed(&document);
+                        let originals = artwork_folder.as_ref().and_then(|_| preview.as_ref().ok()).map(|preview| preview.originals.clone());
+                        if sender.send(preview).is_ok()
+                            && let (Some(path), Some(originals)) = (artwork_folder, originals)
+                            && let Ok(folder) = SharedArtworkFolder::open(&path)
+                        {
+                            for (id, original) in originals {
+                                let _ = folder.publish(id, &original);
+                            }
+                        }
                     })
                     .map_err(|_| "Could not prepare the room previews.")?;
                 self.preparing = Some(receiver);
@@ -388,7 +470,9 @@ impl SeedDelivery {
 
 impl Room {
     pub(super) fn provide_seed(&mut self, peer: ActorId) {
-        if self.peers.contains_key(&peer) && self.seed_delivery.enqueue(&self.storage.archive, &self.storage.seed, peer, self.protocol).is_err() {
+        if self.peers.contains_key(&peer)
+            && self.seed_delivery.enqueue(&self.storage.archive, &self.storage.seed, peer, self.protocol, self.artwork_folder.as_deref()).is_err()
+        {
             self.reply(peer, Message::Incompatible);
         }
     }
@@ -398,7 +482,8 @@ impl Room {
     }
 
     pub(super) fn advance_original_delivery(&mut self) {
-        if let Err(error) = self.originals.advance(&self.transport, self.online && matches!(self.mode, Mode::Guest { ready: true, .. })) {
+        let connected = self.online && matches!(self.mode, Mode::Guest { ready: true, .. });
+        if let Err(error) = self.originals.advance(&self.transport, connected, self.artwork_folder.as_deref()) {
             self.error = Some(error);
         }
         self.seed_delivery.advance_originals(&self.transport);

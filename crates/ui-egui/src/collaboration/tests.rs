@@ -1640,6 +1640,8 @@ mod font_notice;
 #[cfg(feature = "automerge-rooms")]
 mod optimistic;
 mod seed_artwork;
+#[cfg(feature = "automerge-rooms")]
+mod shared_artwork;
 mod version_handshake;
 
 #[cfg(target_os = "macos")]

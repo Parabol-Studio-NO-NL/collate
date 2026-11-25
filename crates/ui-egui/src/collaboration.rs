@@ -11,6 +11,7 @@ mod seed;
 mod seed_document;
 #[cfg(unix)]
 pub mod server;
+mod shared_artwork;
 mod storage;
 mod story_sync;
 #[cfg(test)]
@@ -20,6 +21,7 @@ mod typing;
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    path::PathBuf,
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -158,6 +160,7 @@ struct Room {
     model_size: Option<(Weak<Document>, usize)>,
     seed_delivery: SeedDelivery,
     originals: OriginalDownloads,
+    artwork_folder: Option<PathBuf>,
     receiving_edits: BTreeMap<ActorId, SeedDownload>,
     receiving_blobs: BTreeMap<ActorId, attachments::BlobDownload>,
     sending_proposal: Option<(WireEdit, SendCursor)>,
@@ -218,6 +221,7 @@ pub(crate) struct Collaboration {
     name: String,
     join_code: String,
     relay: bool,
+    artwork_folder: Option<PathBuf>,
     room: Option<Room>,
     joining: Option<PendingJoin>,
     message: Option<String>,
@@ -380,6 +384,9 @@ impl DesignApp {
         room.online = true;
         room.peers = joining.peers;
         room.originals = originals;
+        if protocol.is_automerge() {
+            room.artwork_folder = self.collaboration.artwork_folder.take();
+        }
         self.collaboration.room = Some(room);
         self.session.defer_document_edits(Some(uid));
         // An invitation download has no local file. Keep it off disk until the user saves.
@@ -512,6 +519,9 @@ impl DesignApp {
         }
         c.join_code.clear();
         let mut room = Room::new(transport, mode, storage, uid, seed);
+        if protocol.is_automerge() {
+            room.artwork_folder = c.artwork_folder.take();
+        }
         room.restore_history_index(recovered.history);
         room.inverses = recovered.inverses;
         room.history_bytes = recovered.history_bytes;
@@ -567,6 +577,7 @@ impl Room {
             model_size: None,
             seed_delivery: SeedDelivery::default(),
             originals: OriginalDownloads::default(),
+            artwork_folder: None,
             receiving_edits: BTreeMap::new(),
             receiving_blobs: BTreeMap::new(),
             sending_proposal: None,
