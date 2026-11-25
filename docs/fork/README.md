@@ -39,6 +39,14 @@ The repeating patterns restart in each column or threaded frame. **Off** restore
 
 Choose **New Paragraph Style…** to save the settings for reuse. Existing styles have a **Rag Options** section in **Paragraph Style Options**. In a shared document, everyone uses collaboration protocol 13. Peers can apply existing styles, edit patterns and insets, change paragraph language, and switch hyphenation on or off. Define advanced fitting and hyphenation settings in a style before starting a room.
 
+## Calculate a modular baseline grid
+
+Open **Layout > Modular Baseline Grid** and choose the number of columns and rows. The column gutter is a distance. The row gap is a count of baseline intervals, so the top and bottom of each module land on the same rhythm as grid-aligned text.
+
+Enter your target leading. With **Fit leading to margins** selected, Collate finds the closest leading that fills the height between the margins with equal rows. Clear it to keep the exact leading and see how much space remains below the last row. The preview shows the resulting module size and actual leading before you apply.
+
+**Apply grid** sets the page columns and row guides and changes the document baseline spacing and origin. Apply a grid to a parent page to reuse it on pages that inherit that layout. A grid applied directly to a document page takes precedence there. Paragraphs with baseline alignment use the new grid. Undo reverts the changes in one step. You can explore the calculator while sharing a document and apply the result in a local document.
+
 ## Develop
 
 The **Native Sparkle fixture** runs on changes to the updater and macOS packaging. On a disposable GitHub-hosted macOS runner, it uses a temporary certificate and two ad hoc Collate builds to exercise **Check for Updates** over loopback HTTPS. It verifies the signed appcast and archive, then checks that Sparkle installs and relaunches the newer build from the scratch path.

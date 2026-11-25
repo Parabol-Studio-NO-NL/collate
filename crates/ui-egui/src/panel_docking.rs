@@ -123,6 +123,7 @@ const ICON_GROUPS: &[&[&str]] = &[
     &["textWrap"],
     &["align", "pathfinder"],
     &["flexLayout", "liquid"],
+    &["modularGrid"],
     &["links", "library"],
     &["info"],
     &["attributes", "preflight", "separations"],
@@ -1263,6 +1264,7 @@ fn dock_panel_item(app: &mut DesignApp, ui: &mut egui::Ui, panel: &str) {
 fn floating_size(panel: &str) -> egui::Vec2 {
     match panel {
         "properties" | "pages" | "layers" => egui::vec2(300.0, 420.0),
+        "modularGrid" => egui::vec2(300.0, 560.0),
         "characterStyles" | "paragraphStyles" => egui::vec2(290.0, 340.0),
         "glyphs" | "library" | "links" | "preflight" | "dataMerge" => egui::vec2(320.0, 400.0),
         _ => egui::vec2(280.0, 360.0),

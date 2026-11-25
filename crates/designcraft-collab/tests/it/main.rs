@@ -144,6 +144,7 @@ fn layer_removal_checks_live_references_and_retains_the_last_layer() {
         locked: false,
         layer: Some(guide_layer),
         liquid: false,
+        modular_row: false,
     });
     let with_guide = initial.clone();
     for into in [None, Some(original)] {

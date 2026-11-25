@@ -937,6 +937,7 @@ pub(super) const TABLE: &[(&str, &str)] = &[
     ("Apply to All Spreads", "Använd på alla uppslag"),
     ("Apply to Stroke", "Använd på kontur"),
     ("Art", "Konst"),
+    ("Modular Baseline Grid", "Modulärt baslinjerutnät"),
     ("Baseline Grid", "Baslinjerutnät"),
     ("Bleed and Slug", "Utfall och informationsområde"),
     ("Body Rows", "Brödtextrader"),

@@ -215,6 +215,10 @@ fn draw_guide(cx: &GuideCtx, pr: DRect, g: &designcraft_doc::Guide, selected: bo
     let stroke = if selected {
         let color = g.layer.and_then(|l| doc.layer(l)).map_or(Color32::from_rgb(79, 153, 255), |l| c32(l.color));
         Stroke::new(2.0, color)
+    } else if g.modular_row {
+        // Row boundaries sit exactly on baselines. Match the column colour and give
+        // the boundaries more weight so the modules also read in monochrome.
+        Stroke::new(1.25, c32(doc.settings.column_color))
     } else {
         Stroke::new(hair(painter), Color32::from_rgb(74, 227, 255))
     };

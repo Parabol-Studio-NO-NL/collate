@@ -48,6 +48,7 @@ impl<'r> Importer<'r> {
                     locked: g.locked(),
                     layer: g.item_layer().and_then(|l| self.layer_ids.get(l)).copied(),
                     liquid: g.liquid(),
+                    modular_row: false,
                 })
             })
             .collect()
@@ -140,6 +141,7 @@ impl<'r> Importer<'r> {
                 x: r.x0 - min_x,
                 margins,
                 columns,
+                modular_grid: None,
                 local_margins,
                 parent,
                 side,

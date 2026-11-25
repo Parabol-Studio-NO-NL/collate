@@ -1,5 +1,15 @@
 # A path by itself is a fork-owned file or directory.
 # A path followed by a tab protects that literal in a shared file.
+# Modular baseline grid calculator, persistent geometry and panel
+crates/doc/src/modular_grid.rs
+crates/engine/src/cmd/modular_grid.rs
+crates/ui-egui/src/modular_grid.rs
+crates/doc/src/page.rs	pub modular_grid:
+crates/engine/src/cmd.rs	modular_grid::specs()
+crates/ui-egui/src/canvas/page_decor.rs	else if g.modular_row
+crates/ui-egui/src/dock.rs	crate::modular_grid::panel(
+crates/ui-egui/src/menus/tables.rs	ui:window.panel|Modular Baseline Grid|
+
 # Paragraph rag settings, rendering and regression tests
 crates/ui-egui/src/paragraph_rag.rs
 crates/ui-egui/src/paragraph_rag

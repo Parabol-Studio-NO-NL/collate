@@ -146,6 +146,9 @@ pub struct Guide {
     /// Liquid guide: objects it crosses stretch when a guide-based page changes size.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub liquid: bool,
+    /// A row boundary replaced when the page's modular grid is recalculated.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub modular_row: bool,
 }
 
 impl Guide {
@@ -178,6 +181,9 @@ pub struct Page {
     pub x: f64,
     pub margins: Margins,
     pub columns: Columns,
+    /// Calculator inputs for the last modular grid applied to this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modular_grid: Option<crate::modular_grid::GridRequest>,
     /// Margins and columns set on this page itself. Without them a document page takes its
     /// parent page's margins and columns and follows their changes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -545,6 +551,7 @@ mod tests {
             x,
             margins: Margins { top: 36.0, bottom: 36.0, inside: 54.0, outside: 36.0 },
             columns: Columns { count: 2, gutter: 12.0, positions: None },
+            modular_grid: None,
             local_margins: false,
             parent: None,
             side,
