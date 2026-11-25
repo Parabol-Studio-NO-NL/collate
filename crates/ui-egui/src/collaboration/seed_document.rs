@@ -11,7 +11,7 @@ use designcraft_collab::artwork::{
     BlobId, MAX_ARTWORK_BYTES, MAX_IMAGE_PIXELS, PDF_MIME, pdf_dimensions, raster_dimensions as image_dimensions, raster_format as image_format,
     valid_dimensions,
 };
-use designcraft_doc::{Asset, AssetData, AssetId, Document, Storage};
+use designcraft_doc::{Asset, AssetData, AssetId, Document, Storage, StoryId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -60,6 +60,47 @@ pub(super) fn model_bytes(doc: &Document) -> Result<Vec<u8>, String> {
     let mut output = ModelBytes(Vec::new());
     serde_json::to_writer(&mut output, doc).map_err(|error| if error.is_io() { TOO_LARGE } else { "Could not encode the shared document." })?;
     Ok(output.0)
+}
+
+#[derive(Default)]
+struct JsonSize(usize);
+
+impl Write for JsonSize {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len()).filter(|&len| len <= MAX_MODEL_BYTES).ok_or_else(|| io::Error::other(TOO_LARGE))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(super) fn model_size(value: &impl Serialize) -> Result<usize, String> {
+    let mut output = JsonSize::default();
+    serde_json::to_writer(&mut output, value).map_err(|error| if error.is_io() { TOO_LARGE } else { "Could not encode the shared document." })?;
+    Ok(output.0)
+}
+
+/// A text-only commit replaces story values under their unchanged map keys. Validate the
+/// full document limit by counting only those values, including their escaped JSON text.
+pub(super) fn updated_story_model_size(
+    original_size: usize,
+    before: &Document,
+    after: &Document,
+    stories: impl Iterator<Item = StoryId>,
+) -> Result<usize, String> {
+    let mut removed = 0;
+    let mut added = 0;
+    for id in stories {
+        removed += model_size(before.story(id).ok_or(INVALID)?)?;
+        added += model_size(after.story(id).ok_or(INVALID)?)?;
+    }
+    let size = original_size.checked_sub(removed).ok_or(INVALID)? + added;
+    if size > MAX_MODEL_BYTES {
+        return Err(TOO_LARGE.into());
+    }
+    Ok(size)
 }
 
 /// A weak owner pins the allocation identity without retaining the artwork's
@@ -517,6 +558,25 @@ mod tests {
         MAX_EXPANDED_BYTES, MAX_MODEL_BYTES, MAX_SEED_BYTES, UNSUPPORTED_LINKS, decode, embedded_image_fixture, encode, fingerprint, model_bytes,
         test_png,
     };
+
+    #[test]
+    fn text_only_model_accounting_matches_the_native_document_size() {
+        use designcraft_doc::{Document, SpreadRef, build::NewDocument, geom::Rect};
+
+        let mut before = Document::new(&NewDocument::default());
+        let layer = before.default_layer();
+        let bounds = Rect::new(20.0, 20.0, 100.0, 100.0);
+        let (_, opening) = before.add_text_frame(SpreadRef::Doc(0), bounds, layer, "Opening", Default::default()).unwrap();
+        let (_, closing) = before.add_text_frame(SpreadRef::Doc(0), bounds, layer, "Remove this", Default::default()).unwrap();
+        let original = model_bytes(&before).unwrap().len();
+        let mut after = before.clone();
+        after.story_mut(opening).unwrap().insert(0, "\"Café\"\n\t🌿\\\n");
+        after.story_mut(closing).unwrap().delete(0.."Remove this".len());
+        let expected = model_bytes(&after).unwrap().len();
+        assert_eq!(super::updated_story_model_size(original, &before, &after, [opening, closing].into_iter()), Ok(expected));
+        assert!(expected > original);
+        assert!(super::updated_story_model_size(MAX_MODEL_BYTES, &before, &after, [opening, closing].into_iter()).is_err());
+    }
 
     fn with_members(bytes: &[u8], extras: &[(&str, &[u8])], omit: Option<&str>) -> Vec<u8> {
         let mut source = Archive::open(bytes, Limits { max_entries: 10, max_total_bytes: MAX_EXPANDED_BYTES }).unwrap();

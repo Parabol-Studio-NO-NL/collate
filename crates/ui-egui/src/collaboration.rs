@@ -17,7 +17,11 @@ mod tests;
 mod text_selection;
 mod typing;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use designcraft_collab::{Operation, PROTOCOL_VERSION, Replica, layers::LayerEdit};
 use designcraft_collab_core::{ActorId, Event, MAX_PAYLOAD, Peer, Session as Transport};
@@ -138,6 +142,7 @@ struct Room {
     history: Vec<(Commit, WireEdit)>,
     inverses: Vec<Option<Vec<Operation>>>,
     history_bytes: usize,
+    model_size: Option<(Weak<Document>, usize)>,
     seed_delivery: SeedDelivery,
     receiving_edits: BTreeMap<ActorId, SeedDownload>,
     receiving_blobs: BTreeMap<ActorId, attachments::BlobDownload>,
@@ -459,6 +464,7 @@ impl Room {
             history: Vec::new(),
             inverses: Vec::new(),
             history_bytes: 0,
+            model_size: None,
             seed_delivery: SeedDelivery::default(),
             receiving_edits: BTreeMap::new(),
             receiving_blobs: BTreeMap::new(),
@@ -1016,8 +1022,15 @@ impl Room {
         if commit.proposal.edits.iter().any(Operation::changes_artwork) {
             seed_document::check_artwork(&doc)?;
         }
-        // Every committed checkpoint must still fit the model bound during journal replay.
-        seed_document::model_bytes(&doc)?;
+        // Every committed checkpoint must fit the model bound during journal replay.
+        let model_size = match &self.model_size {
+            Some((before, size))
+                if before.ptr_eq(&Arc::downgrade(&st.doc)) && commit.proposal.edits.iter().all(|edit| operation_story(edit).is_some()) =>
+            {
+                seed_document::updated_story_model_size(*size, &st.doc, &doc, commit.proposal.edits.iter().filter_map(operation_story))?
+            }
+            _ => seed_document::model_size(&doc)?,
+        };
         let local_edit = self.local.as_ref().is_some_and(|local| local.actor == commit.actor);
         let selection = text_selection::after(st, &self.replica, &replica, &commit.proposal.edits, local_edit);
         let previous_selection = st.selection.text;
@@ -1037,6 +1050,7 @@ impl Room {
             && matches!(commit.proposal.edits.as_slice(), [Operation::Layer { edit: LayerEdit::Create { .. } }]))
         .then_some(LayerId(doc.next_id));
         install_confirmed(st, doc);
+        self.model_size = Some((Arc::downgrade(&st.doc), model_size));
         if let Some(layer) = created_layer {
             st.active_layer = layer;
         }
