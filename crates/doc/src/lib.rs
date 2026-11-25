@@ -26,6 +26,7 @@ pub mod flex;
 pub mod ids;
 pub mod index;
 pub mod item;
+pub mod modular_grid;
 pub mod mojikumi;
 pub mod notes;
 pub mod otf;

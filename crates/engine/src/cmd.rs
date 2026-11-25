@@ -34,6 +34,7 @@ mod layout;
 pub mod library;
 mod linked;
 mod links;
+mod modular_grid;
 pub mod native_links;
 pub use links::{LinkListChecks, list_document_links, preview_document_links, remember_link_files};
 mod liquid;
@@ -236,6 +237,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(index::specs());
         v.extend(anchored::specs());
         v.extend(guides::specs());
+        v.extend(modular_grid::specs());
         v.extend(rulers::specs());
         v.extend(links::specs());
         v.extend(fonts::specs());

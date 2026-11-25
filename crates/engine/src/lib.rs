@@ -37,6 +37,7 @@ pub use cmd::params::{check_keys, check_params};
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
 pub use designcraft_compose as compose;
 pub use designcraft_doc as doc;
+pub use designcraft_doc::modular_grid;
 pub use designcraft_tools as tools;
 pub use tooling::{ImeMutation, ImeTextContext, SnapView, UiRequest, ViewInfo, ime_delete_ranges};
 

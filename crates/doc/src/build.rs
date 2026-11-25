@@ -225,6 +225,7 @@ impl Document {
             x: 0.0,
             margins,
             columns: Columns { count: columns.max(1), gutter, positions: None },
+            modular_grid: None,
             local_margins: false,
             parent,
             side: PageSide::Single,
@@ -757,7 +758,10 @@ impl Document {
     pub fn parent_guides<'a>(&'a self, page: &Page) -> impl Iterator<Item = Guide> + 'a {
         let src = self.parent_page(page);
         let dx = src.map_or(0.0, |q| page.x - q.x);
-        src.into_iter().flat_map(|q| q.guides.iter()).map(move |g| {
+        // A local modular grid replaces only the parent calculator's rows. Ordinary parent
+        // guides still cross the page and participate in snapping.
+        let has_local_grid = page.modular_grid.is_some();
+        src.into_iter().flat_map(|q| q.guides.iter()).filter(move |g| !has_local_grid || !g.modular_row).map(move |g| {
             let mut g = g.clone();
             if g.orientation == Orientation::Vertical {
                 g.position += dx;

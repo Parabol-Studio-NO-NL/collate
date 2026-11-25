@@ -344,7 +344,7 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "window.panel",
         "Show Panel",
         None,
-        "{panel: properties|pages|layers|swatches|paragraphStyles|characterStyles|stroke|character|paragraph|ragtime|textWrap|links|table|preflight}",
+        "{panel: properties|pages|layers|swatches|paragraphStyles|characterStyles|stroke|character|paragraph|ragtime|modularGrid|textWrap|links|table|preflight}",
     ),
     ("window.floatPanel", "Float Panel", None, "{panel, x?, y?, width?, height?} — the panel in its own floating window (window.panel.float)"),
     (

@@ -243,6 +243,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
                 locked: false,
                 layer: Some(layer),
                 liquid: liquid && !spread_guide,
+                modular_row: false,
             });
             out.push(json!({"page": pi, "index": index}));
             added.push(GuideSel { spread: r, page: pi, index });
@@ -282,7 +283,10 @@ fn move_guide(s: &mut Session, p: &Value) -> Result<Value> {
             .and_then(|sp| sp.pages.get_mut(pi))
             .and_then(|pg| pg.guides.get_mut(i))
             .ok_or_else(|| bad("guide.move", "no such guide"))?;
-        g.position = pos;
+        if g.position != pos {
+            g.modular_row = false;
+            g.position = pos;
+        }
         Ok(Value::Null)
     })
 }
@@ -309,7 +313,7 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Removes `targets` (existing guides; repeats count once) and renumbers the guide selection to
 /// match. Returns how many guides it removed.
-fn remove_guides(d: &mut Document, sel: &mut Selection, targets: &[GuideSel], command: &str) -> Result<usize> {
+pub(super) fn remove_guides(d: &mut Document, sel: &mut Selection, targets: &[GuideSel], command: &str) -> Result<usize> {
     let gone: HashSet<GuideSel> = targets.iter().copied().collect();
     // Per page, the removed indices in ascending order.
     let mut by_page: HashMap<(SpreadRef, usize), Vec<usize>> = HashMap::new();
@@ -441,6 +445,9 @@ fn move_by(s: &mut Session, p: &Value) -> Result<Value> {
                     Orientation::Vertical => dx,
                     Orientation::Horizontal => dy,
                 };
+            if guide.position != to {
+                guide.modular_row = false;
+            }
             guide.position = guide_position(to, "guide.moveBy").map_err(|_| bad("guide.moveBy", "the guide would move out of range"))?;
         }
         Ok(json!({"moved": targets.len()}))
@@ -461,7 +468,9 @@ pub(crate) fn keep_selection_valid(st: &mut DocState, before: Option<(&Document,
         sel.guides.clear();
         return;
     }
-    let kept_up = id.starts_with("guide.") || matches!(id, "edit.undo" | "edit.redo") || before.is_some_and(|(_, old)| old.guides != sel.guides);
+    let kept_up = id.starts_with("guide.")
+        || matches!(id, "edit.undo" | "edit.redo" | "layout.modularBaselineGrid")
+        || before.is_some_and(|(_, old)| old.guides != sel.guides);
     if !kept_up
         && let Some((old, _)) = before
         && !std::ptr::eq(old, st.doc.as_ref())
@@ -595,6 +604,7 @@ fn create_guides(s: &mut Session, p: &Value) -> Result<Value> {
                     locked: false,
                     layer: Some(layer),
                     liquid: false,
+                    modular_row: false,
                 });
                 n += 1;
             }
@@ -606,6 +616,7 @@ fn create_guides(s: &mut Session, p: &Value) -> Result<Value> {
                     locked: false,
                     layer: Some(layer),
                     liquid: false,
+                    modular_row: false,
                 });
                 n += 1;
             }

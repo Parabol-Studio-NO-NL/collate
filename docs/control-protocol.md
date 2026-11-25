@@ -72,6 +72,16 @@ positive JSON integer when supplied; invalid or over-budget requests return `ok:
 input unchanged. Oversized gestures are rejected rather than truncated. Wait for queued input
 to finish before retrying a request that would exceed the pending-event limit.
 
+## Modular baseline grid
+
+Use `layout.calculateModularBaselineGrid` to preview the geometry in points. For example, this request fits four rows and three columns into the first page’s margins, with one baseline interval between rows.
+
+```json
+{"id":1,"method":"engine.execute","params":{"command":"layout.calculateModularBaselineGrid","params":{"spread":0,"page":0,"rows":4,"columns":3,"columnGutter":12,"gutterLines":1,"leading":14,"fit":true}}}
+```
+
+The reply includes `effectiveLeading`, `linesPerRow`, `moduleWidth`, `moduleHeight`, `rowGutter` and `remainder`. Set `fit` to `false` to keep the requested leading. Use the same parameters with `layout.modularBaselineGrid` to apply the page geometry and document-wide baseline in one undo step.
+
 ## Shared panel docking
 
 Panel arrangements support tab grouping and reordering, horizontal and vertical splits,

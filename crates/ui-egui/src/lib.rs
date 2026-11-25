@@ -23,6 +23,7 @@ pub mod keys;
 mod links_worker;
 pub mod menus;
 mod modal_drag;
+mod modular_grid;
 mod new_document;
 mod object_control;
 pub mod object_style_dialog;
