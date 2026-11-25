@@ -1,9 +1,11 @@
 use std::{
+    fs,
     net::{Ipv4Addr, UdpSocket},
     thread,
     time::{Duration, Instant},
 };
 
+use super::directory::{export, init, open, rotate_invite};
 use super::*;
 use crate::{DesignApp, Services};
 
@@ -57,8 +59,8 @@ fn unattended_room_keeps_confirmed_artwork_and_its_invitation_after_restart() {
     fs::write(&file, &png).unwrap();
     init(&root, None).unwrap();
     let port = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap().local_addr().unwrap().port();
-    let mut server = Server::open(&root, false, port).unwrap();
-    assert!(Server::open(&root, false, 0).is_err());
+    let mut server = open(&root, false, port).unwrap();
+    assert!(open(&root, false, 0).is_err());
     wait_until(|| {
         server.poll().unwrap();
         server.published.is_some()
@@ -76,7 +78,7 @@ fn unattended_room_keeps_confirmed_artwork_and_its_invitation_after_restart() {
     drop(server);
     wait_until(|| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok());
 
-    let mut server = Server::open(&root, false, port).unwrap();
+    let mut server = open(&root, false, port).unwrap();
     let mut returning = join(&invite);
     settle(&mut server, &mut returning, 1);
     assert_eq!(returning.session.doc().unwrap().doc, old_doc);
@@ -88,18 +90,21 @@ fn unattended_room_keeps_confirmed_artwork_and_its_invitation_after_restart() {
     assert!(export(&root, &snapshot).is_err());
     let imported = temp.path().join("imported");
     init(&imported, Some(&snapshot)).unwrap();
-    let (_, imported_seed, _) = Journal::lock(&imported).unwrap().load().unwrap();
+    let reexported = temp.path().join("reimported.designcraft");
+    export(&imported, &reexported).unwrap();
+    let imported_seed = designcraft_format::load(&fs::read(reexported).unwrap()).unwrap();
     assert_eq!(imported_seed.assets.values().next().unwrap().data.embedded_bytes().unwrap().as_slice(), png);
     assert_eq!(fs::read_dir(imported.join("state/blobs")).unwrap().count(), 1);
 
-    let header = Journal::lock(&root).unwrap().header().unwrap();
+    let header = || serde_json::from_slice::<Header>(&fs::read(root.join("state/room.json")).unwrap()).unwrap();
+    let original = header();
     rotate_invite(&root).unwrap();
-    let rotated = Journal::lock(&root).unwrap().header().unwrap();
-    assert_eq!(header.identity, rotated.identity);
-    assert_ne!(header.access, rotated.access);
+    let rotated = header();
+    assert_eq!(original.identity, rotated.identity);
+    assert_ne!(original.access, rotated.access);
 
     wait_until(|| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok());
-    let mut rotated = Server::open(&root, false, port).unwrap();
+    let mut rotated = open(&root, false, port).unwrap();
     wait_until(|| {
         rotated.poll().unwrap();
         rotated.published.is_some()
@@ -121,5 +126,5 @@ fn unattended_room_keeps_confirmed_artwork_and_its_invitation_after_restart() {
     let mut corrupt = png;
     corrupt[0] ^= 1;
     fs::write(sidecars[0].path(), corrupt).unwrap();
-    assert!(Server::open(&root, false, port).err().unwrap().contains("content hash"));
+    assert!(open(&root, false, port).err().unwrap().contains("content hash"));
 }

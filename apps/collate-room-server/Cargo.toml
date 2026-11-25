@@ -11,3 +11,8 @@ workspace = true
 
 [target.'cfg(unix)'.dependencies]
 designcraft-ui-egui = { workspace = true }
+designcraft-doc = { workspace = true }
+designcraft-format = { workspace = true }
+craft-atomic = { workspace = true }
+base64 = "0.22"
+tempfile = { workspace = true }

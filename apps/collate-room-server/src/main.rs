@@ -1,7 +1,11 @@
 //! Run one persistent Collate room from a local directory.
 #[cfg(unix)]
+use designcraft_ui_egui::room_server;
+#[cfg(unix)]
+mod directory;
+
+#[cfg(unix)]
 fn run() -> Result<(), String> {
-    use designcraft_ui_egui::room_server::{Server, export, init, rotate_invite};
     use std::{ffi::OsStr, path::Path};
 
     const USAGE: &str = "Usage:\n  collate-room-server init ROOM_DIR [DOCUMENT.designcraft]\n  collate-room-server serve ROOM_DIR [--relay]\n  collate-room-server export ROOM_DIR SNAPSHOT.designcraft\n  collate-room-server rotate-invite ROOM_DIR";
@@ -15,16 +19,16 @@ fn run() -> Result<(), String> {
         _ => return Err(USAGE.into()),
     };
     match (command.to_str(), &args[2..]) {
-        (Some("init"), []) => init(room, None),
-        (Some("init"), [seed]) => init(room, Some(Path::new(seed))),
-        (Some("rotate-invite"), []) => rotate_invite(room),
-        (Some("export"), [output]) => export(room, Path::new(output)),
+        (Some("init"), []) => directory::init(room, None),
+        (Some("init"), [seed]) => directory::init(room, Some(Path::new(seed))),
+        (Some("rotate-invite"), []) => directory::rotate_invite(room),
+        (Some("export"), [output]) => directory::export(room, Path::new(output)),
         (Some("serve"), options) if options.is_empty() || options == [OsStr::new("--relay")] => {
             let port = match std::env::var_os("COLLATE_ROOM_PORT") {
                 Some(port) => port.to_str().and_then(|s| s.parse::<u16>().ok()).ok_or("Invalid COLLATE_ROOM_PORT.")?,
                 None => 7337,
             };
-            let mut server = Server::open(room, !options.is_empty(), port)?;
+            let mut server = directory::open(room, !options.is_empty(), port)?;
             eprintln!("Starting the room. The invitation will be written to {}.", room.join("invitation.txt").display());
             loop {
                 std::thread::sleep(server.poll()?);

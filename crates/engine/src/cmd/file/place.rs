@@ -17,16 +17,14 @@ impl Session {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn read_shared_placement(path: &str) -> Result<Vec<u8>> {
         use std::io::Read;
-        let file = crate::io::open(path).map_err(|e| EngineError::Other(e.to_string()))?;
-        let metadata = file.metadata().map_err(|e| EngineError::Other(e.to_string()))?;
-        if !metadata.is_file() {
+        let Some((file, len)) = crate::io::open_regular(path.as_ref()).map_err(|e| EngineError::Other(e.to_string()))? else {
             return Err(bad("file.place", "choose a regular artwork file"));
-        }
-        if metadata.len() > MAX_SHARED_ARTWORK_BYTES as u64 {
+        };
+        if len > MAX_SHARED_ARTWORK_BYTES as u64 {
             return Err(bad("file.place", SHARED_ARTWORK_LIMIT));
         }
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(metadata.len() as usize).map_err(|_| bad("file.place", "not enough memory for this artwork"))?;
+        bytes.try_reserve_exact(len as usize).map_err(|_| bad("file.place", "not enough memory for this artwork"))?;
         file.take(MAX_SHARED_ARTWORK_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|e| EngineError::Other(e.to_string()))?;
         if bytes.len() > MAX_SHARED_ARTWORK_BYTES {
             return Err(bad("file.place", SHARED_ARTWORK_LIMIT));

@@ -52,8 +52,8 @@ fn embed_link_shares_the_original_bytes_and_keeps_the_source_file_private() {
     {
         let server = dir.path().join("room");
         let export = dir.path().join("room.designcraft");
-        super::super::server::init(&server, Some(&path)).unwrap();
-        super::super::server::export(&server, &export).unwrap();
+        super::super::server::directory::init(&server, Some(&path)).unwrap();
+        super::super::server::directory::export(&server, &export).unwrap();
         let snapshot = designcraft_format::load(&std::fs::read(export).unwrap()).unwrap();
         assert!(!has_local_provenance(&snapshot.assets[&asset]));
         assert!(snapshot.assets[&asset].data.embedded_bytes().unwrap().as_slice() == pixels);

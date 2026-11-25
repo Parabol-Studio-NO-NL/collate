@@ -1,17 +1,11 @@
 //! An unattended host for one document. Uses the desktop room controller without a window or display.
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{self, Read};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use craft_atomic::{AtomicFs, NewFilePermissions, RealFs, WriteOptions};
 use designcraft_collab::artwork::{BlobId, MAX_ARTWORK_BYTES};
 use designcraft_collab_core::Identity;
-use designcraft_doc::{Document, build::NewDocument};
+use designcraft_doc::Document;
 use designcraft_engine::{DocState, Session};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,61 +23,41 @@ struct Header {
     seed: [u8; 32],
 }
 
-/// The exclusive directory lock survives atomic replacement of individual files.
-/// It drops automatically when the server exits or crashes.
+/// Records the protocol may access inside an operator-selected room.
+#[derive(Clone, Copy)]
+pub enum RoomFile {
+    Header,
+    Seed,
+    Blob([u8; 32]),
+    Revision(u64),
+    Invitation,
+}
+
+/// Exclusive storage for a single room. The operator supplies the implementation.
+/// Writes are durable. The store creates each revision and the immutable seed exactly once.
+pub trait RoomFiles: Send + Sync {
+    /// Read one record, failing if its length exceeds the limit.
+    fn read(&self, file: RoomFile, limit: u64) -> Result<Vec<u8>, String>;
+    fn write(&self, file: RoomFile, bytes: &[u8]) -> Result<(), String>;
+    /// List committed revisions in ascending order, failing if their count exceeds the limit.
+    fn revisions(&self, limit: usize) -> Result<Vec<u64>, String>;
+    fn clear_invitation(&self) -> Result<(), String>;
+}
+
 pub(super) struct Journal {
-    data: PathBuf,
-    _lock: File,
+    files: Arc<dyn RoomFiles>,
     blobs: Blobs,
     blob_bytes: usize,
 }
 
-fn io_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-
-fn read_capped(path: impl AsRef<Path>, limit: u64) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let len = file.metadata()?.len();
-    if len > limit {
-        return Err(io::Error::other("File exceeds its size limit."));
-    }
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(len as usize).map_err(io::Error::other)?;
-    file.take(len + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != len {
-        return Err(io::Error::other("File changed during read."));
-    }
-    Ok(bytes)
-}
-
-fn clear_invitation(path: &Path) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_error(error)),
-    }
-}
-
-fn private_files() -> WriteOptions {
-    WriteOptions::default().with_new_file_permissions(NewFilePermissions::Private)
-}
-
 impl Journal {
-    fn lock(root: &Path) -> Result<Self, String> {
-        let metadata = fs::symlink_metadata(root).map_err(io_error)?;
-        if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-            return Err("Use a private room directory (permissions 0700).".into());
-        }
-        let root = fs::canonicalize(root).map_err(io_error)?;
-        let lock = File::open(&root).map_err(io_error)?;
-        lock.try_lock().map_err(|error| format!("Could not exclusively lock the room directory: {error}"))?;
-        Ok(Self { data: root.join("state"), _lock: lock, blobs: Blobs::new(), blob_bytes: 0 })
+    fn new(files: Arc<dyn RoomFiles>) -> Self {
+        Self { files, blobs: Blobs::new(), blob_bytes: 0 }
     }
 
     fn header(&self) -> Result<Header, String> {
-        let bytes = read_capped(self.data.join("room.json"), 4096).map_err(io_error)?;
-        let header: Header = serde_json::from_slice(&bytes).map_err(io_error)?;
+        let bytes = self.files.read(RoomFile::Header, 4096)?;
+        let header: Header = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         if header.version != VERSION {
             return Err("Unsupported room data version.".into());
         }
@@ -91,16 +65,12 @@ impl Journal {
     }
 
     fn seed(&mut self, header: &Header) -> Result<Document, String> {
-        let bytes = read_capped(self.data.join("seed"), super::seed::MAX_SEED_BYTES as u64).map_err(io_error)?;
+        let bytes = self.files.read(RoomFile::Seed, super::seed::MAX_SEED_BYTES as u64)?;
         let doc = seed_document::restore_bundle(&bytes, |id| self.load_blob(id))?;
         if fingerprint(&doc)? != header.seed {
             return Err("The room seed differs from the saved room identity.".into());
         }
         Ok(doc)
-    }
-
-    fn blob_path(&self, id: BlobId) -> PathBuf {
-        self.data.join("blobs").join(URL_SAFE_NO_PAD.encode(id.digest))
     }
 
     fn check_blob_space(&self, id: BlobId) -> Result<(), String> {
@@ -127,7 +97,7 @@ impl Journal {
             return Ok(data.clone());
         }
         self.check_blob_space(id)?;
-        let data = Arc::new(read_capped(self.blob_path(id), u64::from(id.length)).map_err(io_error)?);
+        let data = Arc::new(self.files.read(RoomFile::Blob(id.digest), u64::from(id.length))?);
         Self::verify(id, &data)?;
         self.remember(id, data.clone());
         Ok(data)
@@ -141,7 +111,7 @@ impl Journal {
             self.check_blob_space(id)?;
             Self::verify(id, &data)?;
             // Replace an orphan left by an interrupted write before publishing its reference.
-            private_files().atomic_write(&self.blob_path(id), &data).map_err(io_error)?;
+            self.files.write(RoomFile::Blob(id.digest), &data)?;
             self.remember(id, data);
         }
         Ok(())
@@ -149,31 +119,16 @@ impl Journal {
 
     pub(super) fn append(&mut self, commit: &Commit) -> Result<(), String> {
         self.save_blobs(commit.proposal.blobs()?)?;
-        let path = self.data.join("history").join(format!("{}.json", commit.revision));
-        private_files().write_new_with(&path, |file| serde_json::to_writer(file, commit).map_err(io::Error::other)).map_err(io_error)
+        self.files.write(RoomFile::Revision(commit.revision), &serde_json::to_vec(commit).map_err(|e| e.to_string())?)
     }
 
     fn history(&mut self) -> Result<Vec<Commit>, String> {
-        let history = self.data.join("history");
-        let mut revisions = BTreeMap::new();
-        for entry in fs::read_dir(&history).map_err(io_error)? {
-            let entry = entry.map_err(io_error)?;
-            let path = entry.path();
-            // Ignore interrupted atomic-write staging files, whose names do not end in .json.
-            if path.extension().and_then(|v| v.to_str()) != Some("json") {
-                continue;
-            }
-            let revision = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok()).ok_or("Invalid journal revision name.")?;
-            if revisions.insert(revision, path).is_some() || revisions.len() > MAX_HISTORY {
-                return Err("Unexpected number of room revisions.".into());
-            }
-        }
         let mut commits = Vec::new();
         let mut remaining = MAX_HISTORY_BYTES as u64;
-        for (revision, path) in revisions {
-            let bytes = read_capped(path, remaining).map_err(io_error)?;
+        for revision in self.files.revisions(MAX_HISTORY)? {
+            let bytes = self.files.read(RoomFile::Revision(revision), remaining)?;
             remaining -= bytes.len() as u64;
-            let mut commit: Commit = serde_json::from_slice(&bytes).map_err(io_error)?;
+            let mut commit: Commit = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
             if commit.revision != revision || revision != commits.len() as u64 + 1 {
                 return Err("The room journal has a missing or mismatched revision.".into());
             }
@@ -195,76 +150,46 @@ impl Journal {
     }
 }
 
-/// Initialize a new private room. The optional original document is imported once.
-pub fn init(root: &Path, seed_path: Option<&Path>) -> Result<(), String> {
-    let mut doc = if let Some(path) = seed_path {
-        let input = read_capped(path, MAX_ARTWORK_BYTES as u64 + 8 * 1024 * 1024).map_err(io_error)?;
-        designcraft_format::load(&input).map_err(io_error)?
-    } else {
-        Document::new(&NewDocument::default())
-    };
+/// Initialize the supplied storage with a standalone document.
+pub fn init(files: Arc<dyn RoomFiles>, mut doc: Document) -> Result<(), String> {
     seed_document::prepare_local_copy(&mut doc)?;
     doc.compact_assets();
     let (bytes, blobs) = seed_document::bundle(&doc)?;
     let header =
         Header { version: VERSION, seed: fingerprint(&doc)?, identity: Identity::generate().to_bytes(), access: Identity::generate().to_bytes() };
-    match fs::DirBuilder::new().mode(0o700).create(root) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(io_error(error)),
-    }
-    let mut journal = Journal::lock(root)?;
-    for entry in fs::read_dir(root).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        // A crash during initialization may leave an unpublished staging directory.
-        if !entry.file_name().to_string_lossy().starts_with(".collate-init-") || !entry.file_type().map_err(io_error)?.is_dir() {
-            return Err("Initialize in an empty directory. Use serve to resume an existing room.".into());
-        }
-    }
-    let state = journal.data;
-    let stage = tempfile::Builder::new().prefix(".collate-init-").tempdir_in(root).map_err(io_error)?;
-    journal.data = stage.path().to_owned();
-    fs::DirBuilder::new().mode(0o700).create(journal.data.join("history")).map_err(io_error)?;
-    fs::DirBuilder::new().mode(0o700).create(journal.data.join("blobs")).map_err(io_error)?;
+    let mut journal = Journal::new(files);
     journal.save_blobs(blobs)?;
-    private_files().write_new(&journal.data.join("seed"), &bytes).map_err(io_error)?;
-    private_files().write_new(&journal.data.join("room.json"), &serde_json::to_vec(&header).map_err(io_error)?).map_err(io_error)?;
-    fs::rename(stage.path(), &state).map_err(io_error)?;
-    RealFs.sync_dir(root).map_err(io_error)
+    journal.files.write(RoomFile::Seed, &bytes)?;
+    journal.files.write(RoomFile::Header, &serde_json::to_vec(&header).map_err(|e| e.to_string())?)
 }
 
 /// Replace the room access token while the server is stopped.
-pub fn rotate_invite(root: &Path) -> Result<(), String> {
-    let journal = Journal::lock(root)?;
+pub fn rotate_invite(files: Arc<dyn RoomFiles>) -> Result<(), String> {
+    let journal = Journal::new(files);
     let mut header = journal.header()?;
-    clear_invitation(&root.join("invitation.txt"))?;
+    journal.files.clear_invitation()?;
     header.access = Identity::generate().to_bytes();
-    private_files().atomic_write(&journal.data.join("room.json"), &serde_json::to_vec(&header).map_err(io_error)?).map_err(io_error)
+    journal.files.write(RoomFile::Header, &serde_json::to_vec(&header).map_err(|e| e.to_string())?)
 }
 
-/// Export a standalone snapshot. Shared comments and edit history stay in the room directory.
-pub fn export(root: &Path, output: &Path) -> Result<(), String> {
-    let mut journal = Journal::lock(root)?;
-    let (_, _, recovered) = journal.load()?;
-    private_files()
-        .write_new_with(output, |file| designcraft_format::write(file, &recovered.document, None).map_err(io::Error::other))
-        .map_err(io_error)
+/// Reconstruct a standalone snapshot from the last confirmed revision.
+pub fn snapshot(files: Arc<dyn RoomFiles>) -> Result<Document, String> {
+    Ok(Journal::new(files).load()?.2.document)
 }
 
 pub struct Server {
     room: Room,
     session: Session,
-    invitation_file: PathBuf,
+    files: Arc<dyn RoomFiles>,
     published: Option<String>,
 }
 
 impl Server {
     /// Reopen the last confirmed revision and advertise the room on its configured port.
-    pub fn open(root: &Path, relay: bool, port: u16) -> Result<Self, String> {
-        let mut journal = Journal::lock(root)?;
+    pub fn open(files: Arc<dyn RoomFiles>, relay: bool, port: u16) -> Result<Self, String> {
+        let mut journal = Journal::new(files.clone());
         let (header, seed, recovered) = journal.load()?;
-        let invitation_file = root.join("invitation.txt");
-        clear_invitation(&invitation_file)?;
+        journal.files.clear_invitation()?;
         let storage = Storage::ephemeral(seed, header.identity)?;
         let transport = Transport::persistent_host("Collate room server", relay, storage.identity(), port, header.access)?;
         let state = DocState::new(recovered.document, None);
@@ -277,7 +202,7 @@ impl Server {
         room.server_journal = Some(journal);
         let mut session = Session::new();
         session.add_document(state);
-        Ok(Self { session, room, invitation_file, published: None })
+        Ok(Self { session, room, files, published: None })
     }
 
     /// Process a bounded batch of events. No UI frame or GPU is required.
@@ -289,12 +214,16 @@ impl Server {
         if let Some(invite) = &self.room.invitation
             && self.published.as_ref() != Some(invite)
         {
-            private_files().atomic_write(&self.invitation_file, invite.as_bytes()).map_err(io_error)?;
+            self.files.write(RoomFile::Invitation, invite.as_bytes())?;
             self.published = Some(invite.clone());
         }
         Ok(if self.room.peers.is_empty() { Duration::from_millis(100) } else { Duration::from_millis(10) })
     }
 }
 
+// Exercise the executable’s actual lock, filesystem and atomic writes with the native editor.
+#[cfg(test)]
+#[path = "../../../../apps/collate-room-server/src/directory.rs"]
+pub(super) mod directory;
 #[cfg(test)]
 mod tests;

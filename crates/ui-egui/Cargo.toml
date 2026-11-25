@@ -72,5 +72,5 @@ features = ["native", "secure-journal"]
 designcraft-collab-core = { path = "../collab-core", features = ["test-journal"] }
 security-framework = "3"
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 craft-atomic = { workspace = true }

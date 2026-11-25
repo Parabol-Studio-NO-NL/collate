@@ -2,7 +2,6 @@
 //! precedes its seed or edit; ordinary packets and per-peer flow control stay small.
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     sync::Arc,
 };
@@ -10,6 +9,7 @@ use std::{
 use designcraft_collab::artwork::{BlobId, MAX_ARTWORK_BYTES};
 use designcraft_collab_core::MAX_PAYLOAD;
 use sha2::{Digest, Sha256};
+use tempfile::SpooledTempFile;
 
 use super::Proposal;
 
@@ -99,7 +99,7 @@ impl BlobCursor {
 
 struct Incoming {
     id: BlobId,
-    file: File,
+    file: SpooledTempFile,
     received: usize,
     hash: Sha256,
 }
@@ -107,7 +107,7 @@ struct Incoming {
 #[derive(Default)]
 pub(super) struct BlobDownload {
     pending: Option<Incoming>,
-    complete: BTreeMap<BlobId, File>,
+    complete: BTreeMap<BlobId, SpooledTempFile>,
     reserved: usize,
     last_part: Option<web_time::Instant>,
 }
@@ -147,7 +147,8 @@ impl BlobDownload {
             if offset != 0 || self.complete.contains_key(&id) || self.complete.len() >= 256 || self.reserved.saturating_add(length) > allowance {
                 return Err(INVALID.into());
             }
-            self.pending = Some(Incoming { id, file: tempfile::tempfile().map_err(|_| IO_ERROR)?, received: 0, hash: Sha256::new() });
+            // A zero threshold keeps every nonempty chunk on disk in an anonymous temporary file.
+            self.pending = Some(Incoming { id, file: tempfile::spooled_tempfile(0), received: 0, hash: Sha256::new() });
             self.reserved += length;
         }
         let stream = self.pending.as_mut().ok_or(INVALID)?;
