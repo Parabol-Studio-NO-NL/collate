@@ -12,6 +12,7 @@ use web_time::Instant;
 use super::attachments::{self, BlobCursor, BlobDownload, Blobs};
 use super::seed::{SEED_CHUNK_BYTES, SeedDownload, SeedUpload};
 use super::shared_artwork::SharedArtworkFolder;
+use super::storage::Storage;
 use super::{Message, Mode, Packet, Room, compatible_invitation, encode_for_protocol, seed_document};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
@@ -356,26 +357,26 @@ impl SeedDelivery {
                 let artwork_folder = artwork_folder.map(Path::to_path_buf);
                 let roots = file_access::current();
                 let (sender, receiver) = mpsc::sync_channel(1);
-                std::thread::Builder::new()
-                    .name("collate-room-previews".into())
-                    .spawn(move || {
-                        let preview = seed_document::preview_seed(&document);
-                        let originals = artwork_folder.as_ref().and_then(|_| preview.as_ref().ok()).map(|preview| preview.originals.clone());
-                        if sender.send(preview).is_ok()
-                            && let (Some(path), Some(originals)) = (artwork_folder, originals)
-                        {
-                            file_access::confine(roots.as_ref(), || {
-                                if let Ok(folder) = SharedArtworkFolder::open(&path) {
-                                    for (id, original) in originals {
-                                        let _ = folder.publish(id, &original);
-                                    }
+                let worker = std::thread::Builder::new().name("collate-room-previews".into()).spawn(move || {
+                    let preview = seed_document::preview_seed(&document);
+                    let originals = artwork_folder.as_ref().and_then(|_| preview.as_ref().ok()).map(|preview| preview.originals.clone());
+                    if sender.send(preview).is_ok()
+                        && let (Some(path), Some(originals)) = (artwork_folder, originals)
+                    {
+                        file_access::confine(roots.as_ref(), || {
+                            if let Ok(folder) = SharedArtworkFolder::open(&path) {
+                                for (id, original) in originals {
+                                    let _ = folder.publish(id, &original);
                                 }
-                            });
-                        }
-                    })
-                    .map_err(|_| "Could not prepare the room previews.")?;
-                self.preparing = Some(receiver);
-            } else {
+                            }
+                        });
+                    }
+                });
+                if worker.is_ok() {
+                    self.preparing = Some(receiver);
+                }
+            }
+            if self.preparing.is_none() {
                 self.upload = Some(SeedUpload::new(archive).map_err(|error| error.to_string())?);
             }
         }
@@ -390,7 +391,8 @@ impl SeedDelivery {
         self.originals.remove(&peer);
     }
 
-    pub(super) fn advance(&mut self, transport: &Transport, blobs: &Blobs, protocol: RoomProtocol) {
+    pub(super) fn advance(&mut self, transport: &Transport, storage: &Storage) {
+        let protocol = storage.protocol;
         if let Some(preparing) = &self.preparing {
             let received = match preparing.try_recv() {
                 Ok(preview) => preview,
@@ -403,19 +405,22 @@ impl SeedDelivery {
                     self.upload = Some(upload);
                     self.preview = Some(preview);
                 }
-                Err(_) => {
-                    self.failed = true;
-                    if let Ok(bytes) = encode_for_protocol(Message::Incompatible, protocol) {
-                        for &peer in self.peers.keys() {
-                            let _ = transport.send_to(peer, bytes.clone());
+                Err(_) => match SeedUpload::new(&storage.archive) {
+                    Ok(upload) => self.upload = Some(upload),
+                    Err(_) => {
+                        self.failed = true;
+                        if let Ok(bytes) = encode_for_protocol(Message::Incompatible, protocol) {
+                            for &peer in self.peers.keys() {
+                                let _ = transport.send_to(peer, bytes.clone());
+                            }
                         }
+                        self.peers.clear();
                     }
-                    self.peers.clear();
-                }
+                },
             }
         }
         let Some(upload) = self.upload.as_ref() else { return };
-        let blobs = self.preview.as_ref().map_or(blobs, |preview| &preview.eager);
+        let blobs = self.preview.as_ref().map_or(&storage.seed_blobs, |preview| &preview.eager);
         self.peers.retain(|&peer, (binary, offset)| {
             for _ in 0..SEND_BURST {
                 match binary.next(blobs, |part| transport.send_to(peer, part)) {
