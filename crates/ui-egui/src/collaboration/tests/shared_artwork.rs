@@ -28,7 +28,7 @@ fn wait_without_host_originals(host: &mut DesignApp, guest: &mut DesignApp, stag
         }
         assert!(!hosted.fatal, "{stage}: {:?}", hosted.error);
         hosted.advance_delivery();
-        hosted.seed_delivery.advance(&hosted.transport, &hosted.storage.seed_blobs, hosted.protocol);
+        hosted.seed_delivery.advance(&hosted.transport, &hosted.storage);
         done(apps[0])
     });
 }

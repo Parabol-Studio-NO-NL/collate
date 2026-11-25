@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ActorId, Peer};
 
-use self::wire::{ALPN, Admit, FromHost, Hello, IO_TIMEOUT, Ticket};
+use self::wire::{ADMISSION_TIMEOUT, ALPN, Admit, FromHost, Hello, Ticket, WRITE_STALL_TIMEOUT};
 
 pub const MAX_PAYLOAD: usize = 48 * 1024;
 const MAX_GUESTS: usize = 3;
@@ -241,7 +241,7 @@ impl Worker {
         let mut generation = 0;
         let mut seat_retries = 0;
         loop {
-            match timeout(IO_TIMEOUT, endpoint.connect(ticket.address.clone(), ALPN)).await {
+            match timeout(ADMISSION_TIMEOUT, endpoint.connect(ticket.address.clone(), ALPN)).await {
                 Ok(Ok(connection)) => {
                     generation += 1;
                     match self.exchange(ticket, local, connection, generation).await {
@@ -263,10 +263,10 @@ impl Worker {
     }
 
     async fn exchange(&mut self, ticket: &Ticket, local: &Peer, connection: Connection, generation: u64) -> ExchangeError {
-        let opened = timeout(IO_TIMEOUT, async {
+        let opened = timeout(ADMISSION_TIMEOUT, async {
             let streams = connection.open_bi().await.map_err(|_| "The peer stream closed.")?;
             let (mut output, mut input) = wire::framed(streams);
-            wire::write(&mut output, &Hello { access: ticket.access, name: local.name.clone() }).await?;
+            wire::write(&mut output, &Hello { access: ticket.access, name: local.name.clone() }, ADMISSION_TIMEOUT).await?;
             let response = wire::read(&mut input).await?;
             Ok::<_, String>((output, input, response))
         })
@@ -287,21 +287,26 @@ impl Worker {
         for peer in peers {
             self.publish(Event::PeerJoined(peer)).await;
         }
-        loop {
-            tokio::select! {
-                response = wire::read(&mut input) => {
-                    match response.ok().and_then(|value| guest_event(value, host.actor, local.actor)) {
-                        Some(event) => self.publish(event).await,
-                        None => return ExchangeError::Retry,
-                    }
-                }
-                Some(message) = self.inbox.recv() => {
-                    if message.generation == generation && wire::write(&mut output, &message.bytes).await.is_err() {
-                        return ExchangeError::Retry;
-                    }
+        let report = &self.report;
+        let receive = async {
+            while let Some(event) = wire::read(&mut input).await.ok().and_then(|value| guest_event(value, host.actor, local.actor)) {
+                if report.send(event).await.is_err() {
+                    break;
                 }
             }
+        };
+        let transmit = async {
+            while let Some(message) = self.inbox.recv().await {
+                if message.generation == generation && wire::write(&mut output, &message.bytes, WRITE_STALL_TIMEOUT).await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            _ = receive => {},
+            _ = transmit => {},
         }
+        ExchangeError::Retry
     }
 }
 

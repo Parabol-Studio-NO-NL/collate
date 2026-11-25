@@ -688,7 +688,7 @@ impl Room {
             }
         }
         self.advance_delivery();
-        self.seed_delivery.advance(&self.transport, &self.storage.seed_blobs, self.protocol);
+        self.seed_delivery.advance(&self.transport, &self.storage);
         self.advance_proposal();
         self.advance_original_delivery();
     }

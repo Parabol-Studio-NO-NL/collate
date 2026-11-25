@@ -27,6 +27,7 @@ const MAX_PROXY_PIXELS: u64 = 1024 * 1024;
 const LEGACY_TOTAL_PIXELS: u64 = 32 * 1024 * 1024;
 const SCREEN_PREVIEW_SIDE: u32 = 256;
 const SCREEN_PREVIEW_BYTES: usize = 64 * 1024;
+const RASTER_SEED_TARGET_BYTES: usize = 512 * 1024;
 // The native File > New page size ceiling, in points (216 inches).
 const MAX_PAGE_POINTS: f64 = 15_552.0;
 const NATIVE_MEMBERS: [&str; 3] = ["mimetype", "meta.json", "document.json"];
@@ -254,7 +255,14 @@ pub(super) struct PreviewSeed {
 }
 
 pub(super) fn use_preview_seed(doc: &Document) -> bool {
-    doc.assets.values().any(|asset| asset.mime != PDF_MIME && asset.data.len() > SCREEN_PREVIEW_BYTES as u64)
+    let preview_bytes = raster_seed_bytes_per_asset(doc);
+    doc.assets.values().any(|asset| asset.mime != PDF_MIME && asset.data.len() > preview_bytes as u64)
+}
+
+fn raster_seed_bytes_per_asset(doc: &Document) -> usize {
+    let count = doc.assets.values().filter(|asset| asset.mime != PDF_MIME).count();
+    // All raster previews and small raster originals are sent before the guest can edit.
+    SCREEN_PREVIEW_BYTES.min(RASTER_SEED_TARGET_BYTES / count.max(1))
 }
 
 pub(super) fn is_preview_seed(bytes: &[u8]) -> bool {
@@ -276,14 +284,18 @@ pub(super) fn artwork_size(doc: &Document) -> u64 {
 pub(super) fn preview_seed(doc: &Document) -> Result<PreviewSeed, String> {
     validate_model(doc, RoomProtocol::Automerge)?;
     payloads(doc, false, RoomProtocol::Automerge)?;
+    let preview_bytes = raster_seed_bytes_per_asset(doc);
+    // Start with a smaller thumbnail when the byte limit calls for one, avoiding
+    // unnecessary encode attempts at the 256-pixel ceiling for illustrated books.
+    let preview_side = SCREEN_PREVIEW_SIDE.min((preview_bytes as u32).isqrt() * 2);
     let mut eager = Blobs::new();
     let mut originals = Blobs::new();
     let mut members = BTreeMap::new();
     for (&id, asset) in &doc.assets {
         let body = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
         let original = blob_id(body)?;
-        let preview = (asset.mime != PDF_MIME && body.len() > SCREEN_PREVIEW_BYTES)
-            .then(|| designcraft_render::proxy::make_proxy_with_limits(body, asset.page, SCREEN_PREVIEW_SIDE, SCREEN_PREVIEW_BYTES))
+        let preview = (asset.mime != PDF_MIME && body.len() > preview_bytes)
+            .then(|| designcraft_render::proxy::make_proxy_with_limits(body, asset.page, preview_side, preview_bytes))
             .flatten();
         let screen_preview = if let Some(image) = preview {
             originals.entry(original).or_insert_with(|| body.clone());

@@ -35,6 +35,92 @@ fn a_preview_seed_keeps_the_original_fingerprint_with_multiple_native_proxies() 
 
 #[cfg(feature = "automerge-rooms")]
 #[test]
+fn many_individually_small_originals_open_as_bounded_raster_previews() {
+    use crate::collaboration::seed_document::{preview_seed, restore_preview_seed, use_preview_seed, verify_original};
+
+    let (mut seed, icon, _) = embedded_image_fixture();
+    let side = 72;
+    // Reuse the synthetic illustration generator from the book fixture.
+    for number in 1..=80 {
+        let id = AssetId(seed.alloc());
+        let asset = designcraft_doc::Asset {
+            id,
+            name: format!("Book illustration {number}.png"),
+            mime: "image/png".into(),
+            data: AssetData::embedded(artwork_fixture_with_side(number, side)),
+            pixels: Some((side, side)),
+            ..Default::default()
+        };
+        seed.assets.insert(id, Arc::new(asset));
+    }
+
+    assert!(use_preview_seed(&seed));
+    let mut preview = preview_seed(&seed).unwrap();
+    let original_bytes: u64 = seed.assets.values().map(|asset| asset.data.len()).sum();
+    let eager_bytes: usize = preview.eager.values().map(|bytes| bytes.len()).sum();
+    assert!((eager_bytes as u64) < original_bytes / 2);
+    let (partial, originals) = restore_preview_seed(&preview.archive, |id| Ok(preview.eager.remove(&id).unwrap())).unwrap();
+    assert_eq!(partial.assets[&icon], seed.assets[&icon]);
+    assert_eq!(originals.len(), seed.assets.len() - 1);
+    assert_eq!(fingerprint(&partial).unwrap(), fingerprint(&seed).unwrap());
+
+    for (id, targets) in originals {
+        let bytes = &preview.originals[&id];
+        for target in targets {
+            verify_original(&target, bytes).unwrap();
+            assert!(target.data.install_verified_original(bytes.clone()));
+        }
+    }
+    assert_eq!(partial, seed);
+}
+
+#[cfg(feature = "automerge-rooms")]
+#[test]
+fn a_guest_receives_the_full_seed_when_the_preview_manifest_exceeds_the_model_limit() {
+    use crate::collaboration::seed_document::{MAX_MODEL_BYTES, model_bytes, preview_seed, use_preview_seed};
+    use designcraft_doc::{Content, Graphic, SpreadRef};
+
+    let (mut seed, asset, frame) = embedded_image_fixture();
+    let asset_template = (*seed.assets[&asset]).clone();
+    let frame_template = seed.item(frame).unwrap().clone();
+    let graphic_template = frame_template.graphic().unwrap();
+    let side = 120;
+    for number in 1..=10 {
+        let id = AssetId(seed.alloc());
+        let asset = designcraft_doc::Asset {
+            id,
+            data: AssetData::embedded(artwork_fixture_with_side(number, side)),
+            pixels: Some((side, side)),
+            proxy: None,
+            ..asset_template.clone()
+        };
+        seed.assets.insert(id, Arc::new(asset));
+        let mut placed = frame_template.clone();
+        placed.id = designcraft_doc::ItemId(seed.alloc());
+        placed.content = Content::Graphic(Graphic { asset: id, ..graphic_template.clone() });
+        seed.insert_item(SpreadRef::Doc(0), placed, None).unwrap();
+    }
+    // A compressible field fills the model without requiring a long story to compose.
+    seed.file_info.description.push('x');
+    let remaining = MAX_MODEL_BYTES - model_bytes(&seed).unwrap().len();
+    seed.file_info.description.push_str(&"x".repeat(remaining - 256));
+    assert!(use_preview_seed(&seed));
+    assert!(preview_seed(&seed).is_err());
+
+    let mut host = editor(&seed, "Book host");
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "host invites guests to the full seed", |apps| room(apps[0]).invitation.is_some());
+    let mut guest = DesignApp::new(Session::new(), Services::default());
+    guest.collaboration.name = "Book guest".into();
+    guest.collaboration.join_code = room(&host).invitation.clone().unwrap();
+    guest.start_seed_download().unwrap();
+    wait_for(&mut [&mut host, &mut guest], "guest receives the full seed", |apps| apps[1].collaboration.room.as_ref().is_some_and(Room::can_edit));
+    assert!(!room(&guest).originals.is_pending());
+    assert_eq!(fingerprint(document(&guest)).unwrap(), fingerprint(&seed).unwrap());
+}
+
+#[cfg(feature = "automerge-rooms")]
+#[test]
 fn a_guest_edits_from_previews_before_the_verified_original_is_available() {
     let (mut seed, asset, _) = embedded_image_fixture();
     let bytes = artwork_fixture_with_side(781, 720);
