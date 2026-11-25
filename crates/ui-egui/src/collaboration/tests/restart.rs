@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::collaboration::storage::JOURNAL_DIRECTORY;
 
 #[path = "room_restart.rs"]
 mod room_restart;
@@ -100,10 +101,43 @@ fn restore_artwork_checkpoint(root: &Path) {
     assert!(embedded.data.embedded_bytes().unwrap().as_slice() == artwork_fixture(555));
 }
 
+#[cfg(feature = "automerge-rooms")]
+fn save_story_checkpoint(root: &Path) {
+    let mut initial = editor(&Document::new(&NewDocument::default()), "Story fixture");
+    initial.run("frame.create", json!({"rect": [30, 40, 300, 300], "content": "text", "text": "Le fleuve"})).unwrap();
+    initial.run("file.saveAs", json!({"path": root.join("Story.designcraft")})).unwrap();
+    let mut host = reopened(root, "Story");
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "durable story host", |apps| room(apps[0]).can_edit());
+    let story = *document(&host).stories.keys().next().unwrap();
+    host.run("text.select", json!({"story": story.0, "anchor": "Le fleuve".len()})).unwrap();
+    host.run("text.insert", json!({"text": " à l’aube", "raw": true})).unwrap();
+    wait_for(&mut [&mut host], "journal the Automerge edit", |apps| room(apps[0]).revision == 1);
+    assert!(room(&host).history[0].0.proposal.story_transaction.is_some());
+    assert!(!root.join("Story").join("Collaboration").exists());
+}
+
+#[cfg(feature = "automerge-rooms")]
+fn restore_story_checkpoint(root: &Path) {
+    let mut host = reopened(root, "Story");
+    let story = *document(&host).stories.keys().next().unwrap();
+    assert_eq!(document(&host).story(story).unwrap().text, "Le fleuve");
+    host.connect_collaboration(true).unwrap();
+    let recovered = "Le fleuve à l’aube";
+    assert_eq!(document(&host).story(story).unwrap().text, recovered);
+    wait_for(&mut [&mut host], "restored story host", |apps| room(apps[0]).can_edit());
+    host.run("text.select", json!({"story": story.0, "anchor": recovered.len()})).unwrap();
+    host.run("text.insert", json!({"text": ".", "raw": true})).unwrap();
+    wait_for(&mut [&mut host], "extend the restored Automerge history", |apps| room(apps[0]).revision == 2);
+    assert_eq!(document(&host).story(story).unwrap().text, format!("{recovered}."));
+}
+
 /// Stage exactly one outbox entry, without polling the host or delivering the guest's edit.
 fn save_checkpoint(root: &Path) {
     room_restart::verify_fresh_room_keeps_the_previous_room(root);
     save_artwork_checkpoint(root);
+    #[cfg(feature = "automerge-rooms")]
+    save_story_checkpoint(root);
     let seed = Document::new(&NewDocument::default());
     let mut initial = editor(&seed, "Fixture");
     let host_path = root.join("Host.designcraft");
@@ -162,7 +196,7 @@ fn save_checkpoint(root: &Path) {
     std::fs::write(root.join("checkpoint.json"), serde_json::to_vec(&checkpoint).unwrap()).unwrap();
 
     for role in ["Host", "Guest"] {
-        let journal = root.join(role).join("Collaboration");
+        let journal = root.join(role).join(JOURNAL_DIRECTORY);
         let records: Vec<_> = std::fs::read_dir(journal)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -183,6 +217,8 @@ fn read_checkpoint(root: &Path) -> Checkpoint {
 
 fn restore_checkpoint(root: &Path) {
     restore_artwork_checkpoint(root);
+    #[cfg(feature = "automerge-rooms")]
+    restore_story_checkpoint(root);
     let checkpoint = read_checkpoint(root);
     let mut host = reopened(root, "Host");
     assert_eq!(fingerprint(document(&host)).unwrap(), checkpoint.document);

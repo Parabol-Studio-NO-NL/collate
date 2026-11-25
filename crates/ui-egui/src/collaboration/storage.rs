@@ -8,6 +8,8 @@ use super::{Commit, Proposal, attachments::Blobs, seed_document};
 use designcraft_collab::artwork::BlobId;
 
 const JOURNAL_VERSION: u16 = 1;
+#[cfg(target_os = "macos")]
+pub(super) const JOURNAL_DIRECTORY: &str = if cfg!(feature = "automerge-rooms") { "Collaboration-Protocol16" } else { "Collaboration" };
 
 #[cfg(target_os = "macos")]
 use designcraft_collab_core::journal::{Journal, RecordId, RecordLock, Role};
@@ -309,8 +311,7 @@ impl Durable {
             hash.update(host.0);
         }
         let path_record = RecordId { room: hash.finalize().into(), role: if guest_of.is_some() { Role::Guest } else { Role::Host } };
-        let directory = if cfg!(feature = "automerge-rooms") { "Collaboration-Protocol16" } else { "Collaboration" };
-        let journal = Journal::new(root.join(directory));
+        let journal = Journal::new(root.join(JOURNAL_DIRECTORY));
         // All host versions of the path share the existing writer lease. The
         // pointer and replacement can only be changed while that lease is held.
         let lease = journal.lock(path_record).map_err(|error| error.to_string())?;
