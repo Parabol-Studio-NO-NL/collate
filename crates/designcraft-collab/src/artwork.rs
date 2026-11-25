@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Error,
+    Error, RoomProtocol,
     pdf_artwork::{self, PdfPlacement},
 };
 
 pub use pdf_artwork::PDF_MIME;
+const PSD_MIME: &str = "image/vnd.adobe.photoshop";
 
 pub const MAX_IMAGE_SIDE: u32 = 12_000;
 pub const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
@@ -63,7 +64,7 @@ struct Artwork {
 }
 
 impl Placement {
-    pub(crate) fn capture(graphic: &Graphic, before: &Document, after: &Document) -> Result<Self, Error> {
+    pub(crate) fn capture(graphic: &Graphic, before: &Document, after: &Document, protocol: RoomProtocol) -> Result<Self, Error> {
         if graphic.layer_options.is_some()
             || graphic.clip.is_some()
             || graphic.auto_fit != Default::default()
@@ -75,6 +76,7 @@ impl Placement {
             return Err(Error::UnsupportedObject);
         }
         let asset = after.assets.get(&graphic.asset).ok_or(Error::UnknownResource)?;
+        check_artwork_protocol(&asset.mime, protocol)?;
         let digest = artwork_digest(asset).ok_or(Error::UnsupportedObject)?;
         let pdf = (asset.mime == PDF_MIME).then(|| PdfPlacement::for_asset(asset));
         // The same PDF can back multiple native assets, one per page and crop.
@@ -119,7 +121,7 @@ impl Placement {
         Ok(())
     }
 
-    pub(crate) fn install(&self, document: &mut Document) -> Result<Graphic, Error> {
+    pub(crate) fn install(&self, document: &mut Document, protocol: RoomProtocol) -> Result<Graphic, Error> {
         let (width, height) = self.size;
         let [a, b, c, d, x, y] = self.transform;
         let xf = Affine::new(self.transform);
@@ -139,9 +141,12 @@ impl Placement {
         let asset = if let Some(pdf) = &self.pdf {
             self.install_pdf(document, fresh, pdf)?
         } else if let Some(artwork) = &self.artwork {
+            check_artwork_protocol(&artwork.mime, protocol)?;
             document.add_asset(artwork.decode_raster(fresh, self.digest)?)
         } else {
-            self.existing_file(document, |asset| raster_format(&asset.mime).is_some())?.id
+            let asset = self.existing_file(document, |asset| raster_format(&asset.mime).is_some())?;
+            check_artwork_protocol(&asset.mime, protocol)?;
+            asset.id
         };
         document.next_id = next;
         Ok(Graphic {
@@ -264,14 +269,34 @@ pub fn pdf_dimensions(asset: &Asset, bytes: &[u8], verify_body: bool) -> Result<
     Ok(page.pixels)
 }
 
-pub fn raster_format(mime: &str) -> Option<(Format, &'static str)> {
+#[derive(Clone, Copy)]
+enum RasterFormat {
+    Codec(Format),
+    Psd,
+}
+
+fn raster_format(mime: &str) -> Option<(RasterFormat, &'static str)> {
+    use RasterFormat::{Codec, Psd};
     Some(match mime {
-        "image/png" => (Format::Png, "png"),
-        "image/jpeg" => (Format::Jpeg, "jpg"),
-        "image/gif" => (Format::Gif, "gif"),
-        "image/webp" => (Format::WebP, "webp"),
+        "image/png" => (Codec(Format::Png), "png"),
+        "image/jpeg" => (Codec(Format::Jpeg), "jpg"),
+        "image/gif" => (Codec(Format::Gif), "gif"),
+        "image/webp" => (Codec(Format::WebP), "webp"),
+        "image/tiff" => (Codec(Format::Tiff), "tiff"),
+        PSD_MIME => (Psd, "psd"),
         _ => return None,
     })
+}
+
+pub fn raster_extension(mime: &str) -> Option<&'static str> {
+    raster_format(mime).map(|(_, extension)| extension)
+}
+
+pub fn check_artwork_protocol(mime: &str, protocol: RoomProtocol) -> Result<(), Error> {
+    if !protocol.supports_print_artwork() && matches!(mime, PSD_MIME | "image/tiff") {
+        return Err(Error::ArtworkNeedsNewRoom);
+    }
+    Ok(())
 }
 
 pub fn valid_dimensions((width, height): (u32, u32), limit: u64) -> bool {
@@ -279,7 +304,10 @@ pub fn valid_dimensions((width, height): (u32, u32), limit: u64) -> bool {
 }
 
 pub fn raster_dimensions(mime: &str, bytes: &[u8], max_pixels: u64, verify_body: bool) -> Result<(u32, u32), &'static str> {
-    let (format, _) = raster_format(mime).ok_or("Shared documents support embedded PNG, JPEG, GIF and WebP images.")?;
+    let (format, _) = raster_format(mime).ok_or("Shared documents support embedded PNG, JPEG, GIF, WebP, PSD and TIFF images.")?;
+    let RasterFormat::Codec(format) = format else {
+        return psd_dimensions(bytes, max_pixels, verify_body);
+    };
     if craft_image_codecs::detect(bytes) != Some(format) {
         return Err("A shared image does not match its declared format.");
     }
@@ -291,6 +319,24 @@ pub fn raster_dimensions(mime: &str, bytes: &[u8], max_pixels: u64, verify_body:
         let limits = craft_image_codecs::Limits::new(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE, max_pixels, max_pixels * 8);
         let options = DecodeOptions { limits, keep_orientation: true };
         craft_image_codecs::decode_as_with(format, bytes, &options).map_err(|_| "A shared image is invalid.")?;
+    }
+    Ok(dimensions)
+}
+
+fn psd_dimensions(bytes: &[u8], max_pixels: u64, verify_body: bool) -> Result<(u32, u32), &'static str> {
+    if !designcraft_images::is_psd(bytes) {
+        return Err("A shared image does not match its declared format.");
+    }
+    let dimensions = designcraft_images::pixel_size(bytes).ok_or("A shared image is invalid.")?;
+    let pixels = u64::from(dimensions.0) * u64::from(dimensions.1);
+    // A PSD may declare many channels. Budget its planes and display conversion before decoding.
+    if !valid_dimensions(dimensions, max_pixels)
+        || pixels.saturating_mul(designcraft_images::decode_bytes_per_pixel(bytes) as u64) > MAX_IMAGE_PIXELS * 16
+    {
+        return Err("A shared image exceeds the room decode limit.");
+    }
+    if verify_body && designcraft_images::decode_rgba(bytes).is_none() {
+        return Err("A shared PSD needs a readable composite image.");
     }
     Ok(dimensions)
 }

@@ -9,8 +9,8 @@ use craft_image_codecs::Format;
 use craft_zip::{Archive, Compression, Limits, Writer, preflight};
 use designcraft_collab::RoomProtocol;
 use designcraft_collab::artwork::{
-    BlobId, MAX_ARTWORK_BYTES, MAX_IMAGE_PIXELS, PDF_MIME, pdf_dimensions, raster_dimensions as image_dimensions, raster_format as image_format,
-    valid_dimensions,
+    BlobId, MAX_ARTWORK_BYTES, MAX_IMAGE_PIXELS, PDF_MIME, check_artwork_protocol, pdf_dimensions, raster_dimensions as image_dimensions,
+    raster_extension, valid_dimensions,
 };
 use designcraft_doc::{Asset, AssetData, AssetId, Document, Proxy, Storage, StoryId};
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ const NATIVE_MEMBERS: [&str; 3] = ["mimetype", "meta.json", "document.json"];
 const INVALID: &str = "The received document bundle is invalid.";
 const TOO_LARGE: &str = "The shared document exceeds the room size limit.";
 const UNSUPPORTED_LINKS: &str = "Shared documents cannot contain linked assets, linked stories or data merges.";
-const UNSUPPORTED_ASSET: &str = "Shared documents support embedded PNG, JPEG, GIF, WebP and PDF artwork.";
+const UNSUPPORTED_ASSET: &str = "Shared documents support embedded PNG, JPEG, GIF, WebP, PDF, PSD and TIFF artwork.";
 
 fn max_assets(protocol: RoomProtocol) -> usize {
     if protocol.is_automerge() { AUTOMERGE_MAX_ASSETS } else { LEGACY_MAX_ASSETS }
@@ -281,9 +281,9 @@ pub(super) fn artwork_size(doc: &Document) -> u64 {
 
 /// Network-only seed. The ordinary native file and encrypted journal keep their
 /// complete artwork and never serialize these preview-only handles.
-pub(super) fn preview_seed(doc: &Document) -> Result<PreviewSeed, String> {
-    validate_model(doc, RoomProtocol::Automerge)?;
-    payloads(doc, false, RoomProtocol::Automerge)?;
+pub(super) fn preview_seed(doc: &Document, protocol: RoomProtocol) -> Result<PreviewSeed, String> {
+    validate_model(doc, protocol)?;
+    payloads(doc, false, protocol)?;
     let preview_bytes = raster_seed_bytes_per_asset(doc);
     // Start with a smaller thumbnail when the byte limit calls for one, avoiding
     // unnecessary encode attempts at the 256-pixel ceiling for illustrated books.
@@ -331,13 +331,14 @@ fn blob_id(bytes: &[u8]) -> Result<BlobId, String> {
 pub(super) fn restore_preview_seed(
     bytes: &[u8],
     mut load: impl FnMut(BlobId) -> Result<Arc<Vec<u8>>, String>,
+    protocol: RoomProtocol,
 ) -> Result<(Document, OriginalTargets), String> {
     if bytes.len() > MAX_SEED_BYTES {
         return Err(INVALID.into());
     }
     let manifest = bytes.strip_prefix(PREVIEW_MAGIC).ok_or(INVALID)?;
     let PreviewManifest { mut document, members }: PreviewManifest<Document> = serde_json::from_slice(manifest).map_err(|_| INVALID)?;
-    validate_model(&document, RoomProtocol::Automerge)?;
+    validate_model(&document, protocol)?;
     if document.assets.len() != members.len() {
         return Err(INVALID.into());
     }
@@ -626,7 +627,7 @@ fn validate_model(doc: &Document, protocol: RoomProtocol) -> Result<(), String> 
         if has_external_bytes(asset) || has_link_provenance(asset) {
             return Err(UNSUPPORTED_LINKS.into());
         }
-        validate_asset_metadata(asset)?;
+        validate_asset_metadata(asset, protocol)?;
     }
     Ok(())
 }
@@ -667,9 +668,10 @@ fn valid_layout(doc: &Document) -> bool {
         })
 }
 
-fn validate_asset_metadata(asset: &Asset) -> Result<(), String> {
+fn validate_asset_metadata(asset: &Asset, protocol: RoomProtocol) -> Result<(), String> {
     if asset.mime != PDF_MIME {
-        image_format(&asset.mime).ok_or(UNSUPPORTED_ASSET)?;
+        raster_extension(&asset.mime).ok_or(UNSUPPORTED_ASSET)?;
+        check_artwork_protocol(&asset.mime, protocol).map_err(|error| error.to_string())?;
     }
     if asset.pixels.is_some_and(|pixels| !valid_dimensions(pixels, MAX_IMAGE_PIXELS)) {
         return Err("A shared image exceeds the room pixel limit.".into());
@@ -695,7 +697,7 @@ fn has_linked_story(doc: &Document) -> bool {
 }
 
 fn asset_name(directory: &str, id: u64, mime: &str) -> Result<String, String> {
-    let extension = if directory == "assets" && mime == PDF_MIME { "pdf" } else { image_format(mime).ok_or(UNSUPPORTED_ASSET)?.1 };
+    let extension = if directory == "assets" && mime == PDF_MIME { "pdf" } else { raster_extension(mime).ok_or(UNSUPPORTED_ASSET)? };
     Ok(format!("{directory}/{id}.{extension}"))
 }
 
@@ -731,6 +733,7 @@ fn payloads(doc: &Document, verify_image_body: bool, protocol: RoomProtocol) -> 
     let mut pixels = 0u64;
     let total_pixels = total_pixels(protocol);
     for asset in doc.assets.values() {
+        check_artwork_protocol(&asset.mime, protocol).map_err(|error| error.to_string())?;
         let data = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
         let remaining = MAX_IMAGE_PIXELS.min(total_pixels - pixels);
         let dimensions = original_dimensions(asset, data, remaining, verify_image_body)?;

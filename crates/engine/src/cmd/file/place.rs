@@ -77,10 +77,12 @@ pub(super) fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
                     | craft_file_formats::Format::Jpeg
                     | craft_file_formats::Format::Gif
                     | craft_file_formats::Format::WebP
+                    | craft_file_formats::Format::Psd
+                    | craft_file_formats::Format::Tiff
                     | craft_file_formats::Format::Pdf
             )
         ) {
-            return Err(bad("file.place", "shared documents can place PDFs and PNG, JPEG, GIF and WebP images"));
+            return Err(bad("file.place", "shared documents can place PDF, PNG, JPEG, GIF, WebP, PSD and TIFF artwork"));
         }
     }
     if matches!(format, Some(craft_file_formats::Format::Idml | craft_file_formats::Format::DesignCraft)) {

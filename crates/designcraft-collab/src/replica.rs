@@ -303,7 +303,7 @@ impl Replica {
                         validation::editable_frame(item)?;
                         let index = u16::try_from(ops.len()).map_err(|_| Error::Limit)?;
                         let id = SharedId::Created { actor: actor.to_owned(), sequence, index };
-                        ops.push(capture_creation(before, after, item, id.clone(), spread.id)?);
+                        ops.push(capture_creation(before, after, item, id.clone(), spread.id, self.protocol)?);
                         created.insert(item.id, id);
                     }
                 }
@@ -323,7 +323,7 @@ impl Replica {
             let frame = ShapeFrame::from_item(old);
             ops.extend(ShapeFrame::from_item(new).changes(&frame).map(|change| Operation::Patch { id: id.clone(), change }));
             if old.graphic() != new.graphic() {
-                let placement = new.graphic().map(|graphic| Placement::capture(graphic, before, after)).transpose()?.map(Box::new);
+                let placement = new.graphic().map(|graphic| Placement::capture(graphic, before, after, self.protocol)).transpose()?.map(Box::new);
                 ops.push(Operation::SetGraphic { id: id.clone(), placement });
             }
             if old.text_frame() != new.text_frame() {
@@ -602,7 +602,7 @@ impl Replica {
                     if document.item_at(&loc).is_some_and(|item| item.text_frame().is_some()) {
                         return Err(Error::UnsupportedObject);
                     }
-                    let graphic = placement.as_ref().map(|value| value.install(document)).transpose()?;
+                    let graphic = placement.as_ref().map(|value| value.install(document, self.protocol)).transpose()?;
                     document.item_mut_at(&loc).ok_or(Error::UnknownObject)?.content = graphic.map_or(Content::Unassigned, Content::Graphic);
                 }
                 Operation::Reorder { spread, items } => self.reorder(document, *spread, items)?,
@@ -754,7 +754,7 @@ impl Replica {
         self.check_new_id(id)?;
         validation::created_frame(document, frame)?;
         let destination = spread_ref(document, spread)?;
-        let graphic = placement.map(|placement| placement.install(document)).transpose()?;
+        let graphic = placement.map(|placement| placement.install(document, self.protocol)).transpose()?;
         let local = ItemId(document.next_id.checked_add(1).ok_or(Error::Limit)?);
         if document.item(local).is_some() || document.anchored_item(local).is_some() {
             return Err(Error::DuplicateId);
@@ -940,12 +940,19 @@ fn validate_initial_text(text: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn capture_creation(before: &Document, after: &Document, item: &Item, id: SharedId, spread: SpreadId) -> Result<Operation, Error> {
+fn capture_creation(
+    before: &Document,
+    after: &Document,
+    item: &Item,
+    id: SharedId,
+    spread: SpreadId,
+    protocol: RoomProtocol,
+) -> Result<Operation, Error> {
     let frame = Box::new(ShapeFrame::from_item(item));
     match &item.content {
         Content::Unassigned => Ok(Operation::Create { id, spread, frame }),
         Content::Graphic(graphic) => {
-            let placement = Box::new(Placement::capture(graphic, before, after)?);
+            let placement = Box::new(Placement::capture(graphic, before, after, protocol)?);
             Ok(Operation::CreateGraphic { id, spread, frame, placement })
         }
         Content::Text(text) if before.story(text.story).is_none() => {

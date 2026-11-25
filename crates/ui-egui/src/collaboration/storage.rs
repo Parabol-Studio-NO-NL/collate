@@ -20,7 +20,11 @@ pub(super) const JOURNAL_DIRECTORY: &str = journal_directory(RoomProtocol::CURRE
 #[cfg(target_os = "macos")]
 // Keep the development path stable so existing protocol-16 journals can migrate in place.
 const fn journal_directory(protocol: RoomProtocol) -> &'static str {
-    if protocol.is_automerge() { "Collaboration-Protocol16" } else { "Collaboration" }
+    match protocol {
+        RoomProtocol::Legacy => "Collaboration",
+        RoomProtocol::Automerge => "Collaboration-Protocol16",
+        RoomProtocol::AutomergeArtwork => "Collaboration-Protocol18",
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -377,6 +381,17 @@ pub(super) fn verify_legacy_room_protocol_fallback(root: &Path) -> Result<(), St
     let (selected, _) = open(None)?;
     assert_eq!(selected.protocol, RoomProtocol::Automerge);
     assert_eq!(selected.identity().actor(), automerge_actor);
+    drop(selected);
+
+    // Opening a saved room copy must use its journal even if the local document now has artwork
+    // that would require a new room. Its local asset bytes are irrelevant to the recovery.
+    let mut changed = seed.clone();
+    let id = designcraft_doc::AssetId(changed.alloc());
+    changed.assets.insert(id, Arc::new(designcraft_doc::Asset { id, mime: "image/tiff".into(), ..Default::default() }));
+    let (copy, _) = Storage::open_for_protocol(Some(&recovery), path, &changed, None, OpenRoom::SavedHost(None), None)?;
+    assert_eq!(copy.protocol, RoomProtocol::Automerge);
+    assert_eq!(copy.identity().actor(), automerge_actor);
+
     let (legacy, _) = open(Some(RoomProtocol::Legacy))?;
     assert_eq!(legacy.protocol, RoomProtocol::Legacy);
     assert_eq!(legacy.identity().actor(), legacy_actor);
@@ -482,7 +497,17 @@ impl Storage {
             return Err("The local collaboration journal needs a compatible app version.".into());
         }
         #[cfg(target_os = "macos")]
-        let (protocol, mut durable) = Durable::open(recovery_dir, document_path, guest_of, requested, preferred)?;
+        let (protocol, mut durable) = {
+            // A document that now needs the newer artwork protocol starts its own room.
+            let needs_artwork_room = matches!(room, OpenRoom::Active)
+                && preferred.supports_print_artwork()
+                && document
+                    .assets
+                    .values()
+                    .any(|asset| designcraft_collab::artwork::check_artwork_protocol(&asset.mime, RoomProtocol::Automerge).is_err());
+            let requested = requested.or(needs_artwork_room.then_some(preferred));
+            Durable::open(recovery_dir, document_path, guest_of, requested, preferred)?
+        };
         #[cfg(not(target_os = "macos"))]
         let protocol = {
             let _ = (recovery_dir, document_path, guest_of);
@@ -910,7 +935,7 @@ impl Durable {
 
     fn existing_host_protocol(root: &Path, path_record: RecordId, preferred: RoomProtocol) -> Result<RoomProtocol, String> {
         let index = host_index(path_record);
-        for protocol in [preferred, RoomProtocol::Legacy] {
+        for protocol in [preferred, RoomProtocol::Automerge, RoomProtocol::Legacy] {
             // Discovery must not create the unused journal or hide a corrupt index
             // by falling back to another room on the same document path.
             let journal = Journal::new(root.join(journal_directory(protocol)));

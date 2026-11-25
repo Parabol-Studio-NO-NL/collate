@@ -8,6 +8,8 @@ Generated-in-code art is original and has no file to list: the UI icon set (`cra
 
 The collaboration book test generates original sample text and illustrations in `crates/ui-egui/src/collaboration/tests/book.rs` using its chapter text and the synthetic PNG generator in `crates/ui-egui/src/collaboration/tests.rs`. This fixture uses the repository's MIT OR Apache-2.0 licence.
 
+The collaboration artwork test generates original RGB PSD and CMYK TIFF fixtures in `crates/ui-egui/src/collaboration/tests/seed_artwork.rs` using solid sample colours. These fixtures use the repository's MIT OR Apache-2.0 licence.
+
 Collaboration replication uses the Rust dependency [Automerge 0.12.0](https://crates.io/crates/automerge/0.12.0), by the Automerge contributors, under the MIT licence (see NOTICE).
 
 | Asset | Author | Source | Licence | Notes |

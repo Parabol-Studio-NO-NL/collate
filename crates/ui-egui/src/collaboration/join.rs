@@ -125,7 +125,7 @@ impl PendingJoin {
                 bytes
                     .map(|bytes| {
                         let (document, missing) = if self.protocol.is_automerge() && seed_document::is_preview_seed(&bytes) {
-                            seed_document::restore_preview_seed(&bytes, |id| self.blobs.load(id))?
+                            seed_document::restore_preview_seed(&bytes, |id| self.blobs.load(id), self.protocol)?
                         } else {
                             (
                                 seed_document::restore_bundle_for_room(&bytes, |id| self.blobs.load(id), self.protocol)?,
@@ -191,7 +191,7 @@ impl OriginalDownloads {
         self.transfer.as_ref()?.bytes.progress()
     }
 
-    fn advance(&mut self, transport: &Transport, connected: bool, folder: Option<&Path>) -> Result<(), String> {
+    fn advance(&mut self, transport: &Transport, connected: bool, folder: Option<&Path>, protocol: RoomProtocol) -> Result<(), String> {
         if let Some(check) = &self.verification {
             let result = match check.result.try_recv() {
                 Ok(result) => result,
@@ -222,7 +222,7 @@ impl OriginalDownloads {
         if !connected || self.failed {
             return Ok(());
         }
-        if transport.submit(encode_for_protocol(Message::RequestOriginal { blob: id }, RoomProtocol::Automerge)?).is_ok() {
+        if transport.submit(encode_for_protocol(Message::RequestOriginal { blob: id }, protocol)?).is_ok() {
             self.transfer = Some(OriginalTransfer { id, bytes: BlobDownload::default(), requested: Instant::now() });
         }
         Ok(())
@@ -358,7 +358,7 @@ impl SeedDelivery {
                 let roots = file_access::current();
                 let (sender, receiver) = mpsc::sync_channel(1);
                 let worker = std::thread::Builder::new().name("collate-room-previews".into()).spawn(move || {
-                    let preview = seed_document::preview_seed(&document);
+                    let preview = seed_document::preview_seed(&document, protocol);
                     let originals = artwork_folder.as_ref().and_then(|_| preview.as_ref().ok()).map(|preview| preview.originals.clone());
                     if sender.send(preview).is_ok()
                         && let (Some(path), Some(originals)) = (artwork_folder, originals)
@@ -495,7 +495,7 @@ impl Room {
 
     pub(super) fn advance_original_delivery(&mut self) {
         let connected = self.online && matches!(self.mode, Mode::Guest { ready: true, .. });
-        if let Err(error) = self.originals.advance(&self.transport, connected, self.artwork_folder.as_deref()) {
+        if let Err(error) = self.originals.advance(&self.transport, connected, self.artwork_folder.as_deref(), self.protocol) {
             self.error = Some(error);
         }
         self.seed_delivery.advance_originals(&self.transport);

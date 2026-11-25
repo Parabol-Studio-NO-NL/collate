@@ -5,6 +5,91 @@ use std::sync::Arc;
 
 #[cfg(feature = "automerge-rooms")]
 #[test]
+fn shared_rooms_preserve_psd_and_cmyk_tiff_originals_in_seeds_and_edits() {
+    use craft_image_codecs::{ChannelLayout, Format, Image};
+
+    // Original synthetic artwork. At this size both uncompressed formats enter the preview path.
+    const SIDE: u32 = 160;
+    let pixels = (SIDE * SIDE) as usize;
+    let psd = |red: u8| {
+        let mut bytes = b"8BPS".to_vec();
+        bytes.extend(1u16.to_be_bytes()); // PSD version
+        bytes.extend([0; 6]); // reserved
+        bytes.extend(3u16.to_be_bytes()); // RGB channels
+        bytes.extend(SIDE.to_be_bytes()); // height
+        bytes.extend(SIDE.to_be_bytes()); // width
+        bytes.extend(8u16.to_be_bytes()); // bits per channel
+        bytes.extend(3u16.to_be_bytes()); // RGB mode
+        bytes.extend([0; 12]); // empty colour data, resources, and layers
+        bytes.extend(0u16.to_be_bytes()); // uncompressed composite
+        for channel in [red, 128, 190] {
+            bytes.extend(std::iter::repeat_n(channel, pixels));
+        }
+        bytes
+    };
+    let tiff = |ink: u8| {
+        let samples = std::iter::repeat_n([ink, 60, 170, 15], pixels).flatten().collect();
+        let image = Image::from_u8(SIDE, SIDE, ChannelLayout::Cmyk, samples).unwrap();
+        craft_image_codecs::encode(&image, Format::Tiff, &Default::default()).unwrap()
+    };
+    let cases = [
+        ("cover.psd", "image/vnd.adobe.photoshop", psd(230)),
+        ("cover.tiff", "image/tiff", tiff(180)),
+        ("insert.psd", "image/vnd.adobe.photoshop", psd(40)),
+        ("insert.tiff", "image/tiff", tiff(20)),
+    ];
+    let files = tempfile::tempdir().unwrap();
+    for (name, _, bytes) in &cases {
+        std::fs::write(files.path().join(name), bytes).unwrap();
+    }
+    let place = |app: &mut DesignApp, index: usize| {
+        let path = files.path().join(cases[index].0);
+        app.run("file.place", json!({"path": path, "embed": true, "x": 36 + index % 2 * 180, "y": 36 + index / 2 * 180})).unwrap();
+    };
+    let assert_originals = |app: &DesignApp, originals: &[(&str, &str, Vec<u8>)]| {
+        for (name, mime, bytes) in originals {
+            let asset = document(app).assets.values().find(|asset| asset.name == *name).unwrap();
+            assert_eq!(asset.mime, *mime);
+            assert_eq!(asset.data.embedded_bytes().unwrap().as_slice(), bytes.as_slice());
+        }
+    };
+    let receive = |invite: &str, name: &str| {
+        let mut guest = DesignApp::new(Session::new(), Services::default());
+        guest.collaboration.name = name.into();
+        guest.collaboration.join_code = invite.into();
+        guest.start_seed_download().unwrap();
+        guest
+    };
+
+    let mut host = editor(&Document::new(&NewDocument::default()), "Host");
+    place(&mut host, 0);
+    place(&mut host, 1);
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "host advertises PSD and TIFF artwork", |apps| room(apps[0]).invitation.is_some());
+    let invite = room(&host).invitation.clone().unwrap();
+    let mut guest = receive(&invite, "Designer");
+    wait_for(&mut [&mut host, &mut guest], "guest receives both originals from the seed", |apps| {
+        apps[1].collaboration.room.as_ref().is_some_and(|room| room.can_edit() && !room.originals.is_pending())
+    });
+    assert_originals(&guest, &cases[..2]);
+
+    for index in 2..cases.len() {
+        place(&mut guest, index);
+        let revision = (index - 1) as u64;
+        wait_for(&mut [&mut host, &mut guest], "placed original is confirmed", |apps| apps.iter().all(|app| room(app).revision == revision));
+    }
+    drop(files);
+    assert_originals(&host, &cases);
+
+    let mut late = receive(&invite, "Proofreader");
+    wait_for(&mut [&mut host, &mut guest, &mut late], "late guest receives the seed and confirmed artwork", |apps| {
+        apps[2].collaboration.room.as_ref().is_some_and(|room| room.can_edit() && room.revision == 2 && !room.originals.is_pending())
+    });
+    assert_originals(&late, &cases);
+}
+
+#[cfg(feature = "automerge-rooms")]
+#[test]
 fn a_preview_seed_keeps_the_original_fingerprint_with_multiple_native_proxies() {
     use crate::collaboration::seed_document::{preview_seed, restore_preview_seed};
 
@@ -19,8 +104,9 @@ fn a_preview_seed_keeps_the_original_fingerprint_with_multiple_native_proxies() 
     seed.next_id = seed.next_id.max(another.id.0);
     seed.assets.insert(another.id, Arc::new(another));
 
-    let mut preview = preview_seed(&seed).unwrap();
-    let (partial, originals) = restore_preview_seed(&preview.archive, |id| Ok(preview.eager.remove(&id).unwrap())).unwrap();
+    let mut preview = preview_seed(&seed, designcraft_collab::RoomProtocol::CURRENT).unwrap();
+    let (partial, originals) =
+        restore_preview_seed(&preview.archive, |id| Ok(preview.eager.remove(&id).unwrap()), designcraft_collab::RoomProtocol::CURRENT).unwrap();
     assert!(preview.eager.is_empty());
     assert_eq!(originals.len(), seed.assets.len());
     assert_eq!(fingerprint(&partial).unwrap(), fingerprint(&seed).unwrap());
@@ -55,11 +141,12 @@ fn many_individually_small_originals_open_as_bounded_raster_previews() {
     }
 
     assert!(use_preview_seed(&seed));
-    let mut preview = preview_seed(&seed).unwrap();
+    let mut preview = preview_seed(&seed, designcraft_collab::RoomProtocol::CURRENT).unwrap();
     let original_bytes: u64 = seed.assets.values().map(|asset| asset.data.len()).sum();
     let eager_bytes: usize = preview.eager.values().map(|bytes| bytes.len()).sum();
     assert!((eager_bytes as u64) < original_bytes / 2);
-    let (partial, originals) = restore_preview_seed(&preview.archive, |id| Ok(preview.eager.remove(&id).unwrap())).unwrap();
+    let (partial, originals) =
+        restore_preview_seed(&preview.archive, |id| Ok(preview.eager.remove(&id).unwrap()), designcraft_collab::RoomProtocol::CURRENT).unwrap();
     assert_eq!(partial.assets[&icon], seed.assets[&icon]);
     assert_eq!(originals.len(), seed.assets.len() - 1);
     assert_eq!(fingerprint(&partial).unwrap(), fingerprint(&seed).unwrap());
@@ -105,7 +192,7 @@ fn a_guest_receives_the_full_seed_when_the_preview_manifest_exceeds_the_model_li
     let remaining = MAX_MODEL_BYTES - model_bytes(&seed).unwrap().len();
     seed.file_info.description.push_str(&"x".repeat(remaining - 256));
     assert!(use_preview_seed(&seed));
-    assert!(preview_seed(&seed).is_err());
+    assert!(preview_seed(&seed, designcraft_collab::RoomProtocol::CURRENT).is_err());
 
     let mut host = editor(&seed, "Book host");
     host.connect_collaboration(true).unwrap();
