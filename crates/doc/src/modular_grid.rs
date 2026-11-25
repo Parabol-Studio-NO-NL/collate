@@ -1,7 +1,5 @@
 //! Baseline-aligned rows and columns within the page margins. Row heights and vertical
 //! gutters contain whole baseline intervals, so every row starts on the same rhythm.
-//! The fitted and fixed-leading workflows follow the public
-//! [Grid Calculator overview](https://designersbookshop.com/products/grid-calculator-pe/).
 
 use serde::{Deserialize, Serialize};
 
