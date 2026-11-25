@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -288,6 +288,7 @@ impl Replica {
                 }
             }
         }
+        match_created_assets(before, after, &mut projected, local_ids.values().copied())?;
         for operation in ops {
             if let Operation::Text { story, .. } = operation
                 && let (Some(projected), Some(observed)) = (projected.story_mut(*story), after.story(*story))
@@ -683,6 +684,35 @@ impl Replica {
     fn comment_mut(&mut self, id: &SharedId) -> Result<&mut CommentThread, Error> {
         self.comments.get_mut(id).map(Arc::make_mut).ok_or(Error::UnknownResource)
     }
+}
+
+/// Copying artwork from another document can allocate its frame before the asset, while the
+/// room installs the asset first. Align only provisional assets for the whole-model comparison.
+fn match_created_assets(before: &Document, after: &Document, projected: &mut Document, items: impl Iterator<Item = ItemId>) -> Result<(), Error> {
+    let mut mapping = HashMap::new();
+    for item in items {
+        let from = projected.item(item).and_then(Item::graphic).map(|graphic| graphic.asset);
+        let to = after.item(item).and_then(Item::graphic).map(|graphic| graphic.asset);
+        let (Some(from), Some(to)) = (from, to) else { continue };
+        if from != to
+            && (before.assets.contains_key(&from) || before.assets.contains_key(&to) || mapping.insert(from, to).is_some_and(|prior| prior != to))
+        {
+            return Err(Error::UnsupportedEdit);
+        }
+    }
+    let mut assets = Vec::new();
+    for (&from, &to) in &mapping {
+        let mut asset = projected.assets.remove(&from).ok_or(Error::UnknownResource)?;
+        Arc::make_mut(&mut asset).id = to;
+        assets.push((to, asset));
+    }
+    for (id, asset) in assets {
+        if projected.assets.insert(id, asset).is_some() {
+            return Err(Error::UnsupportedEdit);
+        }
+    }
+    projected.remap_assets(&mapping);
+    Ok(())
 }
 
 fn validate_initial_text(text: &str) -> Result<(), Error> {

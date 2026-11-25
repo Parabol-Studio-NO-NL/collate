@@ -1046,16 +1046,17 @@ fn shared_clipboard_and_placeholder_fill_reach_both_peers() {
     guest.run("type.fillWithPlaceholder", json!({})).unwrap();
     assert_eq!(document(&guest), &seed);
     wait_for_revision(&mut host, &mut guest, "placeholder fills the shared frame", 1);
-    let filler = &document(&host).story(story).unwrap().text;
+    let filler = &document(&guest).story(story).unwrap().text;
     assert!(filler.contains('\n'));
 
-    host.run("text.select", json!({"story": story.0, "anchor": 0, "focus": filler.len()})).unwrap();
+    guest.run("text.select", json!({"story": story.0, "anchor": 0, "focus": filler.len()})).unwrap();
     let pasted = "Café and Ω.\r\n".repeat(120);
-    host.run("edit.paste", json!({"text": pasted})).unwrap();
+    guest.run("edit.paste", json!({"text": pasted})).unwrap();
     wait_for_revision(&mut host, &mut guest, "clipboard text replaces the shared selection", 2);
     let pasted = pasted.replace("\r\n", "\n");
     assert_eq!(document(&guest).story(story).unwrap().text, pasted);
-    assert_eq!(host.session.doc().unwrap().selection.text.unwrap().focus, pasted.len());
+    assert_eq!(guest.session.doc().unwrap().selection.text.unwrap().focus, pasted.len());
+    assert!(room(&host).history[1].1.len() > designcraft_collab_core::MAX_PAYLOAD);
 
     host.run("selection.set", json!({"ids": [shape.0]})).unwrap();
     host.run("edit.copy", json!({})).unwrap();
@@ -1099,6 +1100,17 @@ fn shared_clipboard_and_placeholder_fill_reach_both_peers() {
     host.run("edit.pasteWithoutFormatting", json!({})).unwrap();
     wait_for_revision(&mut host, &mut guest, "paste without formatting restores the copied words", 8);
     assert_eq!(document(&guest).story(original.id).unwrap().text, original.text);
+    let external = artwork_fixture(31);
+    host.run("file.new", json!({})).unwrap();
+    host.run("edit.pasteImage", json!({"base64": designcraft_engine::cmd::base64_encode(&external)})).unwrap();
+    host.run("edit.copy", json!({})).unwrap();
+    host.run("file.activate", json!({"index": 0})).unwrap();
+    host.run("selection.set", json!({"ids": []})).unwrap();
+    host.run("edit.paste", json!({})).unwrap();
+    wait_for_revision(&mut host, &mut guest, "clipboard imports embedded artwork from another document", 9);
+    let [artwork] = host.session.doc().unwrap().selection.items.as_slice() else { panic!("expected one pasted graphic") };
+    let asset = document(&guest).item(*artwork).unwrap().graphic().unwrap().asset;
+    assert_eq!(document(&guest).assets[&asset].data.embedded_bytes().unwrap().as_slice(), &external);
     assert_eq!(document(&host), document(&guest));
 }
 
