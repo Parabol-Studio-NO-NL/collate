@@ -40,7 +40,7 @@ fn large_artwork_survives_guest_placement_save_and_a_new_host() {
     File::create(&oversized).unwrap().set_len(designcraft_doc::MAX_SHARED_ARTWORK_BYTES as u64 + 1).unwrap();
     let error = guest.open_picked("place", oversized.to_str().unwrap().into()).unwrap_err();
     assert!(error.contains("1 GiB"));
-    assert!(document(&guest).assets.is_empty() && room(&guest).pending.is_none());
+    assert!(document(&guest).assets.is_empty() && room(&guest).pending.is_empty());
     guest.ui.dialog = None;
     guest.open_picked("place", source.to_str().unwrap().into()).unwrap();
     wait_for_with_deadline(&mut [&mut host, &mut guest], "placed artwork confirmed", timeout, |apps| {

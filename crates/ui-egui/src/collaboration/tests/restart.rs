@@ -138,6 +138,8 @@ fn save_checkpoint(root: &Path) {
     save_artwork_checkpoint(root);
     #[cfg(feature = "automerge-rooms")]
     save_story_checkpoint(root);
+    #[cfg(feature = "automerge-rooms")]
+    super::optimistic::durable_guest_replays_offline_queue(root);
     let seed = Document::new(&NewDocument::default());
     let mut initial = editor(&seed, "Fixture");
     let host_path = root.join("Host.designcraft");
@@ -181,7 +183,7 @@ fn save_checkpoint(root: &Path) {
     let edit = guest.session.take_deferred_edit().unwrap();
     let guest_room = guest.collaboration.room.as_mut().unwrap();
     guest_room.capture_edit(&mut guest.session, edit).unwrap();
-    let pending_sequence = guest_room.pending.as_ref().unwrap().sequence;
+    let pending_sequence = guest_room.pending.front().unwrap().sequence;
     assert_eq!(room(&host).revision, 3);
     let checkpoint = Checkpoint {
         host_actor: actor(&host),
@@ -236,10 +238,10 @@ fn restore_checkpoint(root: &Path) {
     assert_ne!(fingerprint(document(&guest)).unwrap(), checkpoint.document);
     join(&mut guest, &invitation);
     assert_eq!(fingerprint(document(&guest)).unwrap(), checkpoint.document);
-    assert_eq!(room(&guest).pending.as_ref().unwrap().sequence, checkpoint.pending_sequence);
+    assert_eq!(room(&guest).pending.front().unwrap().sequence, checkpoint.pending_sequence);
     assert_comment(&guest, &checkpoint);
     wait_for(&mut [&mut host, &mut guest], "replay saved outbox exactly once", |apps| {
-        apps.iter().all(|app| room(app).revision == 4 && room(app).pending.is_none())
+        apps.iter().all(|app| room(app).revision == 4 && room(app).pending.is_empty())
     });
     assert_eq!(actor(&guest), checkpoint.guest_actor);
     let host_id = room(&host).replica.local_id(&checkpoint.frame).unwrap();
@@ -249,7 +251,7 @@ fn restore_checkpoint(root: &Path) {
     // A fresh edit must use the next sequence after the restored outbox.
     guest.run("transform.move", json!({"ids": [guest_id.0], "dx": 7, "dy": 0})).unwrap();
     wait_for(&mut [&mut host, &mut guest], "confirm edit after restart", |apps| {
-        apps.iter().all(|app| room(app).revision == 5 && room(app).pending.is_none())
+        apps.iter().all(|app| room(app).revision == 5 && room(app).pending.is_empty())
     });
     assert_eq!(document(&host).item(host_id).unwrap().bounds().x0, checkpoint.frame_x + 18.0);
     assert_eq!(fingerprint(document(&host)).unwrap(), fingerprint(document(&guest)).unwrap());

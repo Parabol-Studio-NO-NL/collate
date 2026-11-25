@@ -31,7 +31,7 @@ fn guest_sees_missing_fonts_on_join_and_after_peer_edits() {
     assert!(!h.get_by_label("Reload Fonts").accesskit_node().is_disabled());
     h.key_press(egui::Key::Escape);
     h.run_steps(3);
-    assert!(room(h.state()).pending.is_none() && room(h.state()).history.is_empty());
+    assert!(room(h.state()).pending.is_empty() && room(h.state()).history.is_empty());
 
     host.run("text.select", json!({"story": story, "anchor": 1, "focus": 2})).unwrap();
     host.run("type.char", json!({"attrs": {"fontFamily": "Source Serif 4", "fontStyle": "Collate Absent Style"}})).unwrap();

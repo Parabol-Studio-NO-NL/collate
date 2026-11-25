@@ -1,11 +1,18 @@
 //! Authenticated Automerge transactions in the experimental room protocol.
 
+use std::{collections::VecDeque, sync::Arc, time::Duration};
+
 use designcraft_collab::{Error, Operation, Replica, automerge_stories::StoryTransaction, text::TextSplice};
 use designcraft_collab_core::ActorId;
 use designcraft_doc::{Document, StoryId, TextSel};
 use designcraft_engine::{DeferredEdit, DocState};
+use web_time::Instant;
 
-use super::{Commit, Proposal, operation_story};
+use super::{
+    Commit, Message, Proposal,
+    edit_wire::{SendCursor, WireEdit},
+    encode_edit, operation_story,
+};
 
 pub(super) struct PendingSelection {
     pub(super) sequence: u64,
@@ -17,6 +24,73 @@ pub(super) struct PendingSelection {
 pub(super) struct Captured {
     pub(super) transaction: StoryTransaction,
     pub(super) selection: Option<PendingSelection>,
+    pub(super) replica: Replica,
+}
+
+/// The editor displays the queued branch. Sync, replay, and room fingerprints use `confirmed`.
+pub(super) struct Draft {
+    pub(super) confirmed: Arc<Document>,
+    pub(super) visible: Replica,
+}
+
+#[derive(Default)]
+pub(super) struct Sender {
+    active: Option<(u64, WireEdit, SendCursor)>,
+    submitted: Option<u64>,
+    awaiting_since: Option<Instant>,
+}
+
+impl Sender {
+    pub(super) fn acknowledge(&mut self, pending: &VecDeque<Proposal>) {
+        if pending.is_empty() {
+            *self = Self::default();
+        } else {
+            self.awaiting_since = Some(Instant::now());
+        }
+    }
+
+    pub(super) fn advance(&mut self, pending: &VecDeque<Proposal>, mut send: impl FnMut(Vec<u8>) -> Result<(), String>) -> Result<(), String> {
+        let Some(front) = pending.front() else { return Ok(()) };
+        if self.active.as_ref().is_some_and(|(sequence, _, _)| *sequence < front.sequence) {
+            // A delayed acknowledgement arrived during a redundant resend. The receiver
+            // replaces any partial transfer before accepting a new fragmented proposal.
+            self.active = None;
+        }
+        if self.active.is_none() && self.awaiting_since.is_some_and(|time| time.elapsed() >= Duration::from_secs(2)) {
+            self.submitted = None;
+            self.awaiting_since = None;
+        }
+        for _ in 0..32 {
+            if self.active.is_none() {
+                let next = pending.iter().find(|proposal| self.submitted.is_none_or(|sequence| proposal.sequence > sequence));
+                let Some(proposal) = next else { break };
+                // The next change on the same story depends on the previous one. Wait across
+                // stories so a rejected head cannot leave a later independent edit accepted.
+                if self.submitted.is_some_and(|sequence| sequence >= front.sequence)
+                    && (only_story(front).is_none() || only_story(front) != only_story(proposal))
+                {
+                    break;
+                }
+                self.active = Some((proposal.sequence, encode_edit(Message::Propose(proposal.clone()))?, SendCursor::default()));
+            }
+            let Some((sequence, wire, cursor)) = &mut self.active else { break };
+            match wire.send_next(cursor, &mut send) {
+                Ok(true) => {
+                    self.submitted = Some(*sequence);
+                    self.awaiting_since.get_or_insert_with(Instant::now);
+                    self.active = None;
+                }
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn only_story(proposal: &Proposal) -> Option<StoryId> {
+    let [change] = proposal.story_transaction.as_ref()?.changes.as_slice() else { return None };
+    Some(change.story)
 }
 
 impl PendingSelection {
@@ -38,7 +112,31 @@ pub(super) fn capture(replica: &Replica, actor: ActorId, edit: &DeferredEdit, se
         let focus = draft.automerge_cursor(selection.story, selection.focus)?;
         Some(PendingSelection { sequence, selection, anchor, focus })
     });
-    Ok(Some(Captured { transaction, selection }))
+    Ok(Some(Captured { transaction, selection, replica: draft }))
+}
+
+pub(super) fn rebase(
+    confirmed: &Arc<Document>,
+    replica: &Replica,
+    actor: ActorId,
+    pending: &VecDeque<Proposal>,
+) -> Result<(Arc<Document>, Option<Draft>), String> {
+    if !pending.front().is_some_and(|p| p.story_transaction.is_some()) {
+        return Ok((confirmed.clone(), None));
+    }
+    let mut document = (**confirmed).clone();
+    let mut visible = replica.clone();
+    for proposal in pending {
+        let transaction = proposal.story_transaction.as_ref().ok_or("A story outbox also contains structural changes.")?;
+        visible.apply_automerge_text(&mut document, &actor.0, transaction).map_err(|error| error.to_string())?;
+    }
+    Ok((Arc::new(document), Some(Draft { confirmed: confirmed.clone(), visible })))
+}
+
+pub(super) fn remap_selection(state: &DocState, old: &Replica, updated: &Replica) -> Option<TextSel> {
+    let selection = state.selection.text?;
+    let [anchor, focus] = old.automerge_anchors(&state.doc, selection.story, [selection.anchor, selection.focus])?;
+    resolve(updated, selection, &anchor, &focus)
 }
 
 fn splice(before: TextSel, after: TextSel, source: &Document, destination: &Document) -> Option<(StoryId, TextSplice)> {

@@ -22,6 +22,8 @@ impl DeferredEdit {
 pub(crate) struct DeferredEdits {
     uid: u64,
     ready: bool,
+    story_ready: bool,
+    showing_draft: bool,
     durable: bool,
     pending: Option<DeferredEdit>,
     placement: Option<Vec<u8>>,
@@ -30,7 +32,15 @@ pub(crate) struct DeferredEdits {
 impl Session {
     /// Enable deferred commits for one open document, or restore standalone operation.
     pub fn defer_document_edits(&mut self, uid: Option<u64>) {
-        self.deferred_edits = uid.map(|uid| DeferredEdits { uid, ready: false, durable: false, pending: None, placement: None });
+        self.deferred_edits = uid.map(|uid| DeferredEdits {
+            uid,
+            ready: false,
+            story_ready: false,
+            showing_draft: false,
+            durable: false,
+            pending: None,
+            placement: None,
+        });
     }
 
     pub fn set_deferred_edit_durable(&mut self, durable: bool) {
@@ -44,8 +54,15 @@ impl Session {
     }
 
     pub fn set_deferred_edit_ready(&mut self, ready: bool) {
+        self.set_deferred_edit_policy(ready, false, false);
+    }
+
+    /// Admit story commands while the collaboration controller shows its local draft.
+    pub fn set_deferred_edit_policy(&mut self, ready: bool, story_ready: bool, showing_draft: bool) {
         if let Some(edits) = self.deferred_edits.as_mut() {
             edits.ready = ready && edits.pending.is_none();
+            edits.story_ready = story_ready && edits.pending.is_none();
+            edits.showing_draft = showing_draft;
         }
     }
 
@@ -101,13 +118,21 @@ impl Session {
             return Ok(());
         }
         let id = spec.id;
+        if matches!(id, "file.save" | "file.saveAs") && self.deferred_edits.as_ref().is_some_and(|edits| edits.showing_draft) {
+            return Err(EngineError::Other("Wait for your edits to sync before saving this file. Save a Copy can keep the current draft.".into()));
+        }
         if self.active().is_some_and(|st| st.interaction.is_some())
             && (matches!(id, "file.save" | "file.saveAs" | "file.saveACopy") || id.starts_with("file.export"))
         {
             return Err(EngineError::Other("Finish the current gesture before saving or exporting the shared document.".into()));
         }
         if is_deferred_edit_command(id) {
-            return if self.deferred_edits.as_ref().is_some_and(|edits| edits.ready) {
+            let inside_story = self.active().is_some_and(|st| st.selection.text.is_some());
+            return if self
+                .deferred_edits
+                .as_ref()
+                .is_some_and(|edits| edits.ready || edits.story_ready && is_deferred_story_command(id, inside_story))
+            {
                 Ok(())
             } else {
                 Err(EngineError::Other("Wait for the shared document to catch up before editing.".into()))
@@ -161,13 +186,40 @@ impl Session {
         if !propose {
             return Ok(());
         }
-        let Some(edits) = self.deferred_edits.as_mut().filter(|edits| edits.ready && edits.pending.is_none()) else {
+        let Some(edits) = self.deferred_edits.as_mut().filter(|edits| (edits.ready || edits.story_ready) && edits.pending.is_none()) else {
             return Err(EngineError::Other("Wait for the shared document to catch up before editing.".into()));
         };
         edits.ready = false;
+        edits.story_ready = false;
         edits.pending = Some(DeferredEdit { before, after, before_selection: selection, before_layer: active_layer, after_selection });
         Ok(())
     }
+}
+
+/// Commands that may produce a story-only draft. The room still validates the entire mutation.
+pub fn is_deferred_story_command(id: &str, inside_story: bool) -> bool {
+    matches!(id, "text.placeCaret" | "type.fillWithPlaceholder")
+        || inside_story
+            && matches!(
+                id,
+                "text.insert"
+                    | "text.delete"
+                    | "text.deleteSurrounding"
+                    | "edit.clear"
+                    | "edit.cut"
+                    | "edit.paste"
+                    | "edit.pasteWithoutFormatting"
+                    | "type.char"
+                    | "type.para"
+                    | "type.paragraphLanguage"
+                    | "type.align"
+                    | "type.alignLeft"
+                    | "type.alignCenter"
+                    | "type.alignRight"
+                    | "type.justify"
+                    | "type.justifyAll"
+                    | "style.paragraph.apply"
+            )
 }
 
 pub(crate) fn is_deferred_edit_command(id: &str) -> bool {

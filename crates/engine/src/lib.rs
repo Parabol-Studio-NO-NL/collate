@@ -23,7 +23,7 @@ pub mod recovery;
 pub mod sample;
 pub mod script;
 pub mod separations;
-pub use deferred_edits::DeferredEdit;
+pub use deferred_edits::{DeferredEdit, is_deferred_story_command};
 
 mod tooling;
 

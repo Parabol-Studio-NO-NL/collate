@@ -39,7 +39,7 @@ impl DesignApp {
                 self.quitting = None;
                 return;
             }
-            if self.quitting.is_none() && !self.session.documents().iter().any(|d| d.is_dirty()) {
+            if self.quitting.is_none() && !self.session.documents().iter().any(|d| self.document_needs_close_prompt(d)) {
                 return;
             }
             let approved =
@@ -113,7 +113,7 @@ impl DesignApp {
             .documents()
             .iter()
             .enumerate()
-            .find(|(_, d)| d.is_dirty() && q.accepted.get(&d.uid) != Some(&d.revision))
+            .find(|(_, d)| self.document_needs_close_prompt(d) && q.accepted.get(&d.uid) != Some(&d.revision))
             .map(|(i, d)| (i, d.uid))
     }
 

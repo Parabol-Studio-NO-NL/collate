@@ -52,7 +52,7 @@ fn guest_can_edit_after_the_host_rejects_artwork_at_its_retained_limit() {
     std::fs::write(&path, artwork_fixture(64)).unwrap();
     guest.open_picked("place", path.to_str().unwrap().into()).unwrap();
     wait_for(&mut [&mut host, &mut guest], "host reports artwork capacity", |apps| {
-        room(apps[1]).error.as_deref() == Some(super::super::attachments::ARTWORK_LIMIT) && room(apps[1]).pending.is_none()
+        room(apps[1]).error.as_deref() == Some(super::super::attachments::ARTWORK_LIMIT) && room(apps[1]).pending.is_empty()
     });
     assert!(document(&host).assets.is_empty() && document(&guest).assets.is_empty());
     guest.run("frame.create", json!({"rect": [110, 10, 180, 80]})).unwrap();
@@ -89,8 +89,8 @@ fn author_receives_a_bound_receipt_and_can_recover_without_pending_artwork() {
         }
         let guest_room = guest.collaboration.room.as_mut().unwrap();
         match index {
-            1 => guest_room.clear_pending().unwrap(),
-            2 => guest_room.pending.as_mut().unwrap().base = 0, // same sequence, different proposal metadata
+            1 => guest_room.clear_pending(&mut guest.session).unwrap(),
+            2 => guest_room.pending.front_mut().unwrap().base = 0, // same sequence, different proposal metadata
             _ => {}
         }
         let mut received_binary = 0;

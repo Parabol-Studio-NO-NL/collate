@@ -7,8 +7,14 @@ use super::{DesignApp, Value, json};
 /// closing also discards its recovery data. Scripts and agents use `file.close`, which never asks.
 pub fn close_document(app: &mut DesignApp, index: Option<usize>) {
     let Some(i) = index.or(app.session.active_index()) else { return };
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Err(error) = app.check_collaboration_close(Some(i)) {
+        app.open_collaboration_dialog();
+        app.status(error);
+        return;
+    }
     match app.session.documents().get(i) {
-        Some(d) if d.is_dirty() => {
+        Some(d) if app.document_needs_close_prompt(d) => {
             app.ui.dialog = Some(crate::dialogs::Dialog::new("closeDocument", json!({"uid": d.uid, "title": d.title(), "discard": false})));
         }
         _ => {

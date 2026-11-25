@@ -126,15 +126,16 @@ fn illustrated_book_converges_through_concurrent_editing_late_join_and_recovery(
     guest.run("text.insert", json!({"text": "Café by the bridge.", "raw": true})).unwrap();
     let queued = if cfg!(feature = "automerge-rooms") {
         guest.poll_collaboration(&egui::Context::default());
-        assert!(room(&guest).pending.is_some());
+        assert!(!room(&guest).pending.is_empty());
         let queued = " Notes from the bank.";
-        assert!(guest.buffer_shared_typing(queued));
+        guest.run("text.insert", json!({"text": queued, "raw": true})).unwrap();
+        assert_eq!(room(&guest).pending.len(), 2);
         queued
     } else {
         ""
     };
     let mut revision = if queued.is_empty() { 2 } else { 3 };
-    wait_for_revision(&mut host, &mut guest, "both chapter edits and any buffered typing arrive", revision);
+    wait_for_revision(&mut host, &mut guest, "both chapter edits and any queued typing arrive", revision);
     let text = format!("Révision\n{}Café by the bridge.{queued}", last_chapter.text);
     assert_eq!(document(&host).story(chapter).unwrap().text, text);
     if cfg!(feature = "automerge-rooms") {

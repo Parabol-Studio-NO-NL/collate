@@ -73,7 +73,7 @@ impl DesignApp {
             }
             Some(Action::Disconnect) => {
                 if let Some(room) = self.collaboration.room.as_mut()
-                    && let Err(error) = room.clear_pending()
+                    && let Err(error) = room.clear_pending(&mut self.session)
                 {
                     room.stop_with_error(&error);
                     return;
@@ -190,26 +190,11 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         return host.or(if download { Some(Action::ReceiveSeed) } else { join.then_some(Action::Connect(false)) });
     };
 
-    let status = if room.fatal {
-        "Connection stopped"
-    } else if room.paused_typing().is_some() {
-        "Queued typing paused"
-    } else if room.pending.is_some() || room.typing.is_some() || session.has_deferred_edit() {
-        "Waiting for the host to confirm your edit"
-    } else if room.can_edit() && room.online {
-        "Connected"
-    } else if room.can_edit() {
-        "Offline. You can queue one edit."
-    } else {
-        match room.mode {
-            Mode::Host { .. } if room.local.is_some() => "Room history is full",
-            _ => "Connecting…",
-        }
-    };
     if let Some(progress) = room.artwork_progress().filter(|_| room.online && !room.fatal) {
         artwork_progress(ui, lang, progress);
     } else {
-        ui.label(tr(lang, status));
+        let message = ui.label(tr(lang, room_status(room, session)));
+        ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
     }
     if let Some(error) = &room.error {
         ui.label(tr(lang, error));
@@ -253,11 +238,13 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         action = comments(c, st, lang, ui, current_page).or(action);
     }
     let Some(room) = c.room.as_ref() else { return action };
-    let pending = room.pending.is_some() || room.typing.is_some() || session.has_deferred_edit();
-    if let Some(typing) = room.paused_typing()
-        && ui.button(tr(lang, "Copy queued typing")).clicked()
-    {
-        ui.ctx().copy_text(typing.into());
+    let pending = !room.pending.is_empty() || room.typing.is_some() || session.has_deferred_edit();
+    if (room.paused_typing().is_some() || room.story_queue_blocked) && ui.button(tr(lang, "Copy queued typing")).clicked() {
+        let mut typing = room.declined_story_text();
+        typing.push_str(room.paused_typing().unwrap_or_default());
+        if !typing.is_empty() {
+            ui.ctx().copy_text(typing);
+        }
     }
     ui.separator();
     if !pending && ui.button(tr(lang, "Leave session")).clicked() {
@@ -280,6 +267,37 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
     action
 }
 
+fn room_status(room: &Room, session: &Session) -> &'static str {
+    if room.fatal {
+        return "Connection stopped";
+    }
+    if room.story_queue_blocked {
+        return "Some edits need attention";
+    }
+    if room.story_draft.is_some() {
+        return match (room.online, room.storage.is_durable()) {
+            (true, _) => "Syncing your edits…",
+            (false, true) => "Offline. Edits are saved on this Mac.",
+            (false, false) => "Offline. Your edits are waiting to sync.",
+        };
+    }
+    if !room.online && room.can_draft_story() {
+        return "Offline. Edits are saved on this Mac.";
+    }
+    if room.paused_typing().is_some() {
+        return "Queued typing paused";
+    }
+    if !room.pending.is_empty() || room.typing.is_some() || session.has_deferred_edit() {
+        return "Waiting for the host to confirm your edit";
+    }
+    match (room.can_edit(), room.online, &room.mode) {
+        (true, true, _) => "Connected",
+        (true, false, _) => "Offline. You can queue one edit.",
+        (false, _, Mode::Host { .. }) if room.local.is_some() => "Room history is full",
+        _ => "Connecting…",
+    }
+}
+
 fn room_button<'a>(lang: &str, label: &'a str) -> Button<'a> {
     Button::new(tr(lang, label)).min_size(egui::vec2(0.0, 24.0))
 }
@@ -294,17 +312,15 @@ fn artwork_progress(ui: &mut Ui, lang: &str, progress: super::attachments::Artwo
 fn comments(c: &mut Collaboration, st: &designcraft_engine::DocState, lang: &str, ui: &mut Ui, current_page: usize) -> Option<Action> {
     let room = c.room.as_ref()?;
     let enabled = room.can_edit();
+    let display_replica = room.story_draft.as_ref().map_or(&room.replica, |draft| &draft.visible);
     let mut action = None;
     egui::ScrollArea::vertical().id_salt("shared-comments").max_height(220.0).show(ui, |ui| {
         for thread in room.replica.comments() {
             ui.push_id(&thread.id, |ui| {
                 ui.small(author(room, &thread.id));
                 ui.label(&thread.text);
-                let target = room.replica.comment_text_range(&st.doc, &thread.anchor);
-                let orphaned = match &thread.anchor {
-                    CommentAnchor::Text { .. } => target.is_none(),
-                    _ => room.replica.comment_is_orphaned(&st.doc, thread),
-                };
+                let target = display_replica.comment_text_range(&st.doc, &thread.anchor);
+                let orphaned = if thread.anchor.is_text() { target.is_none() } else { display_replica.comment_is_orphaned(&st.doc, thread) };
                 if orphaned {
                     ui.small(tr(lang, "Anchor removed"));
                 }

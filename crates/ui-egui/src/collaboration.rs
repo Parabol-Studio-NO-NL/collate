@@ -19,7 +19,7 @@ mod text_selection;
 mod typing;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -44,6 +44,7 @@ use crate::DesignApp;
 
 const MAX_HISTORY: usize = 1024;
 const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QUEUED_STORY_EDITS: usize = 64;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -122,7 +123,7 @@ fn encode_edit(message: Message) -> Result<WireEdit, String> {
 fn accepts_chunked_edit(proposal: &Proposal) -> bool {
     proposal.story_transaction.is_some()
         || proposal.edits.iter().any(|edit| edit.changes_artwork() || matches!(edit, Operation::CreateText { .. } | Operation::Text { .. }))
-        || matches!(proposal.edits.as_slice(), [Operation::CreateComment { anchor: designcraft_collab::CommentAnchor::Text { .. }, .. }])
+        || matches!(proposal.edits.as_slice(), [Operation::CreateComment { anchor, .. }] if anchor.is_text())
 }
 
 enum Mode {
@@ -164,8 +165,11 @@ struct Room {
     invitation: Option<String>,
     next_sequence: u64,
     revision: u64,
-    pending: Option<Proposal>,
+    pending: VecDeque<Proposal>,
     pending_story_selection: Option<story_sync::PendingSelection>,
+    story_draft: Option<story_sync::Draft>,
+    story_queue_blocked: bool,
+    story_sender: story_sync::Sender,
     rejected_comment: Option<CommentDraft>,
     frame_entry: Option<typing::FrameEntry>,
     layer_entry: Option<(u64, LayerId)>,
@@ -239,13 +243,49 @@ impl DesignApp {
             self.collaboration.reply_to = draft.reply_to;
             self.collaboration.comment_needs_text_selection = draft.needs_text_selection;
         }
-        self.session.set_deferred_edit_ready(room.can_edit());
+        room.update_edit_policy(&mut self.session);
         room.flush_typing(&mut self.session);
         ctx.request_repaint_after(Duration::from_millis(40));
     }
 
+    /// Complete a story draft in the input event, before paint and without polling the transport.
+    pub(crate) fn apply_local_story_edit(&mut self, id: &str, inside_story: bool) -> Result<(), String> {
+        if !cfg!(feature = "automerge-rooms") || !designcraft_engine::is_deferred_story_command(id, inside_story) {
+            return Ok(());
+        }
+        let Some(room) =
+            self.collaboration.room.as_mut().filter(|room| room.can_draft_story() && self.session.active().is_some_and(|st| st.uid == room.doc_uid))
+        else {
+            return Ok(());
+        };
+        let Some(edit) = self.session.take_deferred_edit() else { return Ok(()) };
+        let result = room.capture_edit(&mut self.session, edit);
+        room.update_edit_policy(&mut self.session);
+        if let Err(error) = &result {
+            room.error = Some(error.clone());
+        }
+        result
+    }
+
     pub(crate) fn collaboration_blocks_close(&self) -> bool {
-        self.session.has_deferred_edit() || self.collaboration.room.as_ref().is_some_and(|room| room.pending.is_some() || room.typing.is_some())
+        self.session.has_deferred_edit()
+            || self
+                .collaboration
+                .room
+                .as_ref()
+                .is_some_and(|room| (!room.pending.is_empty() || room.typing.is_some()) && !self.collaboration_can_resume_document(room.doc_uid))
+    }
+
+    pub(crate) fn collaboration_can_resume_document(&self, uid: u64) -> bool {
+        self.collaboration.room.as_ref().is_some_and(|room| {
+            room.doc_uid == uid
+                && room.storage.is_durable()
+                && room.story_draft.is_some()
+                && !room.story_queue_blocked
+                && room.typing.is_none()
+                && !self.session.has_deferred_edit()
+                && self.session.documents().iter().any(|st| st.uid == uid && st.path.is_some() && st.interaction.is_none())
+        })
     }
 
     pub(crate) fn check_collaboration_close(&self, index: Option<usize>) -> Result<(), String> {
@@ -346,12 +386,15 @@ impl DesignApp {
         room.online = false;
         room.peers.clear();
         room.presence.clear();
-        room.error = None;
+        if !room.story_queue_blocked {
+            room.error = None;
+        }
         room.fatal = false;
         room.last_send = None;
         room.receiving_edits.clear();
         room.receiving_blobs.clear();
         room.sending_proposal = None;
+        room.story_sender = Default::default();
         c.join_code.clear();
         Ok(())
     }
@@ -416,7 +459,9 @@ impl DesignApp {
             }
         };
         let revision = recovered.history.len() as u64;
-        if saved.pending.as_ref().is_some_and(|pending| host || pending.base > revision || pending.sequence >= saved.next_sequence) {
+        if saved.pending.iter().any(|pending| {
+            host || pending.base > revision || pending.sequence >= saved.next_sequence || pending.validate_story_transaction().is_err()
+        }) {
             return Err("The local collaboration journal has an invalid pending edit.".into());
         }
         let (transport, mode) = if host {
@@ -425,7 +470,7 @@ impl DesignApp {
             (Transport::join_with_identity(&c.join_code, &c.name, storage.identity())?, Mode::Guest { ready: false, hello_sent: false })
         };
         if !matches!(room, OpenRoom::NewHost(_)) {
-            storage.write(recovered.history.iter().map(|(commit, _)| commit), saved.pending.as_ref(), saved.next_sequence)?;
+            storage.write(recovered.history.iter().map(|(commit, _)| commit), &saved.pending, saved.next_sequence)?;
         }
         let durable = storage.is_durable();
         if let Some(st) = self.session.active_mut() {
@@ -441,11 +486,17 @@ impl DesignApp {
         room.next_sequence = saved.next_sequence;
         room.revision = revision;
         room.pending = saved.pending;
+        if cfg!(feature = "automerge-rooms") && !host && durable && (revision != 0 || !room.pending.is_empty()) {
+            room.has_joined = true;
+            room.local = Some(Peer { actor: room.storage.identity().actor(), name: c.name.clone() });
+        }
+        room.restore_story_draft(&mut self.session);
+        self.session.defer_document_edits(Some(uid));
+        self.session.set_deferred_edit_durable(durable);
+        room.update_edit_policy(&mut self.session);
         c.room = Some(room);
         c.message = None;
         c.room_conflict = None;
-        self.session.defer_document_edits(Some(uid));
-        self.session.set_deferred_edit_durable(durable);
         Ok(())
     }
 }
@@ -483,8 +534,11 @@ impl Room {
             invitation: None,
             next_sequence: 1,
             revision: 0,
-            pending: None,
+            pending: VecDeque::new(),
             pending_story_selection: None,
+            story_draft: None,
+            story_queue_blocked: false,
+            story_sender: Default::default(),
             rejected_comment: None,
             frame_entry: None,
             layer_entry: None,
@@ -507,7 +561,7 @@ impl Room {
         let Some(host) = self.host else { return };
         self.recovery_path_checked = Some(path.into());
         if let Err(error) =
-            self.storage.enable_journal(recovery_dir, path, host, self.history.iter().map(|(c, _)| c), self.pending.as_ref(), self.next_sequence)
+            self.storage.enable_journal(recovery_dir, path, host, self.history.iter().map(|(c, _)| c), &self.pending, self.next_sequence)
         {
             self.error = Some(error);
         }
@@ -516,11 +570,36 @@ impl Room {
     fn can_edit(&self) -> bool {
         !self.fatal
             && self.local.is_some()
-            && self.pending.is_none()
+            && self.pending.is_empty()
             && match self.mode {
                 Mode::Host { .. } => self.online && self.history.len() < MAX_HISTORY && self.history_bytes < MAX_HISTORY_BYTES,
                 Mode::Guest { ready, .. } => ready || self.has_joined && !self.online && self.storage.is_durable(),
             }
+    }
+
+    fn can_draft_story(&self) -> bool {
+        cfg!(feature = "automerge-rooms")
+            && !self.fatal
+            && !self.story_queue_blocked
+            && self.local.is_some()
+            && self.pending.len() < MAX_QUEUED_STORY_EDITS
+            && self.pending.front().is_none_or(|pending| pending.story_transaction.is_some())
+            && matches!(self.mode, Mode::Guest { ready, .. } if ready || self.has_joined && !self.online && self.storage.is_durable())
+    }
+
+    fn update_edit_policy(&self, session: &mut Session) {
+        session.set_deferred_edit_policy(self.can_edit(), self.can_draft_story(), self.story_draft.is_some());
+    }
+
+    fn restore_story_draft(&mut self, session: &mut Session) {
+        let Some(st) = session.document_by_uid_mut(self.doc_uid) else { return };
+        match story_sync::rebase(&st.doc, &self.replica, self.storage.identity().actor(), &self.pending) {
+            Ok((document, draft)) => {
+                install_document(st, document);
+                self.story_draft = draft;
+            }
+            Err(_) => self.block_story_queue(),
+        }
     }
 
     fn poll(&mut self, session: &mut Session) {
@@ -560,7 +639,16 @@ impl Room {
     }
 
     fn advance_proposal(&mut self) {
-        let (Mode::Guest { ready: true, .. }, Some(pending)) = (&self.mode, &self.pending) else { return };
+        if self.story_queue_blocked {
+            return;
+        }
+        let (Mode::Guest { ready: true, .. }, Some(pending)) = (&self.mode, self.pending.front()) else { return };
+        if pending.story_transaction.is_some() {
+            if let Err(error) = self.story_sender.advance(&self.pending, |frame| self.transport.submit(frame)) {
+                self.stop_with_error(&error);
+            }
+            return;
+        }
         if self.sending_proposal.is_none() && self.last_send.is_some() && self.host.is_some_and(|host| self.receiving_blobs.contains_key(&host)) {
             return;
         }
@@ -620,18 +708,29 @@ impl Room {
                 }
             }
             Event::Message { actor, bytes } => self.on_packet(session, actor, &bytes),
-            Event::Disconnected => {
-                self.online = false;
-                self.peers.clear();
-                self.presence.clear();
-                self.receiving_edits.clear();
-                self.receiving_blobs.clear();
-                self.sending_proposal = None;
-                if matches!(self.mode, Mode::Guest { .. }) {
-                    self.mode = Mode::Guest { ready: false, hello_sent: false };
+            Event::Disconnected => self.disconnected(),
+            Event::Failed(error)
+                if cfg!(feature = "automerge-rooms") && matches!(self.mode, Mode::Guest { .. }) && self.has_joined && self.storage.is_durable() =>
+            {
+                self.disconnected();
+                if !self.story_queue_blocked {
+                    self.error = Some(error);
                 }
             }
             Event::Failed(error) => self.stop_with_error(&error),
+        }
+    }
+
+    fn disconnected(&mut self) {
+        self.online = false;
+        self.peers.clear();
+        self.presence.clear();
+        self.receiving_edits.clear();
+        self.receiving_blobs.clear();
+        self.sending_proposal = None;
+        self.story_sender = Default::default();
+        if matches!(self.mode, Mode::Guest { .. }) {
+            self.mode = Mode::Guest { ready: false, hello_sent: false };
         }
     }
 
@@ -759,7 +858,7 @@ impl Room {
             }
             Message::Commit(mut commit) => {
                 if let Some(host) = self.host
-                    && let Err(error) = self.receiving_blobs.remove(&host).unwrap_or_default().attach(&mut commit.proposal, self.pending.as_ref())
+                    && let Err(error) = self.receiving_blobs.remove(&host).unwrap_or_default().attach(&mut commit.proposal, self.pending.front())
                 {
                     return self.stop_with_error(&error);
                 }
@@ -769,24 +868,24 @@ impl Room {
                         self.error = Some("Requesting missing edits from the host.".into());
                         return;
                     }
-                    if let Err(error) = self.commit(session, commit.clone()) {
+                    if let Err(error) = self.commit(session, commit) {
                         self.stop_with_error(&error);
-                        return;
                     }
-                }
-                if self.matches_pending(&commit)
-                    && let Err(error) = self.clear_pending()
+                } else if self.matches_pending(&commit)
+                    && let Err(error) = self.acknowledge_duplicate(session)
                 {
                     self.stop_with_error(&error);
                 }
             }
             Message::CaughtUp { revision } if revision == self.revision => {
                 self.has_joined = true;
-                self.error = None;
+                if !self.story_queue_blocked {
+                    self.error = None;
+                }
                 self.mode = Mode::Guest { ready: true, hello_sent: true };
             }
-            Message::Declined { sequence, artwork_limit } => self.decline_pending(sequence, artwork_limit),
-            Message::RetryArtwork if self.pending.is_some() => {
+            Message::Declined { sequence, artwork_limit } => self.decline_pending(session, sequence, artwork_limit),
+            Message::RetryArtwork if !self.pending.is_empty() => {
                 self.sending_proposal = None;
                 self.last_send = None;
             }
@@ -801,7 +900,7 @@ impl Room {
     fn confirm_upload(&mut self, session: &mut Session, revision: u64, sequence: u64, digest: [u8; 32]) -> Result<(), String> {
         if revision == self.revision + 1
             && let Some(local) = &self.local
-            && let Some(pending) = self.pending.as_ref().filter(|p| p.sequence == sequence)
+            && let Some(pending) = self.pending.front().filter(|p| p.sequence == sequence)
         {
             let candidate = Commit { revision, actor: local.actor, proposal: pending.clone(), correction: None };
             if encode_edit(Message::Commit(candidate.clone())).is_ok_and(|wire| wire.digest() == digest) {
@@ -879,15 +978,27 @@ impl Room {
     fn capture_edit(&mut self, session: &mut Session, edit: DeferredEdit) -> Result<(), String> {
         let actor = self.local.as_ref().ok_or("The collaboration connection is still starting.")?.actor;
         self.error = None;
+        let local = self.story_draft.as_ref().map_or(&self.replica, |draft| &draft.visible);
         if cfg!(feature = "automerge-rooms")
-            && let Some(story_sync::Captured { transaction, selection }) = story_sync::capture(&self.replica, actor, &edit, self.next_sequence)?
+            && let Some(story_sync::Captured { transaction, selection, replica }) = story_sync::capture(local, actor, &edit, self.next_sequence)?
         {
-            self.pending_story_selection = selection;
-            let result = self.queue_transaction(session, Vec::new(), None, Some(transaction));
-            if result.is_err() {
-                self.pending_story_selection = None;
+            if matches!(self.mode, Mode::Guest { .. }) {
+                if !self.can_draft_story() {
+                    return Err("Wait for your story edits to sync before typing more.".into());
+                }
+                self.queue_transaction(session, Vec::new(), None, Some(transaction))?;
+                let confirmed = self.story_draft.as_ref().map_or(edit.before, |draft| draft.confirmed.clone());
+                self.story_draft = Some(story_sync::Draft { confirmed, visible: replica });
+                let st = session.document_by_uid_mut(self.doc_uid).ok_or("The shared document closed.")?;
+                install_document(st, edit.after);
+                st.selection = edit.after_selection;
+                return Ok(());
             }
-            return result;
+            self.pending_story_selection = selection;
+            return self.queue_transaction(session, Vec::new(), None, Some(transaction)).inspect_err(|_| self.pending_story_selection = None);
+        }
+        if !self.pending.is_empty() {
+            return Err("Wait for your story edits to sync before changing the layout.".into());
         }
         let selections = edit.before_selection.text.zip(edit.after_selection.text);
         let edits = self
@@ -925,16 +1036,29 @@ impl Room {
     ) -> Result<(), String> {
         let actor = self.local.as_ref().ok_or("The collaboration connection is still starting.")?.actor;
         let proposal = Proposal { sequence: self.next_sequence, base: self.revision, edits, history_action, story_transaction };
-        self.next_sequence = self.next_sequence.checked_add(1).ok_or("The shared room reached its edit limit.")?;
+        let next_sequence = self.next_sequence.checked_add(1).ok_or("The shared room reached its edit limit.")?;
         let wire = encode_edit(Message::Propose(proposal.clone()))?;
         self.check_artwork_budget(wire.artwork_size)?;
         if matches!(self.mode, Mode::Host { .. }) {
+            self.next_sequence = next_sequence;
             self.admit(session, actor, proposal)
-        } else if self.pending.is_none() {
-            self.storage.write(self.history.iter().map(|(c, _)| c), Some(&proposal), self.next_sequence)?;
-            self.pending = Some(proposal);
-            self.sending_proposal = Some((wire, SendCursor::default()));
-            self.last_send = None;
+        } else if self.pending.is_empty() || proposal.story_transaction.is_some() && self.can_draft_story() {
+            let is_story = proposal.story_transaction.is_some();
+            self.pending.push_back(proposal);
+            let saved = if is_story {
+                self.storage.write_story_outbox(self.revision, &self.pending, next_sequence)
+            } else {
+                self.storage.write(self.history.iter().map(|(c, _)| c), &self.pending, next_sequence)
+            };
+            if let Err(error) = saved {
+                self.pending.pop_back();
+                return Err(error);
+            }
+            self.next_sequence = next_sequence;
+            if self.pending.len() == 1 && !is_story {
+                self.sending_proposal = Some((wire, SendCursor::default()));
+                self.last_send = None;
+            }
             Ok(())
         } else {
             Err("Wait for the host to confirm your previous edit.".into())
@@ -983,15 +1107,25 @@ impl Room {
 
     fn matches_pending(&self, commit: &Commit) -> bool {
         self.local.as_ref().is_some_and(|local| commit.actor == local.actor)
-            && self.pending.as_ref().is_some_and(|p| p.sequence == commit.proposal.sequence)
+            && self.pending.front().is_some_and(|p| p.sequence == commit.proposal.sequence)
     }
 
-    fn clear_pending(&mut self) -> Result<(), String> {
-        if self.pending.is_some() {
-            self.storage.write(self.history.iter().map(|(c, _)| c), None, self.next_sequence)?;
-            self.pending = None;
+    fn clear_pending(&mut self, session: &mut Session) -> Result<(), String> {
+        if !self.pending.is_empty() {
+            self.storage.write(self.history.iter().map(|(c, _)| c), &VecDeque::new(), self.next_sequence)?;
+            self.pending.clear();
             self.sending_proposal = None;
+            self.last_send = None;
             self.pending_story_selection = None;
+            self.story_queue_blocked = false;
+            self.story_sender = Default::default();
+            if let Some(draft) = self.story_draft.take()
+                && let Some(st) = session.document_by_uid_mut(self.doc_uid)
+            {
+                let selection = story_sync::remap_selection(st, &draft.visible, &self.replica);
+                install_document(st, draft.confirmed);
+                st.selection.text = selection;
+            }
             self.layer_entry = None;
             if self.frame_entry.take().is_some() {
                 self.pause_typing();
@@ -1000,21 +1134,57 @@ impl Room {
         Ok(())
     }
 
-    fn decline_pending(&mut self, sequence: u64, artwork_limit: bool) {
-        let Some(proposal) = self.pending.as_ref().filter(|proposal| proposal.sequence == sequence) else { return };
+    fn acknowledge_duplicate(&mut self, session: &mut Session) -> Result<(), String> {
+        let Some(front) = self.pending.pop_front() else { return Ok(()) };
+        if let Err(error) = self.storage.write(self.history.iter().map(|(c, _)| c), &self.pending, self.next_sequence) {
+            self.pending.push_front(front);
+            return Err(error);
+        }
+        self.sending_proposal = None;
+        self.last_send = None;
+        self.story_sender.acknowledge(&self.pending);
+        if self.pending.is_empty() {
+            self.story_queue_blocked = false;
+        }
+        if let Some(draft) = self.story_draft.take()
+            && let Some(st) = session.document_by_uid_mut(self.doc_uid)
+        {
+            let rebased = story_sync::rebase(&draft.confirmed, &self.replica, self.storage.identity().actor(), &self.pending);
+            self.install_rebased(st, rebased, draft.confirmed.clone(), Some(draft), &self.replica.clone());
+        }
+        Ok(())
+    }
+
+    fn block_story_queue(&mut self) {
+        self.story_queue_blocked = true;
+        self.sending_proposal = None;
+        self.story_sender = Default::default();
+        self.pause_typing();
+        self.error = Some("Some story edits could not sync. Copy your queued typing or save a copy of the open draft before leaving.".into());
+    }
+
+    fn declined_story_text(&self) -> String {
+        if self.story_queue_blocked { self.pending.iter().map(typing::submitted_typing).collect() } else { String::new() }
+    }
+
+    fn decline_pending(&mut self, session: &mut Session, sequence: u64, artwork_limit: bool) {
+        let Some(proposal) = self.pending.front().filter(|proposal| proposal.sequence == sequence) else { return };
+        if proposal.story_transaction.is_some() {
+            // Later changes can depend on this one. Retain the entire outbox and the visible draft.
+            self.block_story_queue();
+            return;
+        }
         let submitted = typing::submitted_typing(proposal);
         let comment = match proposal.edits.as_slice() {
-            [Operation::CreateComment { anchor, text, .. }] => Some(CommentDraft {
-                text: text.clone(),
-                reply_to: None,
-                needs_text_selection: matches!(anchor, designcraft_collab::CommentAnchor::Text { .. }),
-            }),
+            [Operation::CreateComment { anchor, text, .. }] => {
+                Some(CommentDraft { text: text.clone(), reply_to: None, needs_text_selection: anchor.is_text() })
+            }
             [Operation::Reply { thread, text, .. }] => {
                 Some(CommentDraft { text: text.clone(), reply_to: Some(thread.clone()), needs_text_selection: false })
             }
             _ => None,
         };
-        if let Err(error) = self.clear_pending() {
+        if let Err(error) = self.clear_pending(session) {
             self.stop_with_error(&error);
             return;
         }
@@ -1042,7 +1212,8 @@ impl Room {
             return Err("The shared room reached its history limit.".into());
         }
         let st = session.document_by_uid_mut(self.doc_uid).ok_or("The shared document closed.")?;
-        let mut doc = (*st.doc).clone();
+        let base = self.story_draft.as_ref().map_or_else(|| st.doc.clone(), |draft| draft.confirmed.clone());
+        let mut doc = (*base).clone();
         let mut replica = self.replica.clone();
         let inverse = commit.apply_document(&mut replica, &mut doc)?;
         if commit.proposal.edits.iter().any(Operation::changes_artwork) {
@@ -1050,13 +1221,15 @@ impl Room {
         }
         // Every committed checkpoint must fit the model bound during journal replay.
         let model_size = match &self.model_size {
-            Some((before, size)) if before.ptr_eq(&Arc::downgrade(&st.doc)) && commit.proposal.is_text_only() => {
-                seed_document::updated_story_model_size(*size, &st.doc, &doc, commit.proposal.affected_stories())?
+            Some((before, size)) if before.ptr_eq(&Arc::downgrade(&base)) && commit.proposal.is_text_only() => {
+                seed_document::updated_story_model_size(*size, &base, &doc, commit.proposal.affected_stories())?
             }
             _ => seed_document::model_size(&doc)?,
         };
         let local_edit = self.local.as_ref().is_some_and(|local| local.actor == commit.actor);
-        let selection = if let Some(transaction) = &commit.proposal.story_transaction {
+        let selection = if self.story_draft.is_some() {
+            None
+        } else if let Some(transaction) = &commit.proposal.story_transaction {
             let pending = self.pending_story_selection.as_ref().filter(|selection| local_edit && selection.sequence == commit.proposal.sequence);
             story_sync::selection_after(st, &self.replica, &replica, transaction, pending)
         } else {
@@ -1064,8 +1237,20 @@ impl Room {
         };
         let previous_selection = st.selection.text;
         let acknowledged = self.matches_pending(&commit);
-        let pending = if acknowledged { None } else { self.pending.as_ref() };
-        self.storage.write(self.history.iter().map(|(c, _)| c).chain(std::iter::once(&commit)), pending, self.next_sequence)?;
+        let front = if acknowledged { self.pending.pop_front() } else { None };
+        let keeps_visible_draft = !self.story_queue_blocked
+            && !self.pending.is_empty()
+            && front
+                .as_ref()
+                .and_then(|p| p.story_transaction.as_ref())
+                .is_some_and(|front| Some(front) == commit.proposal.story_transaction.as_ref());
+        if let Err(error) = self.storage.write(self.history.iter().map(|(c, _)| c).chain(std::iter::once(&commit)), &self.pending, self.next_sequence)
+        {
+            if let Some(front) = front {
+                self.pending.push_front(front);
+            }
+            return Err(error);
+        }
         #[cfg(unix)]
         if let Some(journal) = &mut self.server_journal
             && let Err(error) = journal.append(&commit)
@@ -1078,8 +1263,25 @@ impl Room {
             && self.layer_entry == Some((commit.proposal.sequence, st.active_layer))
             && matches!(commit.proposal.edits.as_slice(), [Operation::Layer { edit: LayerEdit::Create { .. } }]))
         .then_some(LayerId(doc.next_id));
-        install_confirmed(st, doc);
-        self.model_size = Some((Arc::downgrade(&st.doc), model_size));
+        let confirmed = Arc::new(doc);
+        if let Some(mut previous) = self.story_draft.take() {
+            if keeps_visible_draft {
+                // The editor already applied this exact change, including any dependent drafts.
+                previous.confirmed = confirmed;
+                self.story_draft = Some(previous);
+            } else {
+                let rebased = if self.story_queue_blocked && !self.pending.is_empty() {
+                    Err("Queued changes are paused.".into())
+                } else {
+                    story_sync::rebase(&confirmed, &replica, self.storage.identity().actor(), &self.pending)
+                };
+                self.install_rebased(st, rebased, confirmed.clone(), Some(previous), &replica);
+            }
+        } else {
+            install_document(st, confirmed.clone());
+        }
+        let installed_confirmed = self.story_draft.as_ref().map_or(&st.doc, |draft| &draft.confirmed);
+        self.model_size = Some((Arc::downgrade(installed_confirmed), model_size));
         if let Some(layer) = created_layer {
             st.active_layer = layer;
         }
@@ -1089,8 +1291,12 @@ impl Room {
         self.update_typing_selection(previous_selection, st.selection.text);
         self.replica = replica;
         if acknowledged {
-            self.pending = None;
             self.sending_proposal = None;
+            self.last_send = None;
+            self.story_sender.acknowledge(&self.pending);
+            if self.pending.is_empty() {
+                self.story_queue_blocked = false;
+            }
         }
         if local_edit {
             self.pending_story_selection = None;
@@ -1106,6 +1312,37 @@ impl Room {
         self.history.push((commit, bytes));
         self.inverses.push(inverse);
         Ok(())
+    }
+
+    fn install_rebased(
+        &mut self,
+        st: &mut designcraft_engine::DocState,
+        result: Result<(Arc<Document>, Option<story_sync::Draft>), String>,
+        confirmed: Arc<Document>,
+        previous: Option<story_sync::Draft>,
+        replica: &Replica,
+    ) {
+        match result {
+            Ok((display, draft)) => {
+                let selection = previous
+                    .as_ref()
+                    .and_then(|previous| story_sync::remap_selection(st, &previous.visible, draft.as_ref().map_or(replica, |view| &view.visible)));
+                install_document(st, display);
+                if let Some(selection) = selection {
+                    st.selection.text = Some(selection);
+                }
+                self.story_draft = draft;
+            }
+            Err(_) => {
+                if let Some(mut previous) = previous {
+                    previous.confirmed = confirmed;
+                    self.story_draft = Some(previous);
+                } else {
+                    install_document(st, confirmed);
+                }
+                self.block_story_queue();
+            }
+        }
     }
 
     fn select_own_creations(&self, session: &mut Session, edits: &[Operation]) {
@@ -1136,7 +1373,11 @@ impl Room {
 }
 
 fn install_confirmed(st: &mut designcraft_engine::DocState, doc: Document) {
-    if doc == *st.doc {
+    install_document(st, Arc::new(doc));
+}
+
+fn install_document(st: &mut designcraft_engine::DocState, doc: Arc<Document>) {
+    if doc == st.doc {
         return;
     }
     st.selection.items.retain(|id| doc.item(*id).is_some());
@@ -1150,7 +1391,7 @@ fn install_confirmed(st: &mut designcraft_engine::DocState, doc: Document) {
     if doc.layer(st.active_layer).is_none() {
         st.active_layer = doc.working_layer();
     }
-    st.doc = Arc::new(doc);
+    st.doc = doc;
     st.bump_revision();
 }
 

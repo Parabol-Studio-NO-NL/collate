@@ -48,7 +48,7 @@ fn wait_for_with_deadline(apps: &mut [&mut DesignApp], stage: &str, timeout: Dur
                     app.collaboration
                         .room
                         .as_ref()
-                        .map(|state| (state.revision, state.online, state.can_edit(), state.pending.is_some(), state.error.as_deref()))
+                        .map(|state| (state.revision, state.online, state.can_edit(), !state.pending.is_empty(), state.error.as_deref()))
                 })
                 .collect();
             panic!("{stage} timed out (revision, online, editable, pending, error): {states:?}");
@@ -358,7 +358,7 @@ fn invitation_downloads_embedded_image_and_shares_frame_moves() {
 
     guest.run("transform.move", json!({"ids": [guest_id.0], "dx": 36, "dy": 18})).unwrap();
     wait_for(&mut [&mut host, &mut guest], "guest moves embedded image frame", |apps| {
-        apps.iter().all(|app| room(app).revision == 1) && room(apps[1]).pending.is_none()
+        apps.iter().all(|app| room(app).revision == 1) && room(apps[1]).pending.is_empty()
     });
     let moved = document(&host).item(host_id).unwrap().bounds();
     assert!(moved.x0 > original_bounds.x0 && moved.y0 > original_bounds.y0);
@@ -396,7 +396,7 @@ fn lan_room_replicates_editor_edits_and_replays_comments_to_a_late_guest() {
 
     guest.run("transform.move", json!({"ids": [guest_id.0], "dx": 36, "dy": 18})).unwrap();
     wait_for(&mut [&mut host, &mut guest], "guest transform", |apps| {
-        apps.iter().all(|app| room(app).revision == 2) && room(apps[1]).pending.is_none()
+        apps.iter().all(|app| room(app).revision == 2) && room(apps[1]).pending.is_empty()
     });
     let moved = document(&host).item(host_id).unwrap().bounds();
     assert!(moved.x0 > original.x0 && moved.y0 > original.y0);
@@ -405,7 +405,7 @@ fn lan_room_replicates_editor_edits_and_replays_comments_to_a_late_guest() {
     for (command, revision, expected) in [("edit.undo", 3, original), ("edit.redo", 4, moved)] {
         guest.run(command, json!({})).unwrap();
         wait_for(&mut [&mut host, &mut guest], command, |apps| {
-            apps.iter().all(|app| room(app).revision == revision) && room(apps[1]).pending.is_none()
+            apps.iter().all(|app| room(app).revision == revision) && room(apps[1]).pending.is_empty()
         });
         assert_eq!(document(&host).item(host_id).unwrap().bounds(), expected);
         assert_eq!(document(&guest).item(guest_id).unwrap().bounds(), expected);
@@ -419,7 +419,9 @@ fn lan_room_replicates_editor_edits_and_replays_comments_to_a_late_guest() {
             vec![Operation::CreateComment { id: thread.clone(), anchor: CommentAnchor::Object(shared.clone()), text: "Proof ready".into() }],
         )
         .unwrap();
-    wait_for(&mut [&mut host, &mut guest], "guest comment", |apps| apps.iter().all(|app| room(app).revision == 5) && room(apps[1]).pending.is_none());
+    wait_for(&mut [&mut host, &mut guest], "guest comment", |apps| {
+        apps.iter().all(|app| room(app).revision == 5) && room(apps[1]).pending.is_empty()
+    });
     let host_room = host.collaboration.room.as_mut().unwrap();
     host_room.queue_local(&mut host.session, vec![Operation::SetResolved { thread, resolved: true }]).unwrap();
     wait_for(&mut [&mut host, &mut guest], "comment resolution", |apps| apps.iter().all(|app| room(app).revision == 6));
@@ -813,8 +815,8 @@ fn three_peers_converge_after_delayed_reordered_and_duplicate_packets() {
         let edit = app.session.take_deferred_edit().unwrap();
         app.collaboration.room.as_mut().unwrap().capture_edit(&mut app.session, edit).unwrap();
     }
-    let fill_proposal = room(&reviewer).pending.clone().unwrap();
-    let text_proposal = room(&writer).pending.clone().unwrap();
+    let fill_proposal = room(&reviewer).pending.front().unwrap().clone();
+    let text_proposal = room(&writer).pending.front().unwrap().clone();
     deliver_room_packet(&reviewer, &mut host, Message::Propose(fill_proposal.clone()));
     deliver_room_packet(&reviewer, &mut host, Message::Propose(fill_proposal));
     assert_eq!(room(&host).revision, 2);
@@ -830,7 +832,7 @@ fn three_peers_converge_after_delayed_reordered_and_duplicate_packets() {
     deliver_room_packet(&host, &mut reviewer, Message::Commit(typed.clone()));
     assert_eq!(document(&reviewer), &seed);
     assert_eq!(room(&reviewer).revision, 0);
-    assert!(room(&reviewer).pending.is_some());
+    assert!(!room(&reviewer).pending.is_empty());
     assert!(matches!(room(&reviewer).mode, Mode::Guest { ready: false, hello_sent: false }));
     deliver_room_packet(&host, &mut writer, Message::Commit(moved.clone()));
     deliver_room_packet(&host, &mut writer, Message::Commit(moved));
@@ -987,7 +989,7 @@ fn shared_text_comment_tracks_original_atoms_through_edits_and_replay() {
     let deletion = host.session.take_deferred_edit().unwrap();
     host.collaboration.room.as_mut().unwrap().capture_edit(&mut host.session, deletion).unwrap();
     wait_for(&mut [&mut host, &mut guest], "story removal and stale comment rejection", |apps| {
-        apps.iter().all(|app| room(app).revision == 9) && room(apps[1]).pending.is_none()
+        apps.iter().all(|app| room(app).revision == 9) && room(apps[1]).pending.is_empty()
     });
     assert_range(&host, &guest, None, None);
     assert_eq!(guest.collaboration.comment, "Keep this draft");
@@ -1251,7 +1253,7 @@ fn deleting_a_shared_text_frame_preserves_declined_and_buffered_typing() {
     // The host's local deletion is confirmed before its event loop reads the guest's proposal.
     host.run("edit.clear", json!({"ids": [frame]})).unwrap();
     wait_for(&mut [&mut host, &mut guest], "delete confirmed and stale text declined", |apps| {
-        room(apps[0]).revision == 1 && room(apps[1]).revision == 1 && room(apps[1]).pending.is_none()
+        room(apps[0]).revision == 1 && room(apps[1]).revision == 1 && room(apps[1]).pending.is_empty()
     });
 
     assert_eq!(document(&host), document(&guest));
@@ -1534,7 +1536,7 @@ fn concurrent_editor_text_inserts_and_deletes_keep_the_other_peers_atoms() {
     guest.request_quit();
     guest.handle_quit(&egui::Context::default());
     assert!(guest.collaboration.open, "quit directs the editor to its outstanding edit");
-    assert!(room(&guest).pending.is_some());
+    assert!(!room(&guest).pending.is_empty());
 
     let state = host.collaboration.room.as_mut().unwrap();
     state.transport = super::Transport::host_with_identity("Text host", false, state.storage.identity()).unwrap();
@@ -1566,9 +1568,13 @@ fn concurrent_editor_text_inserts_and_deletes_keep_the_other_peers_atoms() {
     assert_eq!(*document(&guest), unchanged);
 }
 
+#[cfg(feature = "automerge-rooms")]
+mod automerge_comments;
 mod book;
 mod embedded_link;
 mod font_notice;
+#[cfg(feature = "automerge-rooms")]
+mod optimistic;
 mod seed_artwork;
 mod version_handshake;
 
