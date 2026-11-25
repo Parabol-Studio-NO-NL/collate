@@ -72,7 +72,7 @@ fn author_receives_a_bound_receipt_and_can_recover_without_pending_artwork() {
 
     let files = tempfile::tempdir().unwrap();
     let ctx = egui::Context::default();
-    for (index, missing_pending) in [false, true].into_iter().enumerate() {
+    for index in 0..3 {
         let revision = index as u64 + 1;
         let body = artwork_fixture_with_side(171 + index as u32, 800);
         let path = files.path().join(format!("art-{index}.png"));
@@ -88,8 +88,10 @@ fn author_receives_a_bound_receipt_and_can_recover_without_pending_artwork() {
             thread::sleep(Duration::from_millis(2));
         }
         let guest_room = guest.collaboration.room.as_mut().unwrap();
-        if missing_pending {
-            guest_room.clear_pending().unwrap();
+        match index {
+            1 => guest_room.clear_pending().unwrap(),
+            2 => guest_room.pending.as_mut().unwrap().base = 0, // same sequence, different proposal metadata
+            _ => {}
         }
         let mut received_binary = 0;
         let mut receipts = 0;
@@ -113,8 +115,8 @@ fn author_receives_a_bound_receipt_and_can_recover_without_pending_artwork() {
             thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(receipts, 1);
-        if missing_pending {
-            assert!(received_binary >= body.len(), "fresh replay supplies the complete missing body");
+        if index != 0 {
+            assert!(received_binary >= body.len(), "fresh replay supplies the complete unconfirmed body");
         } else {
             assert_eq!(received_binary, 0, "submitting guest needs only its authenticated receipt");
         }

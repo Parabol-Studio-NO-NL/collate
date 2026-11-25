@@ -25,7 +25,7 @@ fn run() -> Result<(), String> {
                 None => 7337,
             };
             let mut server = Server::open(room, !options.is_empty(), port)?;
-            eprintln!("Serving the room. Read the current invitation from {}.", room.join("invitation.txt").display());
+            eprintln!("Starting the room. The invitation will be written to {}.", room.join("invitation.txt").display());
             loop {
                 std::thread::sleep(server.poll()?);
             }
