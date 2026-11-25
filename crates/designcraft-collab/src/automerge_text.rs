@@ -17,7 +17,10 @@ use crate::{
     text::{TextSplice, simple_text},
 };
 
+mod comment_anchor;
 mod format;
+
+pub use comment_anchor::AutomergeCommentAnchor;
 
 use format::{CHARACTER, EMPTY_CHARACTER, FIRST_PARAGRAPH, FOLLOWING_PARAGRAPH, Properties};
 

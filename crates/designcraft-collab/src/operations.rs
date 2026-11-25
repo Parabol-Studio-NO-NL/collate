@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     artwork::Placement,
+    automerge_text::AutomergeCommentAnchor,
     layers::LayerEdit,
     pages::PageEdit,
     text::{AtomId, TextEdit},
@@ -175,6 +176,14 @@ pub enum CommentAnchor {
     Page(PageId),
     Object(SharedId),
     Text { story: StoryId, atoms: Vec<AtomId> },
+    AutomergeText { story: StoryId, anchor: AutomergeCommentAnchor },
+}
+
+impl CommentAnchor {
+    /// Whether navigation must resolve the anchor through a story replica.
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text { .. } | Self::AutomergeText { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -7,7 +7,8 @@ use designcraft_doc::{
 };
 
 use crate::artwork::Placement;
-use crate::automerge_stories::{AutomergeStories, StoryTransaction};
+use crate::automerge_stories::{AutomergeStories, StoryTransaction, check_native_ranges};
+use crate::automerge_text::AutomergeText;
 use crate::text::{AtomId, CaptureHint, MAX_STORY_ATOMS, TextEdit, TextReplica, TextSplice, simple_text};
 use crate::{
     CommentAnchor, CommentReply, CommentThread, Error, InitialTextFormat, MAX_OPERATIONS, Operation, ShapeFrame, SharedId, layers, pages, validation,
@@ -17,6 +18,8 @@ const MAX_ORDER_ITEMS: usize = 512;
 const MAX_THREADS: usize = 512;
 const MAX_REPLIES_PER_THREAD: usize = 64;
 const MAX_COMMENT_ENTRIES: usize = 2_048;
+// Seeding a pristine story for comments does not perform any writes under this actor.
+const COMMENT_SEED_ACTOR: &[u8; 32] = &[0; 32];
 
 /// Per-document identity and comments for a replica initialized from an identical seed.
 #[derive(Clone)]
@@ -53,18 +56,28 @@ impl Replica {
         match &thread.anchor {
             CommentAnchor::Page(id) => !document.spreads.iter().flat_map(|spread| &spread.pages).any(|page| page.id == *id),
             CommentAnchor::Object(id) => self.local_id(id).is_none_or(|local| document.item(local).is_none()),
-            CommentAnchor::Text { .. } => self.comment_text_range(document, &thread.anchor).is_none(),
+            CommentAnchor::Text { .. } | CommentAnchor::AutomergeText { .. } => self.comment_text_range(document, &thread.anchor).is_none(),
         }
     }
 
     /// Capture the original visible atoms of a nonempty UTF-8 byte range.
     pub fn text_comment_anchor(&self, document: &Document, story: StoryId, range: Range<usize>) -> Option<CommentAnchor> {
-        if self.automerge.get(story).is_some() {
-            return None;
-        }
         let current = document.story(story)?;
         if current.text.get(range.clone())?.is_empty() {
             return None;
+        }
+        if let Some(replica) = self.automerge.get(story) {
+            if !cfg!(feature = "automerge-rooms") {
+                return None;
+            }
+            return replica.comment_anchor(range).ok().map(|anchor| CommentAnchor::AutomergeText { story, anchor });
+        }
+        if cfg!(feature = "automerge-rooms")
+            && !self.text.contains_key(&story)
+            && check_native_ranges(document, story).is_ok()
+            && let Ok(replica) = AutomergeText::seed(current, &document.styles, COMMENT_SEED_ACTOR)
+        {
+            return replica.comment_anchor(range).ok().map(|anchor| CommentAnchor::AutomergeText { story, anchor });
         }
         let atoms = match self.text.get(&story) {
             Some(replica) => replica.atoms_in(range),
@@ -76,10 +89,19 @@ impl Replica {
 
     /// Resolve a text comment to the span between its first and last surviving original atom.
     pub fn comment_text_range(&self, document: &Document, anchor: &CommentAnchor) -> Option<(StoryId, Range<usize>)> {
-        let CommentAnchor::Text { story, atoms } = anchor else { return None };
-        document.story(*story)?;
-        let range = self.text.get(story)?.visible_anchored_range(atoms)?;
-        Some((*story, range))
+        match anchor {
+            CommentAnchor::Text { story, atoms } => {
+                document.story(*story)?;
+                let range = self.text.get(story)?.visible_anchored_range(atoms)?;
+                Some((*story, range))
+            }
+            CommentAnchor::AutomergeText { story, anchor } => {
+                document.story(*story)?;
+                let range = self.automerge.get(*story)?.comment_range(anchor)?;
+                Some((*story, range))
+            }
+            _ => None,
+        }
     }
 
     /// Capture a committed local edit while retaining the pre-edit replica. The
@@ -122,7 +144,7 @@ impl Replica {
         let replica = if let Some(replica) = self.automerge.get(story) {
             replica
         } else {
-            seeded = crate::automerge_text::AutomergeText::seed(document.story(story)?, &document.styles, &[0; 32]).ok()?;
+            seeded = AutomergeText::seed(document.story(story)?, &document.styles, &[0; 32]).ok()?;
             &seeded
         };
         Some([replica.cursor(anchor).ok()?, replica.cursor(focus).ok()?])
@@ -549,7 +571,7 @@ impl Replica {
             .filter(|item| expected.contains(&item.id))
             .map(|item| {
                 let shared = self.shared_id(item.id).ok_or(Error::UnknownObject)?;
-                Ok((item.id, shared, validate_frame_removal(document, item)?))
+                Ok((item.id, shared, validate_frame_removal(document, item, &self.automerge)?))
             })
             .collect::<Result<Vec<_>, Error>>()?;
         if frames.len() != expected.len() {
@@ -655,7 +677,7 @@ impl Replica {
         if item.text_frame().map(|frame| frame.story) != story {
             return Err(Error::UnsupportedObject);
         }
-        validate_frame_removal(document, item)?;
+        validate_frame_removal(document, item, &self.automerge)?;
         document.remove_item(local).map_err(|_| Error::UnknownObject)?;
         self.tombstone_frame(local, id.clone(), story);
         Ok(())
@@ -728,6 +750,14 @@ impl Replica {
                     std::collections::btree_map::Entry::Vacant(entry) => entry.insert(TextReplica::new(current, &document.styles)?),
                 };
                 replica.validate_comment_atoms(atoms)?;
+            }
+            CommentAnchor::AutomergeText { story, anchor } => {
+                if !cfg!(feature = "automerge-rooms") || self.text.contains_key(story) {
+                    return Err(Error::UnsupportedEdit);
+                }
+                let current = document.story(*story).ok_or(Error::UnknownResource)?;
+                check_native_ranges(document, *story)?;
+                self.automerge.open(current, &document.styles, COMMENT_SEED_ACTOR)?.validate_comment_anchor(anchor)?;
             }
             _ => {}
         }
@@ -827,7 +857,7 @@ fn spread_ref(document: &Document, id: SpreadId) -> Result<SpreadRef, Error> {
     document.spreads.iter().position(|spread| spread.id == id).map(SpreadRef::Doc).ok_or(Error::UnknownResource)
 }
 
-fn validate_frame_removal(document: &Document, item: &Item) -> Result<Option<StoryId>, Error> {
+fn validate_frame_removal(document: &Document, item: &Item, automerge: &AutomergeStories) -> Result<Option<StoryId>, Error> {
     validation::editable_frame(item)?;
     if item_is_referenced(document, item.id) {
         return Err(Error::UnsupportedObject);
@@ -838,7 +868,11 @@ fn validate_frame_removal(document: &Document, item: &Item) -> Result<Option<Sto
         if current.frames != [item.id] || story_is_referenced(document, story) {
             return Err(Error::UnsupportedObject);
         }
-        TextReplica::new(current, &document.styles)?;
+        if automerge.get(story).is_some() {
+            crate::automerge_text::validate_story_shape(current)?;
+        } else {
+            TextReplica::new(current, &document.styles)?;
+        }
     }
     Ok(story)
 }

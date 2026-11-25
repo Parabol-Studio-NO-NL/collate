@@ -180,3 +180,70 @@ fn a_change_in_a_long_threaded_story_sends_the_edit_instead_of_the_chapter() {
     reader.project(&mut projected, &styles).unwrap();
     assert_eq!(projected, revised);
 }
+
+#[test]
+fn a_comment_tracks_only_surviving_original_characters_after_merge_and_checkpoint() {
+    let seed = seeded("Aé😊B");
+    let styles = Styles::default();
+    let mut alice = AutomergeText::seed(&seed, &styles, ALICE).unwrap();
+    let mut bob = AutomergeText::seed(&seed, &styles, BOB).unwrap();
+    let anchor = alice.comment_anchor(1.."Aé😊".len()).unwrap();
+    assert_eq!(alice.comment_range(&anchor), Some(1.."Aé😊".len()));
+    let encoded = serde_json::to_vec(&anchor).unwrap();
+    let anchor: AutomergeCommentAnchor = serde_json::from_slice(&encoded).unwrap();
+
+    let mut inserted = seed.clone();
+    inserted.insert("Aé".len(), "between");
+    let insertion = change(&mut alice, &seed, &inserted, &styles);
+    let mut shortened = seed.clone();
+    shortened.delete(1.."Aé".len());
+    let deletion = change(&mut bob, &seed, &shortened, &styles);
+    let range = alice.comment_range(&anchor).unwrap();
+    assert_eq!(&inserted.text[range], "ébetween😊");
+
+    alice.apply_changes(BOB, &deletion, &styles).unwrap();
+    bob.apply_changes(ALICE, &insertion, &styles).unwrap();
+    bob.validate_comment_anchor(&anchor).unwrap();
+    let mut merged = seed.clone();
+    alice.project(&mut merged, &styles).unwrap();
+    let remaining = "Abetween".len().."Abetween😊".len();
+    assert_eq!(alice.comment_range(&anchor), Some(remaining.clone()));
+    assert_eq!(alice.comment_range(&anchor), bob.comment_range(&anchor));
+
+    let current = alice.comment_anchor(1.."Abetween😊".len()).unwrap();
+    let bytes = alice.save().unwrap();
+    let mut restored = AutomergeText::load(seed.id, ALICE, &bytes, &styles).unwrap();
+    assert_eq!(restored.comment_range(&anchor), Some(remaining.clone()));
+    // Equal bytes are not equal characters after a replacement.
+    let mut replaced = merged.clone();
+    replaced.replace(remaining.clone(), "😊");
+    let replacement = restored.capture(&merged, &replaced, &styles, Some(TextSplice { old: remaining.clone(), new: remaining })).unwrap().unwrap();
+    bob.apply_changes(ALICE, &replacement, &styles).unwrap();
+    bob.validate_comment_anchor(&anchor).unwrap();
+    assert_eq!(restored.comment_range(&anchor), None);
+    assert_eq!(bob.comment_range(&anchor), None);
+    let survived = bob.comment_range(&current).unwrap();
+    assert_eq!(&merged.text[survived], "between");
+}
+
+#[test]
+fn comment_anchors_require_exact_boundaries_known_history_and_bounded_wire_data() {
+    let source = "é".repeat(crate::text::MAX_EDIT_ATOMS + 1);
+    let mut seed = seeded(&source);
+    let styles = Styles::default();
+    let original = AutomergeText::seed(&seed, &styles, ALICE).unwrap();
+    let anchor = original.comment_anchor(0..source.len() - "é".len()).unwrap();
+    assert!(original.comment_anchor(0..source.len()).is_err());
+    assert!(original.comment_anchor(0..1).is_err());
+    assert!(original.comment_anchor(1..2).is_err());
+    assert!(original.comment_anchor(0..0).is_err());
+    seed.id = StoryId(seed.id.0 + 1);
+    let unrelated = AutomergeText::seed(&seed, &styles, BOB).unwrap();
+    assert!(unrelated.validate_comment_anchor(&anchor).is_err());
+    assert_eq!(unrelated.comment_range(&anchor), None);
+
+    let encoded = serde_json::to_vec(&anchor).unwrap();
+    assert!(encoded.len() < source.len());
+    let oversized = serde_json::json!({"heads": "A".repeat(4096), "start": 0, "end": 2});
+    assert!(serde_json::from_value::<AutomergeCommentAnchor>(oversized).is_err());
+}

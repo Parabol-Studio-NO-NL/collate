@@ -114,7 +114,7 @@ impl AutomergeStories {
         Ok(())
     }
 
-    fn open(&mut self, original: &Story, styles: &Styles, actor: &[u8; 32]) -> Result<&mut AutomergeText, Error> {
+    pub(crate) fn open(&mut self, original: &Story, styles: &Styles, actor: &[u8; 32]) -> Result<&mut AutomergeText, Error> {
         use std::collections::btree_map::Entry;
 
         let story = match self.stories.entry(original.id) {
@@ -127,7 +127,7 @@ impl AutomergeStories {
 
 // Native links and data-merge placeholders still use UTF-8 offsets. A remote splice
 // cannot leave these ranges pointing at different content. They need CRDT anchors first.
-fn check_native_ranges(document: &Document, id: StoryId) -> Result<(), Error> {
+pub(crate) fn check_native_ranges(document: &Document, id: StoryId) -> Result<(), Error> {
     if document.hyperlinks.iter().any(|link| matches!(link.source, HyperlinkSource::Text { story, .. } if story == id))
         || document
             .data_merge

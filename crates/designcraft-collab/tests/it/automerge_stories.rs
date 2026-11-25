@@ -127,3 +127,79 @@ fn native_room_replica_keeps_the_two_story_histories_separate() {
     assert_eq!(recipient.apply_automerge_text(&mut book, &BOB, &crossed), Err(Error::UnsupportedEdit));
     assert!(book.story(legacy).unwrap().text.starts_with("Legacy note\n"));
 }
+
+#[cfg(not(feature = "automerge-rooms"))]
+#[test]
+fn protocol_15_rejects_automerge_comment_anchors_without_changing_the_story_model() {
+    use designcraft_collab::{CommentAnchor, Operation, automerge_text::AutomergeText};
+
+    let mut book = super::seed();
+    let (_, story) = super::add_text_frame(&mut book, 0.0);
+    let mut recipient = Replica::new(&book);
+    let native = book.story(story).unwrap();
+    let anchor = AutomergeText::seed(native, &book.styles, &ALICE).unwrap().comment_anchor(0..4).unwrap();
+    let incoming = Operation::CreateComment {
+        id: super::id("alice", 1),
+        anchor: CommentAnchor::AutomergeText { story, anchor },
+        text: "Review the opening".into(),
+    };
+
+    let incoming = serde_json::from_slice(&serde_json::to_vec(&incoming).unwrap()).unwrap();
+    assert_eq!(recipient.apply(&mut book, &[incoming]), Err(Error::UnsupportedEdit));
+    assert_eq!(recipient.comments().count(), 0);
+    assert!(matches!(recipient.text_comment_anchor(&book, story, 0..4), Some(CommentAnchor::Text { .. })));
+}
+
+#[cfg(feature = "automerge-rooms")]
+#[test]
+fn an_automerge_comment_from_a_pristine_story_survives_replay_and_retains_its_thread_after_story_removal() {
+    use designcraft_collab::{CommentAnchor, Operation, SharedId, text::MAX_STORY_ATOMS};
+
+    let mut seed = super::seed();
+    let (frame, story) = super::add_text_frame(&mut seed, 0.0);
+    let mut author = Replica::new(&seed);
+    let selected = seed.story(story).unwrap().text.find("story").unwrap();
+    let anchor = author.text_comment_anchor(&seed, story, selected..selected + "story".len()).unwrap();
+    assert!(matches!(anchor, CommentAnchor::AutomergeText { .. }));
+    let comment_id = super::id("alice", 1);
+    let comment = Operation::CreateComment { id: comment_id.clone(), anchor: anchor.clone(), text: "Review the ending".into() };
+    let comment: Operation = serde_json::from_slice(&serde_json::to_vec(&comment).unwrap()).unwrap();
+
+    // A comment accepted before the first text change must initialize the same seed as a peer
+    // independently drafting that change. Late replay will see the same original selection.
+    let mut amended = seed.clone();
+    amended.story_mut(story).unwrap().insert(0, "Chapter: ");
+    let text = author.capture_automerge_text(&seed, &amended, &BOB, None).unwrap().unwrap();
+    let mut reviewer = Replica::new(&seed);
+    let mut book = seed.clone();
+    reviewer.apply(&mut book, std::slice::from_ref(&comment)).unwrap();
+    reviewer.apply_automerge_text(&mut book, &BOB, &text).unwrap();
+
+    let mut late = Replica::new(&seed);
+    let mut joined = seed.clone();
+    late.apply_automerge_text(&mut joined, &BOB, &text).unwrap();
+    late.apply(&mut joined, &[comment]).unwrap();
+    for (native, replica) in [(&book, &reviewer), (&joined, &late)] {
+        let (_, moved) = replica.comment_text_range(native, &anchor).unwrap();
+        assert_eq!(&native.story(story).unwrap().text[moved], "story");
+        assert!(!replica.comment_is_orphaned(native, replica.comments().next().unwrap()));
+    }
+
+    // The story can now be longer than the legacy text replica supports. Deleting its only
+    // frame must still remove the story without deleting its comment.
+    let before = book.clone();
+    let at = book.story(story).unwrap().len();
+    let addition = "Paragraph for the next proof.\n".repeat(MAX_STORY_ATOMS / 20);
+    book.story_mut(story).unwrap().insert(at, &addition);
+    let long_edit = reviewer.capture_automerge_text(&before, &book, &BOB, None).unwrap().unwrap();
+    late.apply_automerge_text(&mut joined, &BOB, &long_edit).unwrap();
+    assert!(joined.story(story).unwrap().text.chars().count() > MAX_STORY_ATOMS);
+    let spread = joined.spreads[0].id;
+    late.apply(&mut joined, &[Operation::DeleteText { id: SharedId::Seed(frame), spread, story }]).unwrap();
+    assert!(joined.story(story).is_none());
+    assert!(late.comment_text_range(&joined, &anchor).is_none());
+    let thread = late.comments().next().unwrap();
+    assert_eq!(thread.id, comment_id);
+    assert!(late.comment_is_orphaned(&joined, thread));
+    assert_eq!(thread.text, "Review the ending");
+}
