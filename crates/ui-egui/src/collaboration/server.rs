@@ -203,6 +203,7 @@ pub fn init(root: &Path, seed_path: Option<&Path>) -> Result<(), String> {
     } else {
         Document::new(&NewDocument::default())
     };
+    seed_document::prepare_local_copy(&mut doc)?;
     doc.compact_assets();
     let (bytes, blobs) = seed_document::bundle(&doc)?;
     let header =

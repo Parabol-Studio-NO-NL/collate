@@ -20,7 +20,7 @@ Use the existing **Layers** panel to create or reorder shared layers, change opt
 
 Shared undo and redo apply to your own simple text edits while preserving other collaborators' typing, deletions and formatting. They also cover frame properties, order and comment resolution when no teammate has since changed the same target. Artwork and structural edits remain outside shared undo.
 
-Font files stay on each participant’s computer. When a shared document uses a missing family or style, select **Missing fonts** in the status bar to see which faces this computer needs. Install the same licensed fonts and choose **Reload Fonts**. Until then, fallback fonts may change line breaks and output. Embed supported linked images before starting a room so their appearance travels with the document.
+Font files stay on each participant’s computer. When a shared document uses a missing family or style, select **Missing fonts** in the status bar to see which faces this computer needs. Install the same licensed fonts and choose **Reload Fonts**. Until then, fallback fonts may change line breaks and output. For an existing linked image, select it in **Window > Links** and choose **Embed** before sharing. The shared copy contains the artwork and its filename. It drops the local source path that **Unembed** would use. To keep that path in your original, use **File > Save a Copy** and start the room from the copy. Starting a room leaves the file on disk untouched until you save.
 
 ### Try collaboration on one Mac
 

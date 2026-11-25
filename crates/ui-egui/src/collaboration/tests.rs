@@ -244,8 +244,10 @@ fn placed_pdf_page_and_crop_converge_and_render_after_reopen() {
     host.run("file.place", json!({"path": file, "pdfPage": 2, "x": 80, "y": 360})).unwrap();
     wait_for(&mut [&mut host, &mut guest], "second PDF crop is kept distinct", |apps| apps.iter().all(|app| room(app).revision == 3));
     let history = &room(&host).history;
-    assert!(history[0].1.len() > designcraft_collab_core::MAX_PAYLOAD);
-    assert!(history[1..].iter().all(|(_, edit)| edit.len() < designcraft_collab_core::MAX_PAYLOAD));
+    assert!(history[0].1.artwork_size > designcraft_collab_core::MAX_PAYLOAD as u64);
+    assert_eq!(history[0].1.blobs.len(), 1);
+    assert!(history.iter().all(|(_, edit)| edit.len() < designcraft_collab_core::MAX_PAYLOAD));
+    assert!(history[1..].iter().all(|(_, edit)| edit.blobs.is_empty()));
     std::fs::remove_file(&file).unwrap();
     assert_eq!(document(&host), document(&guest));
     let confirmed = document(&guest);
@@ -1456,6 +1458,7 @@ fn concurrent_editor_text_inserts_and_deletes_keep_the_other_peers_atoms() {
     assert_eq!(*document(&guest), unchanged);
 }
 
+mod embedded_link;
 mod font_notice;
 mod seed_artwork;
 

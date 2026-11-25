@@ -67,8 +67,13 @@ fn save_artwork_checkpoint(root: &Path) {
     asset.data = designcraft_doc::AssetData::embedded(pixels);
     asset.pixels = Some((832, 832));
     let mut source = editor(&doc, "Studio artwork");
+    let original = root.join("formerly-linked.png");
+    std::fs::write(&original, artwork_fixture(555)).unwrap();
+    let placed = source.run("file.place", json!({"path": original, "link": true})).unwrap();
+    source.run("links.embed", json!({"asset": placed["asset"]})).unwrap();
     source.run("file.saveAs", json!({"path": root.join("Artwork.designcraft")})).unwrap();
     drop(source);
+    std::fs::remove_file(original).unwrap();
     let mut host = reopened(root, "Artwork");
     host.connect_collaboration(true).unwrap();
     wait_for(&mut [&mut host], "durable artwork host", |apps| room(apps[0]).can_edit());
@@ -85,8 +90,11 @@ fn restore_artwork_checkpoint(root: &Path) {
     let doc = document(&host);
     let placed = doc.assets.values().find(|asset| asset.name == "placed.png").unwrap();
     assert_eq!(placed.data.embedded_bytes().unwrap().as_slice(), std::fs::read(root.join("placed.png")).unwrap());
-    let seed = doc.assets.values().find(|asset| asset.id != placed.id).unwrap();
+    let seed = doc.assets.values().find(|asset| asset.name == "Synthetic colour chip").unwrap();
     assert_eq!(seed.data.embedded_bytes().unwrap().as_slice(), artwork_fixture_with_side(589, 832));
+    let embedded = doc.assets.values().find(|asset| asset.name == "formerly-linked.png").unwrap();
+    assert!(embedded.link.is_none() && embedded.link_relative.is_none() && embedded.link_hash.is_none() && embedded.link_fingerprint.is_none());
+    assert!(embedded.data.embedded_bytes().unwrap().as_slice() == artwork_fixture(555));
 }
 
 /// Stage exactly one outbox entry, without polling the host or delivering the guest's edit.

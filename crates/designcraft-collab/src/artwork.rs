@@ -19,7 +19,7 @@ pub use pdf_artwork::PDF_MIME;
 pub const MAX_IMAGE_SIDE: u32 = 12_000;
 pub const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 pub use designcraft_doc::MAX_SHARED_ARTWORK_BYTES as MAX_ARTWORK_BYTES;
-const INLINE_ARTWORK_BYTES: usize = 2 * 1024 * 1024;
+const MAX_LEGACY_INLINE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Identifies immutable bytes independently of a local filename or asset allocation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -86,13 +86,12 @@ impl Placement {
             if bytes.len() > MAX_ARTWORK_BYTES {
                 return Err(Error::Limit);
             }
-            let external = bytes.len() > INLINE_ARTWORK_BYTES;
             Some(Artwork {
                 name: asset.name.clone(),
                 mime: asset.mime.clone(),
-                bytes: (!external).then(|| STANDARD_NO_PAD.encode(bytes).into()),
-                length: external.then_some(bytes.len() as u32),
-                body: if external { asset.data.embedded_bytes().cloned() } else { None },
+                bytes: None,
+                length: Some(bytes.len() as u32),
+                body: asset.data.embedded_bytes().cloned(),
             })
         };
         Ok(Self { digest: Sha256::digest(bytes).into(), size: graphic.size, transform: graphic.xf.as_coeffs(), pdf, artwork })
@@ -211,7 +210,7 @@ impl Artwork {
             return Ok(data.clone());
         }
         let bytes = self.bytes.as_deref().ok_or(Error::UnknownResource)?;
-        if bytes.len() > (INLINE_ARTWORK_BYTES * 4).div_ceil(3) {
+        if bytes.len() > (MAX_LEGACY_INLINE_BYTES * 4).div_ceil(3) {
             return Err(Error::Limit);
         }
         let data = STANDARD_NO_PAD.decode(bytes.as_bytes()).map_err(|_| Error::Invalid("image data"))?;

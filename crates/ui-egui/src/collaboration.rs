@@ -340,10 +340,12 @@ impl DesignApp {
         if cfg!(target_os = "macos") && self.session.recovery_dir.is_some() && (st.path.is_none() || st.is_dirty()) {
             return Err("Save the seed document before starting or joining a room.".into());
         }
-        let (storage, saved) = Storage::open(self.session.recovery_dir.as_deref(), st.path.as_deref(), &st.doc, guest_of)?;
+        let mut opened = (*st.doc).clone();
+        seed_document::prepare_local_copy(&mut opened)?;
+        let (storage, saved) = Storage::open(self.session.recovery_dir.as_deref(), st.path.as_deref(), &opened, guest_of)?;
         let seed = fingerprint(&storage.seed)?;
         let uid = st.uid;
-        let recovered = replay::restore(&storage.seed, &st.doc, saved.confirmed)?;
+        let recovered = replay::restore(&storage.seed, &opened, saved.confirmed)?;
         let revision = recovered.history.len() as u64;
         if saved.pending.as_ref().is_some_and(|pending| host || pending.base > revision || pending.sequence >= saved.next_sequence) {
             return Err("The local collaboration journal has an invalid pending edit.".into());

@@ -48,7 +48,7 @@ fn guest_can_edit_after_the_host_rejects_artwork_at_its_retained_limit() {
     // was preparing a proposal, without allocating a gigabyte in regular CI.
     host.collaboration.room.as_mut().unwrap().history[0].1.artwork_size = designcraft_doc::MAX_SHARED_ARTWORK_BYTES as u64 - 32;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("inline.png");
+    let path = dir.path().join("small.png");
     std::fs::write(&path, artwork_fixture(64)).unwrap();
     guest.open_picked("place", path.to_str().unwrap().into()).unwrap();
     wait_for(&mut [&mut host, &mut guest], "host reports artwork capacity", |apps| {
@@ -123,4 +123,49 @@ fn author_receives_a_bound_receipt_and_can_recover_without_pending_artwork() {
         assert_eq!(document(&guest), document(&host));
         wait_for(&mut [&mut host, &mut guest], "guest caught up", |apps| room(apps[1]).can_edit());
     }
+}
+
+#[test]
+fn smaller_placements_stay_out_of_json_history_and_inline_journals_still_replay() {
+    use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
+
+    let seed = Document::new(&NewDocument::default());
+    let mut host = editor(&seed, "Host");
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "host starts", |apps| room(apps[0]).invitation.is_some());
+    let mut guest = editor(&seed, "Guest");
+    join(&mut guest, room(&host).invitation.as_deref().unwrap());
+    wait_for(&mut [&mut host, &mut guest], "guest joins", |apps| room(apps[1]).can_edit());
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut old_size = 0;
+    for index in 0..4 {
+        let body = artwork_fixture_with_side(371 + index, 700);
+        assert!(body.len() < 2 * 1024 * 1024);
+        old_size += (body.len() * 4).div_ceil(3);
+        let path = dir.path().join(format!("spread-{index}.png"));
+        std::fs::write(&path, body).unwrap();
+        host.open_picked("place", path.to_str().unwrap().into()).unwrap();
+        wait_for(&mut [&mut host, &mut guest], "placed image confirmed", |apps| apps.iter().all(|app| room(app).revision == u64::from(index) + 1));
+    }
+    assert!(old_size > super::super::MAX_HISTORY_BYTES);
+    assert!(room(&host).history_bytes < designcraft_collab_core::MAX_PAYLOAD);
+    assert_eq!(document(&host), document(&guest));
+
+    // Produce a v13 journal entry: it held base64 bytes instead of a body length.
+    let (first, wire) = &room(&host).history[0];
+    let original = wire.blobs.values().next().unwrap();
+    let mut record = serde_json::to_value(first).unwrap();
+    let artwork = record["proposal"]["edits"][0]["placement"]["artwork"].as_object_mut().unwrap();
+    assert!(artwork.remove("length").is_some());
+    artwork.insert("bytes".into(), STANDARD_NO_PAD.encode(original.as_slice()).into());
+    let legacy: super::super::Commit = serde_json::from_value(record.clone()).unwrap();
+    let restored = super::super::replay::restore(&seed, &seed, vec![legacy]).unwrap();
+    let installed = restored.document.assets.values().next().unwrap().data.embedded_bytes().unwrap();
+    assert_eq!(installed, original);
+
+    let mut corrupt = original.as_ref().clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    record["proposal"]["edits"][0]["placement"]["artwork"]["bytes"] = STANDARD_NO_PAD.encode(corrupt).into();
+    assert!(super::super::replay::restore(&seed, &seed, vec![serde_json::from_value(record).unwrap()]).is_err());
 }

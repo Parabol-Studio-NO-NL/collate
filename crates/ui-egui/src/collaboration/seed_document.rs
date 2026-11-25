@@ -305,6 +305,35 @@ fn member(archive: &mut Archive<'_>, name: &str, limit: u64) -> Result<Vec<u8>, 
     archive.read(name, limit).map_err(|_| INVALID)?.ok_or_else(|| INVALID.into())
 }
 
+fn has_external_bytes(asset: &Asset) -> bool {
+    asset.storage == Storage::Linked || asset.data.is_linked() || asset.proxy.as_ref().is_some_and(|proxy| proxy.data.is_linked())
+}
+
+fn has_link_provenance(asset: &Asset) -> bool {
+    asset.link.is_some() || asset.link_relative.is_some() || asset.link_hash.is_some() || asset.link_fingerprint.is_some()
+}
+
+/// Embed Link keeps the source location for a future local Unembed. Remove it only
+/// from a local working copy with the original bytes in hand, before compaction or
+/// comparison with the room. Incoming seeds must pass strict validation as received.
+pub(super) fn prepare_local_copy(doc: &mut Document) -> Result<(), String> {
+    for asset in doc.assets.values_mut() {
+        if has_external_bytes(asset) {
+            return Err(UNSUPPORTED_LINKS.into());
+        }
+        if has_link_provenance(asset) {
+            if asset.data.embedded_bytes().is_none_or(|body| body.is_empty()) {
+                return Err(UNSUPPORTED_LINKS.into());
+            }
+            let asset = Arc::make_mut(asset);
+            asset.set_link(None, None);
+            asset.link_relative = None;
+            asset.link_hash = None;
+        }
+    }
+    Ok(())
+}
+
 fn validate_model(doc: &Document) -> Result<(), String> {
     if doc.assets.len() > MAX_ASSETS {
         return Err(TOO_LARGE.into());
@@ -323,14 +352,7 @@ fn validate_model(doc: &Document) -> Result<(), String> {
         if id != asset.id {
             return Err(INVALID.into());
         }
-        if asset.storage == Storage::Linked
-            || asset.link.is_some()
-            || asset.link_relative.is_some()
-            || asset.link_hash.is_some()
-            || asset.link_fingerprint.is_some()
-            || asset.data.is_linked()
-            || asset.proxy.as_ref().is_some_and(|proxy| proxy.data.is_linked())
-        {
+        if has_external_bytes(asset) || has_link_provenance(asset) {
             return Err(UNSUPPORTED_LINKS.into());
         }
         validate_asset_metadata(asset)?;
@@ -573,8 +595,11 @@ mod tests {
         assert!(decode(&with_members(&encoded, &[(&path, truncated_png)], Some(&path))).is_err());
 
         let target = Arc::make_mut(doc.assets.get_mut(&asset).unwrap());
-        target.storage = Storage::Linked;
         target.link = Some("/missing/local/source.png".into());
+        let retained_link = model_bytes(&doc).unwrap();
+        let untrusted = with_members(&encoded, &[("document.json", &retained_link)], Some("document.json"));
+        assert_eq!(decode(&untrusted), Err(UNSUPPORTED_LINKS.into()), "only local callers may strip embedded-link provenance");
+        Arc::make_mut(doc.assets.get_mut(&asset).unwrap()).storage = Storage::Linked;
         assert_eq!(encode(&doc), Err(UNSUPPORTED_LINKS.into()));
         assert_eq!(fingerprint(&doc), Err(UNSUPPORTED_LINKS.into()));
         let linked_model = model_bytes(&doc).unwrap();

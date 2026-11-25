@@ -14,7 +14,7 @@ room="$HOME/Collate Studio Room"
 "$server" serve "$room"
 ```
 
-Omit the document path to create a blank room. Import reads the original once. Embed linked artwork in Collate before importing. The room holds the working copy from then on.
+Omit the document path to create a blank room. Import reads the original once. For linked artwork, first use **Embed** in Collate’s Links panel and save the document. Import removes the local source paths from the server’s copy. The room holds the working copy from then on.
 
 In another terminal, copy the contents of `invitation.txt` inside the room directory. On macOS, run `pbcopy < "$HOME/Collate Studio Room/invitation.txt"`. Choose **Join shared document…** on Collate’s Home screen and paste the invitation. Use a second Collate instance or another computer to test simultaneous edits. For a second macOS instance run `open -n -a Collate`. Anyone with the invitation can join and edit, so send it privately.
 
