@@ -28,6 +28,7 @@ fn independent_collators_merge_book_stories_and_replay_into_a_fresh_native_docum
     let alice_tx = alice.capture(&seed, &alice_book, &ALICE, None).unwrap().unwrap();
     let alice_tx: StoryTransaction = serde_json::from_slice(&serde_json::to_vec(&alice_tx).unwrap()).unwrap();
     let bob_tx = bob.capture(&seed, &bob_book, &BOB, None).unwrap().unwrap();
+    assert_eq!(bob_tx.inserted_text().unwrap(), " de Bob");
     alice.apply(&mut alice_book, &BOB, &bob_tx).unwrap();
     bob.apply(&mut bob_book, &ALICE, &alice_tx).unwrap();
 

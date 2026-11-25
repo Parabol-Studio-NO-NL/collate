@@ -116,6 +116,18 @@ impl Replica {
         self.automerge.get(story)?.cursor(byte).ok()
     }
 
+    /// Anchor an existing selection even when the first accepted Automerge edit has just arrived.
+    pub fn automerge_anchors(&self, document: &Document, story: StoryId, [anchor, focus]: [usize; 2]) -> Option<[Vec<u8>; 2]> {
+        let seeded;
+        let replica = if let Some(replica) = self.automerge.get(story) {
+            replica
+        } else {
+            seeded = crate::automerge_text::AutomergeText::seed(document.story(story)?, &document.styles, &[0; 32]).ok()?;
+            &seeded
+        };
+        Some([replica.cursor(anchor).ok()?, replica.cursor(focus).ok()?])
+    }
+
     pub fn resolve_automerge_cursor(&self, story: StoryId, cursor: &[u8]) -> Option<usize> {
         self.automerge.get(story)?.resolve(cursor).ok()
     }

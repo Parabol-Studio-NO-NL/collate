@@ -9,7 +9,11 @@ use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use designcraft_doc::{Document, HyperlinkSource, PlaceholderAnchor, Story, StoryId, Styles};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Error, automerge_text::AutomergeText, text::TextSplice};
+use crate::{
+    Error,
+    automerge_text::{AutomergeText, append_inserted_text},
+    text::TextSplice,
+};
 
 const MAX_STORIES_PER_EDIT: usize = 64;
 const MAX_TRANSACTION_BYTES: usize = 2 * 1024 * 1024;
@@ -149,6 +153,16 @@ fn deserialize_change<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<
 }
 
 impl StoryTransaction {
+    /// Recover inserted text from a locally submitted change that the host declined.
+    pub fn inserted_text(&self) -> Result<String, Error> {
+        self.validate()?;
+        let mut text = String::new();
+        for change in &self.changes {
+            append_inserted_text(&change.bytes, &mut text)?;
+        }
+        Ok(text)
+    }
+
     fn validate(&self) -> Result<(), Error> {
         if self.changes.is_empty() {
             return Err(Error::Invalid("empty story transaction"));

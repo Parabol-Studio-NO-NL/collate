@@ -12,6 +12,7 @@ mod seed_document;
 #[cfg(unix)]
 pub mod server;
 mod storage;
+mod story_sync;
 #[cfg(test)]
 mod tests;
 mod text_selection;
@@ -23,6 +24,7 @@ use std::{
     time::Duration,
 };
 
+use designcraft_collab::automerge_stories::StoryTransaction;
 use designcraft_collab::{Operation, PROTOCOL_VERSION, Replica, layers::LayerEdit};
 use designcraft_collab_core::{ActorId, Event, MAX_PAYLOAD, Peer, Session as Transport};
 use designcraft_doc::{Document, LayerId, PageId, Selection, SpreadRef};
@@ -51,6 +53,8 @@ struct Proposal {
     edits: Vec<Operation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     history_action: Option<HistoryAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    story_transaction: Option<StoryTransaction>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -102,8 +106,7 @@ fn encode_packet(message: Message) -> Result<Vec<u8>, String> {
 }
 
 fn encode_edit(message: Message) -> Result<WireEdit, String> {
-    let can_chunk =
-        matches!(&message, Message::Propose(proposal) | Message::Commit(Commit { proposal, .. }) if accepts_chunked_edit(&proposal.edits));
+    let can_chunk = matches!(&message, Message::Propose(proposal) | Message::Commit(Commit { proposal, .. }) if accepts_chunked_edit(proposal));
     let (blobs, artwork_size) = match &message {
         Message::Propose(p) | Message::Commit(Commit { proposal: p, .. }) => (p.blobs()?, p.artwork_size()),
         _ => (attachments::Blobs::new(), 0),
@@ -116,9 +119,10 @@ fn encode_edit(message: Message) -> Result<WireEdit, String> {
     Ok(wire)
 }
 
-fn accepts_chunked_edit(edits: &[Operation]) -> bool {
-    edits.iter().any(|edit| edit.changes_artwork() || matches!(edit, Operation::CreateText { .. } | Operation::Text { .. }))
-        || matches!(edits, [Operation::CreateComment { anchor: designcraft_collab::CommentAnchor::Text { .. }, .. }])
+fn accepts_chunked_edit(proposal: &Proposal) -> bool {
+    proposal.story_transaction.is_some()
+        || proposal.edits.iter().any(|edit| edit.changes_artwork() || matches!(edit, Operation::CreateText { .. } | Operation::Text { .. }))
+        || matches!(proposal.edits.as_slice(), [Operation::CreateComment { anchor: designcraft_collab::CommentAnchor::Text { .. }, .. }])
 }
 
 enum Mode {
@@ -161,6 +165,7 @@ struct Room {
     next_sequence: u64,
     revision: u64,
     pending: Option<Proposal>,
+    pending_story_selection: Option<story_sync::PendingSelection>,
     rejected_comment: Option<CommentDraft>,
     frame_entry: Option<typing::FrameEntry>,
     layer_entry: Option<(u64, LayerId)>,
@@ -479,6 +484,7 @@ impl Room {
             next_sequence: 1,
             revision: 0,
             pending: None,
+            pending_story_selection: None,
             rejected_comment: None,
             frame_entry: None,
             layer_entry: None,
@@ -684,10 +690,10 @@ impl Room {
         self.receiving_edits.remove(&actor);
         let Ok(Packet { version: PROTOCOL_VERSION, message }) = serde_json::from_slice(&bytes) else { return self.drop_transfer(actor) };
         match message {
-            Message::Propose(ref proposal) if self.serving(actor) && accepts_chunked_edit(&proposal.edits) => {
+            Message::Propose(ref proposal) if self.serving(actor) && accepts_chunked_edit(proposal) => {
                 self.on_guest_message(session, actor, message);
             }
-            Message::Commit(ref commit) if self.host == Some(actor) && accepts_chunked_edit(&commit.proposal.edits) => {
+            Message::Commit(ref commit) if self.host == Some(actor) && accepts_chunked_edit(&commit.proposal) => {
                 self.on_host_message(session, message);
             }
             _ => self.drop_transfer(actor),
@@ -871,12 +877,22 @@ impl Room {
     }
 
     fn capture_edit(&mut self, session: &mut Session, edit: DeferredEdit) -> Result<(), String> {
-        let local = self.local.as_ref().ok_or("The collaboration connection is still starting.")?;
+        let actor = self.local.as_ref().ok_or("The collaboration connection is still starting.")?.actor;
         self.error = None;
+        if cfg!(feature = "automerge-rooms")
+            && let Some(story_sync::Captured { transaction, selection }) = story_sync::capture(&self.replica, actor, &edit, self.next_sequence)?
+        {
+            self.pending_story_selection = selection;
+            let result = self.queue_transaction(session, Vec::new(), None, Some(transaction));
+            if result.is_err() {
+                self.pending_story_selection = None;
+            }
+            return result;
+        }
         let selections = edit.before_selection.text.zip(edit.after_selection.text);
         let edits = self
             .replica
-            .capture_selected(&edit.before, &edit.after, &local.actor.to_string(), self.next_sequence, selections)
+            .capture_selected(&edit.before, &edit.after, &actor.to_string(), self.next_sequence, selections)
             .map_err(|error| error.to_string())?;
         self.frame_entry = typing::FrameEntry::capture(self.next_sequence, &edit, &edits);
         self.layer_entry =
@@ -897,8 +913,18 @@ impl Room {
     }
 
     fn queue_proposal(&mut self, session: &mut Session, edits: Vec<Operation>, history_action: Option<HistoryAction>) -> Result<(), String> {
+        self.queue_transaction(session, edits, history_action, None)
+    }
+
+    fn queue_transaction(
+        &mut self,
+        session: &mut Session,
+        edits: Vec<Operation>,
+        history_action: Option<HistoryAction>,
+        story_transaction: Option<StoryTransaction>,
+    ) -> Result<(), String> {
         let actor = self.local.as_ref().ok_or("The collaboration connection is still starting.")?.actor;
-        let proposal = Proposal { sequence: self.next_sequence, base: self.revision, edits, history_action };
+        let proposal = Proposal { sequence: self.next_sequence, base: self.revision, edits, history_action, story_transaction };
         self.next_sequence = self.next_sequence.checked_add(1).ok_or("The shared room reached its edit limit.")?;
         let wire = encode_edit(Message::Propose(proposal.clone()))?;
         self.check_artwork_budget(wire.artwork_size)?;
@@ -931,6 +957,7 @@ impl Room {
         if proposal.base > self.revision || proposal.sequence == 0 || self.history.len() >= MAX_HISTORY {
             return Err("The edit has an invalid revision or the room is full.".into());
         }
+        proposal.validate_story_transaction()?;
         if proposal.edits.iter().any(Operation::is_text_compensation) {
             return Err("A text undo or redo must be requested through shared history.".into());
         }
@@ -941,15 +968,14 @@ impl Room {
         } else {
             None
         };
-        if proposal.edits.is_empty() {
+        if proposal.edits.is_empty() && proposal.story_transaction.is_none() {
             return Err("The proposal has no edits.".into());
         }
         let author = actor.to_string();
         if !proposal.edits.iter().all(|edit| edit.is_authored_by(&author) && edit.is_from_sequence(proposal.sequence)) {
             return Err("Could not verify the edit author.".into());
         }
-        let changed = self.history.iter().skip(proposal.base as usize);
-        if changed.flat_map(|(old, _)| &old.proposal.edits).any(|old| proposal.edits.iter().any(|edit| edit.conflicts(old))) {
+        if self.history.iter().skip(proposal.base as usize).any(|(old, _)| proposal.conflicts_with(&old.proposal)) {
             return Err("A collaborator changed the same object property first.".into());
         }
         self.commit(session, Commit { revision: self.revision + 1, actor, proposal, correction })
@@ -965,6 +991,7 @@ impl Room {
             self.storage.write(self.history.iter().map(|(c, _)| c), None, self.next_sequence)?;
             self.pending = None;
             self.sending_proposal = None;
+            self.pending_story_selection = None;
             self.layer_entry = None;
             if self.frame_entry.take().is_some() {
                 self.pause_typing();
@@ -1017,22 +1044,24 @@ impl Room {
         let st = session.document_by_uid_mut(self.doc_uid).ok_or("The shared document closed.")?;
         let mut doc = (*st.doc).clone();
         let mut replica = self.replica.clone();
-        let inverse = replica.inverse_patch_batch(&doc, &commit.proposal.edits).map_err(|error| error.to_string())?;
-        replica.apply(&mut doc, &commit.proposal.edits).map_err(|error| error.to_string())?;
+        let inverse = commit.apply_document(&mut replica, &mut doc)?;
         if commit.proposal.edits.iter().any(Operation::changes_artwork) {
             seed_document::check_artwork(&doc)?;
         }
         // Every committed checkpoint must fit the model bound during journal replay.
         let model_size = match &self.model_size {
-            Some((before, size))
-                if before.ptr_eq(&Arc::downgrade(&st.doc)) && commit.proposal.edits.iter().all(|edit| operation_story(edit).is_some()) =>
-            {
-                seed_document::updated_story_model_size(*size, &st.doc, &doc, commit.proposal.edits.iter().filter_map(operation_story))?
+            Some((before, size)) if before.ptr_eq(&Arc::downgrade(&st.doc)) && commit.proposal.is_text_only() => {
+                seed_document::updated_story_model_size(*size, &st.doc, &doc, commit.proposal.affected_stories())?
             }
             _ => seed_document::model_size(&doc)?,
         };
         let local_edit = self.local.as_ref().is_some_and(|local| local.actor == commit.actor);
-        let selection = text_selection::after(st, &self.replica, &replica, &commit.proposal.edits, local_edit);
+        let selection = if let Some(transaction) = &commit.proposal.story_transaction {
+            let pending = self.pending_story_selection.as_ref().filter(|selection| local_edit && selection.sequence == commit.proposal.sequence);
+            story_sync::selection_after(st, &self.replica, &replica, transaction, pending)
+        } else {
+            text_selection::after(st, &self.replica, &replica, &commit.proposal.edits, local_edit)
+        };
         let previous_selection = st.selection.text;
         let acknowledged = self.matches_pending(&commit);
         let pending = if acknowledged { None } else { self.pending.as_ref() };
@@ -1064,6 +1093,7 @@ impl Room {
             self.sending_proposal = None;
         }
         if local_edit {
+            self.pending_story_selection = None;
             self.layer_entry = None;
             if self.frame_entry.as_ref().is_some_and(|entry| entry.sequence == commit.proposal.sequence) {
                 self.confirm_frame_entry(session);

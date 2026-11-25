@@ -63,10 +63,8 @@ pub(super) fn restore_cached(
         if history_bytes > MAX_HISTORY_BYTES || artwork_size > designcraft_collab::artwork::MAX_ARTWORK_BYTES as u64 {
             return Err(RestoreIssue::Other("The local collaboration journal exceeds its history limit.".into()));
         }
-        let edits = &commit.proposal.edits;
         super::history::verify_text_compensation(&commit, history.iter().map(|(original, _)| original), &inverses)?;
-        let inverse = replica.inverse_patch_batch(&document, edits).map_err(|error| error.to_string())?;
-        replica.apply(&mut document, edits).map_err(|error| error.to_string())?;
+        let inverse = commit.apply_document(&mut replica, &mut document)?;
         inverses.push(inverse);
         if !found_opened {
             found_opened = cache.canonical(&document)? == opened_fingerprint;

@@ -98,16 +98,7 @@ impl AutomergeText {
     /// Apply one uncompressed change from the authenticated actor. Duplicate delivery is harmless.
     pub fn apply_changes(&mut self, actor: &[u8], bytes: &[u8], styles: &Styles) -> Result<(), Error> {
         let actor = editing_actor(self.story, actor)?;
-        if bytes.len() > MAX_CHANGE_BYTES {
-            return Err(Error::Limit);
-        }
-        // The public binary format puts a one-byte chunk type after the four magic and four checksum bytes.
-        // https://automerge.org/automerge-binary-format-spec/ . Accept just a raw change so parsing never inflates remote data.
-        if bytes.get(8) != Some(&1) {
-            return Err(Error::Invalid("Automerge change chunk"));
-        }
-        let change = Change::try_from(bytes).map_err(|_| Error::Invalid("Automerge change"))?;
-        check_bounds(&change, bytes.len())?;
+        let change = parse_change(bytes)?;
         if bytes[4..8] != change.hash().0[..4] {
             return Err(Error::Invalid("Automerge change checksum"));
         }
@@ -290,6 +281,33 @@ impl AutomergeText {
         }
         Ok(projection)
     }
+}
+
+fn parse_change(bytes: &[u8]) -> Result<Change, Error> {
+    if bytes.len() > MAX_CHANGE_BYTES {
+        return Err(Error::Limit);
+    }
+    // The public binary format puts a one-byte chunk type after the four magic and four checksum bytes.
+    // https://automerge.org/automerge-binary-format-spec/ . Accept just a raw change so parsing never inflates remote data.
+    if bytes.get(8) != Some(&1) {
+        return Err(Error::Invalid("Automerge change chunk"));
+    }
+    let change = Change::try_from(bytes).map_err(|_| Error::Invalid("Automerge change"))?;
+    check_bounds(&change, bytes.len())?;
+    Ok(change)
+}
+
+pub(crate) fn append_inserted_text(bytes: &[u8], output: &mut String) -> Result<(), Error> {
+    for operation in parse_change(bytes)?.decode().operations {
+        if operation.insert
+            && matches!(operation.key, Key::Seq(_))
+            && let OpType::Put(value) = operation.action
+            && let Some(text) = value.as_str()
+        {
+            output.push_str(text);
+        }
+    }
+    Ok(())
 }
 
 struct Projection {

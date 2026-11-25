@@ -3,7 +3,7 @@ use designcraft_doc::{Document, Selection, TextSel};
 use designcraft_engine::{DeferredEdit, Session};
 use serde_json::json;
 
-use super::{Proposal, Room, operation_story};
+use super::{Proposal, Room};
 use crate::DesignApp;
 
 const MAX_BUFFERED_BYTES: usize = 512;
@@ -76,8 +76,7 @@ impl DesignApp {
             TypingTarget::NewFrame
         } else {
             let Some(selection) = st.selection.text else { return false };
-            let pending_text =
-                room.pending.as_ref().is_some_and(|proposal| proposal.edits.iter().filter_map(operation_story).any(|id| id == selection.story));
+            let pending_text = room.pending.as_ref().is_some_and(|proposal| proposal.affected_stories().any(|id| id == selection.story));
             if !pending_text && self.session.deferred_edit_story() != Some(selection.story) && room.typing.is_none() {
                 return false;
             }
@@ -165,6 +164,9 @@ impl Room {
 }
 
 pub(super) fn submitted_typing(proposal: &Proposal) -> String {
+    if let Some(transaction) = &proposal.story_transaction {
+        return transaction.inserted_text().unwrap_or_default();
+    }
     proposal
         .edits
         .iter()

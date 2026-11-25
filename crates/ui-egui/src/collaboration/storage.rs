@@ -309,7 +309,8 @@ impl Durable {
             hash.update(host.0);
         }
         let path_record = RecordId { room: hash.finalize().into(), role: if guest_of.is_some() { Role::Guest } else { Role::Host } };
-        let journal = Journal::new(root.join("Collaboration"));
+        let directory = if cfg!(feature = "automerge-rooms") { "Collaboration-Protocol16" } else { "Collaboration" };
+        let journal = Journal::new(root.join(directory));
         // All host versions of the path share the existing writer lease. The
         // pointer and replacement can only be changed while that lease is held.
         let lease = journal.lock(path_record).map_err(|error| error.to_string())?;

@@ -238,6 +238,7 @@ mod tests {
             base: 0,
             sequence: 1,
             history_action: None,
+            story_transaction: None,
             edits: vec![graphic(1, 1, body.clone()), graphic(2, 1, body.clone()), graphic(3, 2, legacy.clone()), graphic(4, 2, legacy)],
         };
         assert_eq!(proposal.artwork_size(), size + 2 * b"abc".len() as u64);

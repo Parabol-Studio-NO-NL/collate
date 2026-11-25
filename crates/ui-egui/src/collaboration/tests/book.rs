@@ -124,19 +124,40 @@ fn illustrated_book_converges_through_concurrent_editing_late_join_and_recovery(
     host.run("text.insert", json!({"text": "Révision\n", "raw": true})).unwrap();
     guest.run("text.select", json!({"story": chapter.0, "anchor": last_chapter.text.len()})).unwrap();
     guest.run("text.insert", json!({"text": "Café by the bridge.", "raw": true})).unwrap();
-    wait_for_revision(&mut host, &mut guest, "both chapter edits arrive", 2);
-    let text = format!("Révision\n{}Café by the bridge.", last_chapter.text);
+    let queued = if cfg!(feature = "automerge-rooms") {
+        guest.poll_collaboration(&egui::Context::default());
+        assert!(room(&guest).pending.is_some());
+        let queued = " Notes from the bank.";
+        assert!(guest.buffer_shared_typing(queued));
+        queued
+    } else {
+        ""
+    };
+    let mut revision = if queued.is_empty() { 2 } else { 3 };
+    wait_for_revision(&mut host, &mut guest, "both chapter edits and any buffered typing arrive", revision);
+    let text = format!("Révision\n{}Café by the bridge.{queued}", last_chapter.text);
     assert_eq!(document(&host).story(chapter).unwrap().text, text);
+    if cfg!(feature = "automerge-rooms") {
+        assert!(room(&host).history.iter().all(|(commit, _)| commit.proposal.story_transaction.is_some()));
+        let pasted = chapter_text(PAGES / PAGES_PER_CHAPTER).repeat(6);
+        guest.run("text.select", json!({"story": chapter.0, "anchor": text.len()})).unwrap();
+        guest.run("edit.paste", json!({"text": pasted})).unwrap();
+        revision += 1;
+        wait_for_revision(&mut host, &mut guest, "a large clipboard paste arrives as one Automerge transaction", revision);
+        assert_eq!(document(&host).story(chapter).unwrap().text, format!("{text}{pasted}"));
+        assert!(room(&host).history.last().unwrap().1.len() > designcraft_collab_core::MAX_PAYLOAD);
+    }
 
     let before = seed.item(illustration).unwrap().bounds();
     guest.run("transform.move", json!({"ids": [illustration.0], "dx": 12})).unwrap();
-    wait_for_revision(&mut host, &mut guest, "illustration moves on the last page", 3);
+    revision += 1;
+    wait_for_revision(&mut host, &mut guest, "illustration moves on the last page", revision);
     assert!(document(&host).item(illustration).unwrap().bounds().x0 > before.x0);
     assert_eq!(document(&guest), document(&host));
 
     let mut late = receive_invitation(&invitation, "Late proofreader");
     wait_for(&mut [&mut host, &mut guest, &mut late], "late guest receives artwork and chapter edits", |apps| {
-        apps[2].collaboration.room.as_ref().is_some_and(|room| room.can_edit() && room.revision == 3)
+        apps[2].collaboration.room.as_ref().is_some_and(|room| room.can_edit() && room.revision == revision)
     });
     assert_eq!(document(&late), document(&host));
     assert_eq!(document(&late).page_count(), PAGES);

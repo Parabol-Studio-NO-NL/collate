@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::{Commit, MAX_HISTORY, MAX_HISTORY_BYTES, Mode, Room, Storage, Transport, attachments::Blobs, fingerprint, replay, seed_document};
 
-const VERSION: u16 = 1;
+const VERSION: u16 = if cfg!(feature = "automerge-rooms") { 2 } else { 1 };
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
