@@ -9,6 +9,9 @@ description = "DesignCraft egui frontend (InDesign-style UI); swappable — noth
 [lints]
 workspace = true
 
+[features]
+automerge-rooms = ["designcraft-collab/automerge-rooms"]
+
 [dependencies]
 craft-ui = { workspace = true, features = ["native-windows"] }
 craft-window = { workspace = true }

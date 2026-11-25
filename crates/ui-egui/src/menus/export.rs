@@ -24,6 +24,9 @@ fn ask_then_export(
 
 pub(super) fn export_png(app: &mut DesignApp, p: &Value) -> Result<Value, String> {
     let st = app.session.active().ok_or("no document")?;
+    if st.doc.has_pending_shared_original() {
+        return Err("The original artwork is still downloading. Try again when it finishes.".into());
+    }
     let page = crate::control::page_index(p, crate::canvas::current_page(app).unwrap_or(0), st.doc.page_count())?;
     let Some(path) = p.get("path").and_then(Value::as_str).map(str::to_string) else {
         // The page in view now is the one exported once the dialog answers.

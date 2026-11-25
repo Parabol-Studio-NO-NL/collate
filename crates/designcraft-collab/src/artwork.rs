@@ -75,14 +75,15 @@ impl Placement {
             return Err(Error::UnsupportedObject);
         }
         let asset = after.assets.get(&graphic.asset).ok_or(Error::UnknownResource)?;
-        let bytes = embedded_bytes(asset).ok_or(Error::UnsupportedObject)?;
+        let digest = artwork_digest(asset).ok_or(Error::UnsupportedObject)?;
         let pdf = (asset.mime == PDF_MIME).then(|| PdfPlacement::for_asset(asset));
         // The same PDF can back multiple native assets, one per page and crop.
         let known_file = before.assets.contains_key(&graphic.asset)
-            || pdf.is_some() && before.assets.values().filter(|asset| asset.mime == PDF_MIME).any(|asset| embedded_bytes(asset) == Some(bytes));
+            || pdf.is_some() && before.assets.values().filter(|asset| asset.mime == PDF_MIME).any(|asset| artwork_digest(asset) == Some(digest));
         let artwork = if known_file {
             None
         } else {
+            let bytes = embedded_bytes(asset).ok_or(Error::UnsupportedObject)?;
             if bytes.len() > MAX_ARTWORK_BYTES {
                 return Err(Error::Limit);
             }
@@ -94,7 +95,7 @@ impl Placement {
                 body: asset.data.embedded_bytes().cloned(),
             })
         };
-        Ok(Self { digest: Sha256::digest(bytes).into(), size: graphic.size, transform: graphic.xf.as_coeffs(), pdf, artwork })
+        Ok(Self { digest, size: graphic.size, transform: graphic.xf.as_coeffs(), pdf, artwork })
     }
 
     /// Bytes retained by this placement in room history, including earlier inline records.
@@ -163,7 +164,7 @@ impl Placement {
             .values()
             .map(Arc::as_ref)
             .filter(|asset| matches_kind(asset))
-            .find(|asset| embedded_bytes(asset).is_some_and(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)) == self.digest))
+            .find(|asset| artwork_digest(asset) == Some(self.digest))
             .ok_or(Error::UnknownResource)
     }
 
@@ -248,6 +249,10 @@ fn embedded_bytes(asset: &Asset) -> Option<&[u8]> {
         return None;
     }
     asset.data.embedded_bytes().map(|bytes| bytes.as_slice())
+}
+
+fn artwork_digest(asset: &Asset) -> Option<[u8; 32]> {
+    asset.data.shared_reference().map(|(digest, _)| digest).or_else(|| embedded_bytes(asset).map(|bytes| Sha256::digest(bytes).into()))
 }
 
 pub fn pdf_dimensions(asset: &Asset, bytes: &[u8], verify_body: bool) -> Result<(u32, u32), &'static str> {

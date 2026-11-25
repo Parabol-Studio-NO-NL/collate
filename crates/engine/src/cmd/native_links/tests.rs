@@ -305,6 +305,66 @@ fn save_a_copy_with_embedded_links_is_portable() {
 }
 
 #[test]
+fn a_verified_copy_embeds_originals_without_overwriting_or_relinking_the_source() {
+    let dir = Dir::new("verified-copy");
+    let (doc, id) = saved_linked(&dir);
+    let source_bytes = std::fs::read(&doc).unwrap();
+    let mut s = open(&doc);
+    let working = s.doc().unwrap().doc.clone();
+
+    let params = json!({"path": doc, "verifiedLinks": true});
+    assert!(s.execute("file.saveACopy", &params).is_err());
+    assert_eq!(std::fs::read(&doc).unwrap(), source_bytes);
+
+    #[cfg(unix)]
+    {
+        let unused = dir.0.join("unused.designcraft");
+        let alias = dir.0.join("alias.designcraft");
+        std::os::unix::fs::symlink(&unused, &alias).unwrap();
+        let params = json!({"path": alias, "verifiedLinks": true});
+        assert!(s.execute("file.saveACopy", &params).is_err());
+        assert!(!unused.exists());
+    }
+
+    let params = json!({"path": dir.0.join("room copy"), "verifiedLinks": true});
+    let result = s.execute("file.saveACopy", &params).unwrap();
+    let path = PathBuf::from(result["path"].as_str().unwrap());
+    assert_eq!(path, dir.0.join("room copy.designcraft"));
+    assert!(Arc::ptr_eq(&s.doc().unwrap().doc, &working));
+    assert!(asset(&s, id).data.is_linked());
+    assert_eq!(std::fs::read(&doc).unwrap(), source_bytes);
+    std::fs::remove_file(dir.0.join("links/art.png")).unwrap();
+
+    let copy = asset(&open(&path), id);
+    assert_eq!(copy.storage, Storage::Embedded);
+    assert_eq!(copy.data.embedded_bytes().unwrap().as_slice(), png(30));
+    assert_eq!((copy.link.as_ref(), copy.link_relative.as_ref(), copy.link_hash.as_ref(), copy.link_fingerprint), (None, None, None, None));
+}
+
+#[test]
+fn a_verified_copy_checks_resident_links_against_the_file() {
+    let dir = Dir::new("verified-copy-stale");
+    let (doc, id) = saved_linked(&dir);
+    let mut s = open(&doc);
+    assert_eq!(asset(&s, id).data.load().unwrap().as_slice(), png(30));
+    let image = dir.0.join("links/art.png");
+    let original_mtime = image.metadata().unwrap().modified().unwrap();
+    flip_a_byte(&image);
+    std::fs::OpenOptions::new().write(true).open(&image).unwrap().set_modified(original_mtime).unwrap();
+    let output = dir.0.join("copy.designcraft");
+    let params = json!({"path": output, "verifiedLinks": true});
+
+    let changed = s.execute("file.saveACopy", &params).unwrap_err().to_string();
+    assert!(changed.contains("art.png") && changed.contains("changed"), "{changed}");
+    assert!(!output.exists());
+    std::fs::remove_file(image).unwrap();
+    let missing = s.execute("file.saveACopy", &params).unwrap_err().to_string();
+    assert!(missing.contains("art.png") && missing.contains("missing"), "{missing}");
+    assert!(!output.exists());
+    assert!(s.execute("file.saveACopy", &json!({"path": output, "verifiedLinks": 1})).is_err());
+}
+
+#[test]
 fn the_open_looks_for_files_in_the_background() {
     let dir = Dir::new("background");
     let (doc, id) = saved_linked(&dir);

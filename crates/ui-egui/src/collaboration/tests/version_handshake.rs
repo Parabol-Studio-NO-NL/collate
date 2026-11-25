@@ -1,4 +1,5 @@
 use super::*;
+use designcraft_collab::RoomProtocol;
 use designcraft_collab_core::{Event, Identity, Session as Transport};
 
 #[test]
@@ -10,7 +11,8 @@ fn clipboard_only_peer_is_refused_before_receiving_the_room() {
 
     let identity = Identity::generate();
     let actor = identity.actor();
-    let mut guest = Transport::join_with_identity(room(&host).invitation.as_deref().unwrap(), "Older editor", identity).unwrap();
+    let (_, ticket) = RoomProtocol::parse_invitation(room(&host).invitation.as_deref().unwrap());
+    let mut guest = Transport::join_with_identity(ticket, "Older editor", identity).unwrap();
     // Version 14 is the clipboard schema. Keep its actual wire format independent
     // of the current encoder so accidentally reusing its version fails the handshake test.
     let hello = json!({"version": 14, "message": {"type": "hello", "data": {"seed": room(&host).seed, "revision": 0}}});
@@ -33,6 +35,46 @@ fn clipboard_only_peer_is_refused_before_receiving_the_room() {
     assert!(!room(&host).serving(actor));
     assert!(room(&host).can_edit());
     assert_eq!(document(&host), &seed);
+}
+
+#[cfg(feature = "automerge-rooms")]
+#[test]
+fn the_same_build_joins_legacy_and_automerge_rooms() {
+    use super::super::{Message, OpenRoom, Packet};
+
+    let seed = Document::new(&NewDocument::default());
+    for protocol in [RoomProtocol::Legacy, RoomProtocol::Automerge] {
+        let mut host = editor(&seed, "Host");
+        let created = host.run("frame.create", json!({"rect":[30,40,280,180],"content":"text","text":"Proof"})).unwrap();
+        let story = StoryId(created["story"].as_u64().unwrap());
+        host.connect_to_room(true, OpenRoom::Active, Some(protocol)).unwrap();
+        wait_for(&mut [&mut host], "host advertises its room version", |apps| room(apps[0]).invitation.is_some());
+        let invitation = room(&host).invitation.clone().unwrap();
+        let (announced, ticket) = RoomProtocol::parse_invitation(&invitation);
+        assert_eq!(announced, protocol);
+        if protocol == RoomProtocol::Legacy {
+            assert_eq!(ticket, invitation);
+        }
+
+        let mut guest = DesignApp::new(Session::new(), Services::default());
+        guest.collaboration.name = "Guest".into();
+        guest.collaboration.join_code = invitation;
+        guest.start_seed_download().unwrap();
+        wait_for(&mut [&mut host, &mut guest], "guest joins in the advertised protocol", |apps| {
+            apps[1].collaboration.room.as_ref().is_some_and(Room::can_edit)
+        });
+        assert_eq!(room(&guest).protocol, protocol);
+        guest.run("text.select", json!({"story":story.0,"anchor":5})).unwrap();
+        guest.run("text.insert", json!({"text":"read","raw":true})).unwrap();
+        wait_for(&mut [&mut host, &mut guest], "both guests see their story edit", |apps| apps.iter().all(|app| room(app).revision == 1));
+        assert_eq!(document(&host).story(story).unwrap().text, "Proofread");
+        assert_eq!(document(&host), document(&guest));
+        let (commit, _) = &room(&host).history[0];
+        assert_eq!(commit.proposal.story_transaction.is_some(), protocol.is_automerge());
+        let wire = super::super::encode_for_protocol(Message::Commit(commit.clone()), protocol).unwrap();
+        let decoded: Packet = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded.version, protocol.version());
+    }
 }
 
 #[test]

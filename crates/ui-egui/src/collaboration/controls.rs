@@ -1,20 +1,25 @@
 use std::ops::Range;
 
-use designcraft_collab::{CommentAnchor, Operation, SharedId};
+use designcraft_collab::{CommentAnchor, Operation, RoomProtocol, SharedId};
 use designcraft_doc::{Document, StoryId, TextSel};
 use designcraft_engine::Session;
 use egui::{Button, Context, TextEdit, Ui, Window};
 use serde_json::json;
 
-use super::{Collaboration, Mode, Room, history::HistoryAction, presence};
-use crate::{DesignApp, i18n::tr};
+use super::{Collaboration, Mode, Room, history::HistoryAction, linked_copy, presence};
+use crate::{DesignApp, app::file_dialogs::Bound, i18n::tr};
 
 enum Action {
     Connect(bool),
+    StartNewRoom,
+    ShareLinkedCopy,
+    OpenSavedRoomCopy,
     ReceiveSeed,
     CancelDownload,
     Reconnect,
     Disconnect,
+    ChooseArtworkFolder,
+    ClearArtworkFolder,
     History(HistoryAction),
     Comment(Box<Operation>),
     SelectCommentText(StoryId, Range<usize>),
@@ -41,6 +46,21 @@ impl DesignApp {
         match action {
             Some(Action::Connect(host)) => {
                 if let Err(error) = self.connect_collaboration(host) {
+                    self.collaboration.message = if host && self.collaboration.room_conflict.is_some() { None } else { Some(error) };
+                }
+            }
+            Some(Action::StartNewRoom) => {
+                if let Err(error) = self.start_new_room_from_current() {
+                    self.collaboration.message = Some(error);
+                }
+            }
+            Some(Action::ShareLinkedCopy) => {
+                if let Err(error) = self.ask_share_linked_copy() {
+                    self.collaboration.message = Some(error);
+                }
+            }
+            Some(Action::OpenSavedRoomCopy) => {
+                if let Err(error) = self.open_saved_room_copy() {
                     self.collaboration.message = Some(error);
                 }
             }
@@ -59,9 +79,20 @@ impl DesignApp {
                     room.error = Some(error);
                 }
             }
+            Some(Action::ChooseArtworkFolder) => {
+                let title = tr(&self.ui.language, "Choose shared artwork folder").to_string();
+                if let Err(error) = self.ask_folder(&title, Bound::App, |app, path| {
+                    app.collaboration.artwork_folder = Some(path.into());
+                    app.collaboration.message = None;
+                    Ok(serde_json::Value::Null)
+                }) {
+                    self.collaboration.message = Some(error);
+                }
+            }
+            Some(Action::ClearArtworkFolder) => self.collaboration.artwork_folder = None,
             Some(Action::Disconnect) => {
                 if let Some(room) = self.collaboration.room.as_mut()
-                    && let Err(error) = room.clear_pending()
+                    && let Err(error) = room.clear_pending(&mut self.session)
                 {
                     room.stop_with_error(&error);
                     return;
@@ -125,6 +156,11 @@ impl DesignApp {
 }
 
 fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, current_page: usize, history: [bool; 2]) -> Option<Action> {
+    if c.linked_copy.is_some() {
+        let message = ui.label(tr(lang, "Preparing the shared copy…"));
+        ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
+        return None;
+    }
     if let Some(joining) = &c.joining {
         if let Some(progress) = joining.artwork_progress() {
             artwork_progress(ui, lang, progress);
@@ -137,10 +173,43 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         ui.label(tr(lang, "Open a saved document to host a room, or use an invitation to join."));
         ui.label(tr(lang, "Your name"));
         ui.add(TextEdit::singleline(&mut c.name).char_limit(60).hint_text(tr(lang, "Your name")));
-        ui.checkbox(&mut c.relay, tr(lang, "Allow internet relay"));
+        let relay = c.relay.get_or_insert(RoomProtocol::CURRENT.is_automerge());
+        ui.checkbox(relay, tr(lang, "Allow internet relay"));
+        let folder = if RoomProtocol::Automerge.is_supported() { show_artwork_folder(c, lang, ui) } else { None };
         let has_name = !c.name.trim().is_empty();
         let has_document = session.active().is_some();
-        let host = ui.add_enabled(has_name && has_document, Button::new(tr(lang, "Start sharing"))).clicked();
+        let host = if let Some(conflict) = c.room_conflict.as_mut().filter(|conflict| conflict.applies(session)) {
+            let message = ui.label(tr(
+                lang,
+                "This document differs from the saved room. Starting a new room keeps the previous room and creates a new invitation.",
+            ));
+            ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
+            let start = ui.add_enabled(has_name, room_button(lang, "Start a new room from this version"));
+            if std::mem::take(&mut conflict.focus_start) && start.enabled() {
+                start.request_focus();
+            }
+            if start.clicked() {
+                Some(Action::StartNewRoom)
+            } else if ui.add(room_button(lang, "Open saved room copy")).clicked() {
+                Some(Action::OpenSavedRoomCopy)
+            } else {
+                None
+            }
+        } else {
+            let (label, action) =
+                if RoomProtocol::Automerge.is_supported() && session.active().is_some_and(|state| linked_copy::has_linked_artwork(&state.doc)) {
+                    ("Share a copy with artwork…", Action::ShareLinkedCopy)
+                } else {
+                    ("Start sharing", Action::Connect(true))
+                };
+            let host = ui.add_enabled(has_name && has_document, room_button(lang, label)).clicked().then_some(action);
+            if cfg!(target_os = "macos") && session.recovery_dir.is_some() && session.active().is_some_and(|state| state.path.is_some()) {
+                let recovery = ui.collapsing(tr(lang, "Room recovery"), |ui| ui.add(room_button(lang, "Open saved room copy")).clicked());
+                if recovery.body_returned == Some(true) { Some(Action::OpenSavedRoomCopy) } else { host }
+            } else {
+                host
+            }
+        };
         ui.separator();
         ui.label(tr(lang, "Invitation code"));
         ui.add(TextEdit::singleline(&mut c.join_code).password(true).char_limit(4096).hint_text(tr(lang, "Invitation code")));
@@ -150,29 +219,14 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         if let Some(message) = &c.message {
             ui.label(tr(lang, message));
         }
-        return if download { Some(Action::ReceiveSeed) } else { (host || join).then_some(Action::Connect(host)) };
+        return folder.or(host).or(if download { Some(Action::ReceiveSeed) } else { join.then_some(Action::Connect(false)) });
     };
 
-    let status = if room.fatal {
-        "Connection stopped"
-    } else if room.paused_typing().is_some() {
-        "Queued typing paused"
-    } else if room.pending.is_some() || room.typing.is_some() || session.has_deferred_edit() {
-        "Waiting for the host to confirm your edit"
-    } else if room.can_edit() && room.online {
-        "Connected"
-    } else if room.can_edit() {
-        "Offline. You can queue one edit."
-    } else {
-        match room.mode {
-            Mode::Host { .. } if room.local.is_some() => "Room history is full",
-            _ => "Connecting…",
-        }
-    };
     if let Some(progress) = room.artwork_progress().filter(|_| room.online && !room.fatal) {
         artwork_progress(ui, lang, progress);
     } else {
-        ui.label(tr(lang, status));
+        let message = ui.label(tr(lang, room_status(room, session)));
+        ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
     }
     if let Some(error) = &room.error {
         ui.label(tr(lang, error));
@@ -216,11 +270,13 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         action = comments(c, st, lang, ui, current_page).or(action);
     }
     let Some(room) = c.room.as_ref() else { return action };
-    let pending = room.pending.is_some() || room.typing.is_some() || session.has_deferred_edit();
-    if let Some(typing) = room.paused_typing()
-        && ui.button(tr(lang, "Copy queued typing")).clicked()
-    {
-        ui.ctx().copy_text(typing.into());
+    let pending = !room.pending.is_empty() || room.typing.is_some() || session.has_deferred_edit();
+    if (room.paused_typing().is_some() || room.story_queue_blocked) && ui.button(tr(lang, "Copy queued typing")).clicked() {
+        let mut typing = room.declined_story_text();
+        typing.push_str(room.paused_typing().unwrap_or_default());
+        if !typing.is_empty() {
+            ui.ctx().copy_text(typing);
+        }
     }
     ui.separator();
     if !pending && ui.button(tr(lang, "Leave session")).clicked() {
@@ -243,6 +299,65 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
     action
 }
 
+fn show_artwork_folder(c: &Collaboration, lang: &str, ui: &mut Ui) -> Option<Action> {
+    ui.collapsing(tr(lang, "Shared artwork folder"), |ui| {
+        ui.label(tr(lang, "Choose the same synced folder on each computer to share large originals."));
+        if let Some(path) = &c.artwork_folder {
+            let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+            let selected = tr(lang, "Using {name}").replace("{name}", &name);
+            let message = ui.label(selected);
+            ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
+        }
+        ui.horizontal(|ui| {
+            if ui.add(room_button(lang, "Choose folder…")).clicked() {
+                Some(Action::ChooseArtworkFolder)
+            } else if c.artwork_folder.is_some() && ui.add(room_button(lang, "Clear folder")).clicked() {
+                Some(Action::ClearArtworkFolder)
+            } else {
+                None
+            }
+        })
+        .inner
+    })
+    .body_returned
+    .flatten()
+}
+
+fn room_status(room: &Room, session: &Session) -> &'static str {
+    if room.fatal {
+        return "Connection stopped";
+    }
+    if room.story_queue_blocked {
+        return "Some edits need attention";
+    }
+    if room.story_draft.is_some() {
+        return match (room.online, room.storage.is_durable()) {
+            (true, _) => "Syncing your edits…",
+            (false, true) => "Offline. Edits are saved on this Mac.",
+            (false, false) => "Offline. Your edits are waiting to sync.",
+        };
+    }
+    if !room.online && room.can_draft_story() {
+        return "Offline. Edits are saved on this Mac.";
+    }
+    if room.paused_typing().is_some() {
+        return "Queued typing paused";
+    }
+    if !room.pending.is_empty() || room.typing.is_some() || session.has_deferred_edit() {
+        return "Waiting for the host to confirm your edit";
+    }
+    match (room.can_edit(), room.online, &room.mode) {
+        (true, true, _) => "Connected",
+        (true, false, _) => "Offline. You can queue one edit.",
+        (false, _, Mode::Host { .. }) if room.local.is_some() => "Room history is full",
+        _ => "Connecting…",
+    }
+}
+
+fn room_button<'a>(lang: &str, label: &'a str) -> Button<'a> {
+    Button::new(tr(lang, label)).min_size(egui::vec2(0.0, 24.0))
+}
+
 fn artwork_progress(ui: &mut Ui, lang: &str, progress: super::attachments::ArtworkProgress) {
     let template = if progress.sending { "Sending artwork ({percent}%)" } else { "Receiving artwork ({percent}%)" };
     let fraction = progress.bytes as f64 / progress.total.max(1) as f64;
@@ -253,17 +368,15 @@ fn artwork_progress(ui: &mut Ui, lang: &str, progress: super::attachments::Artwo
 fn comments(c: &mut Collaboration, st: &designcraft_engine::DocState, lang: &str, ui: &mut Ui, current_page: usize) -> Option<Action> {
     let room = c.room.as_ref()?;
     let enabled = room.can_edit();
+    let display_replica = room.story_draft.as_ref().map_or(&room.replica, |draft| &draft.visible);
     let mut action = None;
     egui::ScrollArea::vertical().id_salt("shared-comments").max_height(220.0).show(ui, |ui| {
         for thread in room.replica.comments() {
             ui.push_id(&thread.id, |ui| {
                 ui.small(author(room, &thread.id));
                 ui.label(&thread.text);
-                let target = room.replica.comment_text_range(&st.doc, &thread.anchor);
-                let orphaned = match &thread.anchor {
-                    CommentAnchor::Text { .. } => target.is_none(),
-                    _ => room.replica.comment_is_orphaned(&st.doc, thread),
-                };
+                let target = display_replica.comment_text_range(&st.doc, &thread.anchor);
+                let orphaned = if thread.anchor.is_text() { target.is_none() } else { display_replica.comment_is_orphaned(&st.doc, thread) };
                 if orphaned {
                     ui.small(tr(lang, "Anchor removed"));
                 }

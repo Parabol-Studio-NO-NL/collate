@@ -9,9 +9,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::collaboration::storage::JOURNAL_DIRECTORY;
+
+#[path = "room_restart.rs"]
+mod room_restart;
 
 const CHILD_ROOT: &str = "COLLATE_TEST_ROOM_RESTART_ROOT";
 const COMMENT: &str = "Check the recovered cover frame.";
+#[cfg(feature = "automerge-rooms")]
+const STORY_EDITS: u64 = 135;
 
 #[derive(Serialize, Deserialize)]
 struct Checkpoint {
@@ -97,9 +103,105 @@ fn restore_artwork_checkpoint(root: &Path) {
     assert!(embedded.data.embedded_bytes().unwrap().as_slice() == artwork_fixture(555));
 }
 
+#[cfg(feature = "automerge-rooms")]
+fn save_story_checkpoint(root: &Path) {
+    let mut initial = editor(&Document::new(&NewDocument::default()), "Story fixture");
+    initial.run("frame.create", json!({"rect": [30, 40, 300, 300], "content": "text", "text": "Le fleuve"})).unwrap();
+    initial.run("file.saveAs", json!({"path": root.join("Story.designcraft")})).unwrap();
+    let mut host = reopened(root, "Story");
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "durable story host", |apps| room(apps[0]).can_edit());
+    let story = *document(&host).stories.keys().next().unwrap();
+    host.run("text.select", json!({"story": story.0, "anchor": "Le fleuve".len()})).unwrap();
+    host.run("text.insert", json!({"text": " à l’aube", "raw": true})).unwrap();
+    wait_for(&mut [&mut host], "journal the Automerge edit", |apps| room(apps[0]).revision == 1);
+    assert!(room(&host).history[0].0.proposal.story_transaction.is_some());
+    for _ in 1..STORY_EDITS {
+        host.run("text.insert", json!({"text": " ·", "raw": true})).unwrap();
+        let edit = host.session.take_deferred_edit().unwrap();
+        let room = host.collaboration.room.as_mut().unwrap();
+        room.capture_edit(&mut host.session, edit).unwrap();
+        room.update_edit_policy(&mut host.session);
+    }
+    assert_eq!(room(&host).revision, STORY_EDITS);
+    let records = std::fs::read_dir(root.join("Story").join(JOURNAL_DIRECTORY))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "enc"))
+        .count();
+    assert!(records >= 4, "the seed and multiple history records should be on disk");
+    assert!(!root.join("Story").join("Collaboration").exists());
+}
+
+#[cfg(feature = "automerge-rooms")]
+fn restore_story_checkpoint(root: &Path) {
+    let mut host = reopened(root, "Story");
+    let story = *document(&host).stories.keys().next().unwrap();
+    assert_eq!(document(&host).story(story).unwrap().text, "Le fleuve");
+    host.connect_collaboration(true).unwrap();
+    let recovered = format!("Le fleuve à l’aube{}", " ·".repeat(STORY_EDITS as usize - 1));
+    assert_eq!(document(&host).story(story).unwrap().text, recovered);
+    wait_for(&mut [&mut host], "restored story host", |apps| room(apps[0]).can_edit());
+    host.run("edit.undo", json!({})).unwrap();
+    assert_eq!(document(&host).story(story).unwrap().text, recovered.strip_suffix(" ·").unwrap());
+    host.run("edit.redo", json!({})).unwrap();
+    assert_eq!(document(&host).story(story).unwrap().text, recovered);
+    host.run("text.select", json!({"story": story.0, "anchor": recovered.len()})).unwrap();
+    host.run("text.insert", json!({"text": ".", "raw": true})).unwrap();
+    wait_for(&mut [&mut host], "extend the restored Automerge history", |apps| room(apps[0]).revision == STORY_EDITS + 3);
+    assert_eq!(document(&host).story(story).unwrap().text, format!("{recovered}."));
+}
+
+#[cfg(feature = "automerge-rooms")]
+fn migrate_protocol_16_story(root: &Path) {
+    use super::super::{
+        Commit, Proposal,
+        storage::{OpenRoom, Storage},
+    };
+
+    let mut initial = editor(&Document::new(&NewDocument::default()), "Legacy story fixture");
+    initial.run("frame.create", json!({"rect": [30, 40, 300, 300], "content": "text", "text": "The harbor"})).unwrap();
+    let path = root.join("StoryV16.designcraft");
+    initial.run("file.saveAs", json!({"path": path})).unwrap();
+    let seed = document(&initial).clone();
+    let story = *seed.stories.keys().next().unwrap();
+    initial.run("text.select", json!({"story": story.0, "anchor": "The harbor".len()})).unwrap();
+    initial.run("text.insert", json!({"text": " at dawn", "raw": true})).unwrap();
+    {
+        let recovery = root.join("StoryV16").join("Recovery");
+        let (storage, _) = Storage::open(Some(&recovery), path.to_str(), &seed, None, OpenRoom::Active).unwrap();
+        let actor = storage.identity().actor();
+        let transaction = designcraft_collab::Replica::new(&seed).capture_automerge_text(&seed, document(&initial), &actor.0, None).unwrap();
+        assert!(transaction.is_some());
+        let proposal = Proposal { sequence: 1, base: 0, edits: Vec::new(), history_action: None, story_transaction: transaction };
+        let commit = Commit { revision: 1, actor, proposal, correction: None };
+        storage.write_legacy(std::iter::once(&commit), &Default::default(), 2).unwrap();
+    }
+    let mut host = reopened(root, "StoryV16");
+    host.connect_collaboration(true).unwrap();
+    assert_eq!(document(&host).story(story).unwrap().text, "The harbor at dawn");
+    wait_for(&mut [&mut host], "migrated protocol-16 host", |apps| room(apps[0]).can_edit());
+    host.run("text.select", json!({"story": story.0, "anchor": "The harbor at dawn".len()})).unwrap();
+    host.run("text.insert", json!({"text": ".", "raw": true})).unwrap();
+    wait_for(&mut [&mut host], "extend an existing protocol-16 story", |apps| room(apps[0]).revision == 2);
+    drop(host);
+
+    let mut host = reopened(root, "StoryV16");
+    host.connect_collaboration(true).unwrap();
+    assert_eq!(room(&host).revision, 2);
+    assert_eq!(document(&host).story(story).unwrap().text, "The harbor at dawn.");
+}
+
 /// Stage exactly one outbox entry, without polling the host or delivering the guest's edit.
 fn save_checkpoint(root: &Path) {
+    room_restart::verify_fresh_room_keeps_the_previous_room(root);
     save_artwork_checkpoint(root);
+    #[cfg(feature = "automerge-rooms")]
+    super::super::storage::verify_legacy_room_protocol_fallback(root).unwrap();
+    #[cfg(feature = "automerge-rooms")]
+    save_story_checkpoint(root);
+    #[cfg(feature = "automerge-rooms")]
+    super::optimistic::durable_guest_replays_offline_queue(root);
     let seed = Document::new(&NewDocument::default());
     let mut initial = editor(&seed, "Fixture");
     let host_path = root.join("Host.designcraft");
@@ -143,7 +245,7 @@ fn save_checkpoint(root: &Path) {
     let edit = guest.session.take_deferred_edit().unwrap();
     let guest_room = guest.collaboration.room.as_mut().unwrap();
     guest_room.capture_edit(&mut guest.session, edit).unwrap();
-    let pending_sequence = guest_room.pending.as_ref().unwrap().sequence;
+    let pending_sequence = guest_room.pending.front().unwrap().sequence;
     assert_eq!(room(&host).revision, 3);
     let checkpoint = Checkpoint {
         host_actor: actor(&host),
@@ -158,18 +260,19 @@ fn save_checkpoint(root: &Path) {
     std::fs::write(root.join("checkpoint.json"), serde_json::to_vec(&checkpoint).unwrap()).unwrap();
 
     for role in ["Host", "Guest"] {
-        let journal = root.join(role).join("Collaboration");
+        let journal = root.join(role).join(JOURNAL_DIRECTORY);
         let records: Vec<_> = std::fs::read_dir(journal)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "enc"))
             .collect();
-        assert_eq!(records.len(), 1);
-        let path = &records[0];
-        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        let bytes = std::fs::read(path).unwrap();
-        assert!(bytes.starts_with(b"CDJRNL01"));
-        assert!(!bytes.windows(COMMENT.len()).any(|part| part == COMMENT.as_bytes()));
+        assert_eq!(records.len(), if cfg!(feature = "automerge-rooms") { 2 } else { 1 });
+        for path in records {
+            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            let bytes = std::fs::read(path).unwrap();
+            assert!(bytes.starts_with(b"CDJRNL01"));
+            assert!(!bytes.windows(COMMENT.len()).any(|part| part == COMMENT.as_bytes()));
+        }
     }
 }
 
@@ -179,6 +282,10 @@ fn read_checkpoint(root: &Path) -> Checkpoint {
 
 fn restore_checkpoint(root: &Path) {
     restore_artwork_checkpoint(root);
+    #[cfg(feature = "automerge-rooms")]
+    restore_story_checkpoint(root);
+    #[cfg(feature = "automerge-rooms")]
+    migrate_protocol_16_story(root);
     let checkpoint = read_checkpoint(root);
     let mut host = reopened(root, "Host");
     assert_eq!(fingerprint(document(&host)).unwrap(), checkpoint.document);
@@ -196,10 +303,10 @@ fn restore_checkpoint(root: &Path) {
     assert_ne!(fingerprint(document(&guest)).unwrap(), checkpoint.document);
     join(&mut guest, &invitation);
     assert_eq!(fingerprint(document(&guest)).unwrap(), checkpoint.document);
-    assert_eq!(room(&guest).pending.as_ref().unwrap().sequence, checkpoint.pending_sequence);
+    assert_eq!(room(&guest).pending.front().unwrap().sequence, checkpoint.pending_sequence);
     assert_comment(&guest, &checkpoint);
     wait_for(&mut [&mut host, &mut guest], "replay saved outbox exactly once", |apps| {
-        apps.iter().all(|app| room(app).revision == 4 && room(app).pending.is_none())
+        apps.iter().all(|app| room(app).revision == 4 && room(app).pending.is_empty())
     });
     assert_eq!(actor(&guest), checkpoint.guest_actor);
     let host_id = room(&host).replica.local_id(&checkpoint.frame).unwrap();
@@ -209,7 +316,7 @@ fn restore_checkpoint(root: &Path) {
     // A fresh edit must use the next sequence after the restored outbox.
     guest.run("transform.move", json!({"ids": [guest_id.0], "dx": 7, "dy": 0})).unwrap();
     wait_for(&mut [&mut host, &mut guest], "confirm edit after restart", |apps| {
-        apps.iter().all(|app| room(app).revision == 5 && room(app).pending.is_none())
+        apps.iter().all(|app| room(app).revision == 5 && room(app).pending.is_empty())
     });
     assert_eq!(document(&host).item(host_id).unwrap().bounds().x0, checkpoint.frame_x + 18.0);
     assert_eq!(fingerprint(document(&host)).unwrap(), fingerprint(document(&guest)).unwrap());

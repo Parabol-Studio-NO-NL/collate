@@ -9,9 +9,10 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use crate::datamerge::Fingerprint;
+use sha2::{Digest, Sha256};
 
 mod store;
 
@@ -43,6 +44,8 @@ pub enum Unavailable {
     TooLarge,
     #[error("no loader for linked files")]
     NoLoader,
+    #[error("the shared original is still downloading")]
+    SharedOriginalPending,
 }
 
 /// Where a linked asset's bytes are, and what they must be: the [`crate::Asset`] link record
@@ -103,6 +106,14 @@ impl Linked {
 enum Repr {
     Embedded(Arc<Vec<u8>>),
     Linked(Arc<Linked>),
+    Shared(Arc<SharedOriginal>),
+}
+
+struct SharedOriginal {
+    digest: [u8; 32],
+    length: u32,
+    bytes: OnceLock<Arc<Vec<u8>>>,
+    preview: Option<crate::Proxy>,
 }
 
 /// An asset's bytes: embedded in the document, or linked (read from the file on demand).
@@ -117,6 +128,37 @@ impl AssetData {
     /// Embedded bytes, under a new key.
     pub fn embedded(bytes: impl Into<Arc<Vec<u8>>>) -> Self {
         AssetData { key: SourceKey::fresh(), repr: Repr::Embedded(bytes.into()) }
+    }
+
+    /// An immutable, verified room reference. The optional preview only serves rendering.
+    pub fn shared_original(digest: [u8; 32], length: u32, preview: Option<crate::Proxy>) -> Self {
+        Self { key: SourceKey::fresh(), repr: Repr::Shared(Arc::new(SharedOriginal { digest, length, bytes: OnceLock::new(), preview })) }
+    }
+
+    /// The original this shared handle identifies, independent of local download progress.
+    pub fn shared_reference(&self) -> Option<([u8; 32], u32)> {
+        let Repr::Shared(shared) = &self.repr else { return None };
+        Some((shared.digest, shared.length))
+    }
+
+    pub fn shared_original_pending(&self) -> bool {
+        matches!(&self.repr, Repr::Shared(shared) if shared.bytes.get().is_none())
+    }
+
+    pub fn shared_preview(&self) -> Option<&crate::Proxy> {
+        let Repr::Shared(shared) = &self.repr else { return None };
+        shared.preview.as_ref()
+    }
+
+    /// Install original bytes after the collaboration receiver verifies their content
+    /// digest and media metadata. Clones observe the result without a document edit.
+    pub fn install_verified_original(&self, bytes: Arc<Vec<u8>>) -> bool {
+        let Repr::Shared(shared) = &self.repr else { return false };
+        if bytes.len() != shared.length as usize || shared.bytes.set(bytes).is_err() {
+            return false;
+        }
+        links_changed();
+        true
     }
 
     /// Embedded bytes under `key`, which the caller made ([`SourceKey::fresh`]) for exactly these
@@ -156,13 +198,14 @@ impl AssetData {
         match &self.repr {
             Repr::Embedded(b) => Some(b),
             Repr::Linked(_) => None,
+            Repr::Shared(shared) => shared.bytes.get(),
         }
     }
 
     /// Where linked bytes are read from.
     pub fn linked_source(&self) -> Option<&LinkedSource> {
         match &self.repr {
-            Repr::Embedded(_) => None,
+            Repr::Embedded(_) | Repr::Shared(_) => None,
             Repr::Linked(l) => Some(&l.source),
         }
     }
@@ -173,6 +216,7 @@ impl AssetData {
         match &self.repr {
             Repr::Embedded(b) => Ok(Arc::clone(b)),
             Repr::Linked(l) => store::global().load(self.key, l, store::installed().as_deref()),
+            Repr::Shared(shared) => shared.bytes.get().cloned().ok_or(Unavailable::SharedOriginalPending),
         }
     }
 
@@ -211,6 +255,7 @@ impl AssetData {
         match &self.repr {
             Repr::Embedded(b) => Some(Arc::clone(b)),
             Repr::Linked(_) => store::global().resident(self.key),
+            Repr::Shared(shared) => shared.bytes.get().cloned(),
         }
     }
 
@@ -241,6 +286,7 @@ impl AssetData {
         match &self.repr {
             Repr::Embedded(b) => b.len() as u64,
             Repr::Linked(l) => l.source.len,
+            Repr::Shared(shared) => u64::from(shared.length),
         }
     }
 
@@ -258,6 +304,7 @@ impl AssetData {
         let repr = match &self.repr {
             Repr::Embedded(b) => WeakRepr::Embedded(Arc::downgrade(b)),
             Repr::Linked(l) => WeakRepr::Linked(Arc::clone(l)),
+            Repr::Shared(shared) => WeakRepr::Shared(Arc::downgrade(shared)),
         };
         WeakAssetData { key: self.key, repr }
     }
@@ -281,6 +328,7 @@ pub fn link_generation() -> u64 {
 enum WeakRepr {
     Embedded(Weak<Vec<u8>>),
     Linked(Arc<Linked>),
+    Shared(Weak<SharedOriginal>),
 }
 
 /// [`AssetData::downgrade`].
@@ -296,6 +344,7 @@ impl WeakAssetData {
         let repr = match &self.repr {
             WeakRepr::Embedded(w) => Repr::Embedded(w.upgrade()?),
             WeakRepr::Linked(l) => Repr::Linked(Arc::clone(l)),
+            WeakRepr::Shared(shared) => Repr::Shared(shared.upgrade()?),
         };
         Some(AssetData { key: self.key, repr })
     }
@@ -330,6 +379,11 @@ impl PartialEq for AssetData {
         match (&self.repr, &other.repr) {
             (Repr::Embedded(a), Repr::Embedded(b)) => a == b,
             (Repr::Linked(a), Repr::Linked(b)) => self.key == other.key && a.source.len == b.source.len,
+            (Repr::Shared(a), Repr::Shared(b)) => a.length == b.length && a.digest == b.digest,
+            (Repr::Shared(a), Repr::Embedded(b)) | (Repr::Embedded(b), Repr::Shared(a)) => {
+                a.length as usize == b.len()
+                    && a.bytes.get().map_or_else(|| a.digest == <[u8; 32]>::from(Sha256::digest(b.as_slice())), |bytes| bytes == b)
+            }
             _ => false,
         }
     }
@@ -337,7 +391,11 @@ impl PartialEq for AssetData {
 
 impl fmt::Debug for AssetData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = if self.is_linked() { "Linked" } else { "Embedded" };
+        let kind = match self.repr {
+            Repr::Linked(_) => "Linked",
+            Repr::Embedded(_) => "Embedded",
+            Repr::Shared(_) => "SharedOriginal",
+        };
         f.debug_struct(kind).field("key", &self.key.0).field("len", &self.len()).finish()
     }
 }

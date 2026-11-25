@@ -1,6 +1,14 @@
 use super::{DesignApp, UiRequest, Value, canvas, dialogs, json, menus};
 
 impl DesignApp {
+    pub(crate) fn document_needs_close_prompt(&self, document: &designcraft_engine::DocState) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.collaboration_can_resume_document(document.uid) {
+            return false;
+        }
+        document.is_dirty()
+    }
+
     /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         #[cfg(not(target_arch = "wasm32"))]
@@ -47,6 +55,8 @@ impl DesignApp {
             p.entry("spread").or_insert(json!(spread));
         }
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
+        #[cfg(not(target_arch = "wasm32"))]
+        let r = r.and_then(|value| self.apply_local_story_edit(id, typing).map(|()| value));
         self.after_engine();
         match &r {
             Err(e) => self.status(e.clone()),

@@ -23,7 +23,7 @@ pub mod recovery;
 pub mod sample;
 pub mod script;
 pub mod separations;
-pub use deferred_edits::DeferredEdit;
+pub use deferred_edits::{DeferredEdit, is_deferred_story_command};
 
 mod tooling;
 
@@ -660,6 +660,12 @@ impl Session {
 
     fn execute_unguarded(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.into()))?;
+        if (matches!(id, "file.print" | "file.printBooklet")
+            || id.starts_with("file.export") && !matches!(id, "file.exportPresets" | "file.exportText"))
+            && self.active().is_some_and(|state| state.doc.has_pending_shared_original())
+        {
+            return Err(EngineError::Other("The original artwork is still downloading. Try again when it finishes.".into()));
+        }
         // The crate's own tests are the audit of the params descriptions (#776): a key a test
         // passes that its command's description doesn't name fails the test.
         #[cfg(test)]

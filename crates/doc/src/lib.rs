@@ -675,6 +675,9 @@ impl Asset {
     /// warning), or for a missing or unreadable one its proxy, with a warning. `Err` when
     /// there is neither.
     pub fn output_bytes(&self) -> std::result::Result<OutputBytes, Unavailable> {
+        if self.data.shared_original_pending() {
+            return Err(Unavailable::SharedOriginalPending);
+        }
         match self.data.load_for_output() {
             Ok((bytes, false)) => Ok(OutputBytes { bytes, warning: None, proxied: false }),
             Ok((bytes, true)) => Ok(OutputBytes {

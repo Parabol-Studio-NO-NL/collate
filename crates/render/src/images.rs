@@ -537,7 +537,7 @@ pub(crate) fn advance() {
 
 /// Advances each time a background decode queued by [`mip_now`] finishes.
 pub fn generation() -> u64 {
-    background::GENERATION.load(Ordering::Acquire)
+    background::GENERATION.load(Ordering::Acquire).wrapping_add(designcraft_doc::asset_data::link_generation())
 }
 
 /// Called (from a decode thread) each time a background decode finishes, e.g. to request a

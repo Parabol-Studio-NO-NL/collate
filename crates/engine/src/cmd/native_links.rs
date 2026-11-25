@@ -879,6 +879,46 @@ pub(crate) fn embed_linked(d: &mut Document, command: &str) -> Result<()> {
     Ok(())
 }
 
+/// Embed the exact on-disk originals of the assets used in a portable copy.
+pub(crate) fn embed_verified_links(d: &mut Document, document: Option<&Path>, command: &str) -> Result<()> {
+    let used = d.used_assets();
+    d.assets.retain(|id, _| used.contains(id));
+    for asset in d.assets.values_mut() {
+        let original =
+            if asset.storage == Storage::Linked || asset.data.is_linked() { Some(verified_original(asset, document, command)?) } else { None };
+        let asset = Arc::make_mut(asset);
+        if let Some(original) = original {
+            asset.data = AssetData::embedded(original);
+            asset.storage = Storage::Embedded;
+        }
+        asset.set_link(None, None);
+        asset.link_relative = None;
+        asset.link_hash = None;
+        if asset.proxy.as_ref().is_some_and(|proxy| proxy.data.is_linked()) {
+            asset.proxy = None;
+        }
+    }
+    Ok(())
+}
+
+fn verified_original(asset: &Asset, document: Option<&Path>, command: &str) -> Result<Vec<u8>> {
+    let unverified = || bad(command, format!("{}: the linked original could not be verified. Update or relink it before sharing.", asset.name));
+    let mut source = asset.data.linked_source().cloned().or_else(|| LinkedSource::of(asset, document)).ok_or_else(unverified)?;
+    if let Some(document) = document {
+        source.document = Some(document.to_path_buf());
+    }
+    // Verify the actual file even while the renderer holds the recorded bytes.
+    // A just-placed link can still be waiting for the background hash.
+    source.hash = asset.link_hash.clone().or(source.hash).or_else(|| asset.data.resident().map(|bytes| crate::asset_io::content_hash(&bytes)));
+    if source.hash.is_none() {
+        return Err(unverified());
+    }
+    source.fingerprint = None;
+    crate::asset_io::read_linked(&source, None)
+        .map(|loaded| loaded.bytes)
+        .map_err(|error| bad(command, format!("{}: {error}. Update or relink it before sharing.", asset.name)))
+}
+
 /// On the web, a save keeps linked files as links only: it can't read them to embed them.
 pub(crate) fn web_save_warnings(d: &Document) -> Vec<String> {
     let n = d.assets.values().filter(|a| a.storage == Storage::Linked).count();

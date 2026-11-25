@@ -3,16 +3,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use designcraft_collab::artwork::{BlobId, MAX_ARTWORK_BYTES};
+use designcraft_collab::{
+    RoomProtocol,
+    artwork::{BlobId, MAX_ARTWORK_BYTES},
+};
 use designcraft_collab_core::Identity;
 use designcraft_doc::Document;
 use designcraft_engine::{DocState, Session};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Commit, MAX_HISTORY, MAX_HISTORY_BYTES, Mode, Room, Storage, Transport, attachments::Blobs, fingerprint, replay, seed_document};
-
-const VERSION: u16 = 1;
+use super::{Commit, Mode, Room, Storage, Transport, attachments::Blobs, replay, seed_document};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +22,16 @@ struct Header {
     identity: [u8; 32],
     access: [u8; 32],
     seed: [u8; 32],
+}
+
+impl Header {
+    fn protocol(&self) -> Result<RoomProtocol, String> {
+        match self.version {
+            1 => Ok(RoomProtocol::Legacy),
+            2 if RoomProtocol::Automerge.is_supported() => Ok(RoomProtocol::Automerge),
+            _ => Err("Unsupported room data version.".into()),
+        }
+    }
 }
 
 /// Records the protocol may access inside an operator-selected room.
@@ -55,19 +66,17 @@ impl Journal {
         Self { files, blobs: Blobs::new(), blob_bytes: 0 }
     }
 
-    fn header(&self) -> Result<Header, String> {
+    fn header(&self) -> Result<(Header, RoomProtocol), String> {
         let bytes = self.files.read(RoomFile::Header, 4096)?;
         let header: Header = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if header.version != VERSION {
-            return Err("Unsupported room data version.".into());
-        }
-        Ok(header)
+        let protocol = header.protocol()?;
+        Ok((header, protocol))
     }
 
-    fn seed(&mut self, header: &Header) -> Result<Document, String> {
+    fn seed(&mut self, header: &Header, protocol: RoomProtocol) -> Result<Document, String> {
         let bytes = self.files.read(RoomFile::Seed, super::seed::MAX_SEED_BYTES as u64)?;
-        let doc = seed_document::restore_bundle(&bytes, |id| self.load_blob(id))?;
-        if fingerprint(&doc)? != header.seed {
+        let doc = seed_document::restore_bundle_for_room(&bytes, |id| self.load_blob(id), protocol)?;
+        if seed_document::Fingerprints::for_room(protocol).fingerprint(&doc)? != header.seed {
             return Err("The room seed differs from the saved room identity.".into());
         }
         Ok(doc)
@@ -122,10 +131,10 @@ impl Journal {
         self.files.write(RoomFile::Revision(commit.revision), &serde_json::to_vec(commit).map_err(|e| e.to_string())?)
     }
 
-    fn history(&mut self) -> Result<Vec<Commit>, String> {
+    fn history(&mut self, protocol: RoomProtocol) -> Result<Vec<Commit>, String> {
         let mut commits = Vec::new();
-        let mut remaining = MAX_HISTORY_BYTES as u64;
-        for revision in self.files.revisions(MAX_HISTORY)? {
+        let mut remaining = protocol.history_byte_limit() as u64;
+        for revision in self.files.revisions(protocol.history_limit())? {
             let bytes = self.files.read(RoomFile::Revision(revision), remaining)?;
             remaining -= bytes.len() as u64;
             let mut commit: Commit = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
@@ -143,9 +152,9 @@ impl Journal {
     }
 
     fn load(&mut self) -> Result<(Header, Document, replay::RoomReplay), String> {
-        let header = self.header()?;
-        let seed = self.seed(&header)?;
-        let recovered = replay::restore(&seed, &seed, self.history()?)?;
+        let (header, protocol) = self.header()?;
+        let seed = self.seed(&header, protocol)?;
+        let recovered = replay::restore_for_room(&seed, &seed, self.history(protocol)?, protocol)?;
         Ok((header, seed, recovered))
     }
 }
@@ -154,9 +163,14 @@ impl Journal {
 pub fn init(files: Arc<dyn RoomFiles>, mut doc: Document) -> Result<(), String> {
     seed_document::prepare_local_copy(&mut doc)?;
     doc.compact_assets();
-    let (bytes, blobs) = seed_document::bundle(&doc)?;
-    let header =
-        Header { version: VERSION, seed: fingerprint(&doc)?, identity: Identity::generate().to_bytes(), access: Identity::generate().to_bytes() };
+    let protocol = RoomProtocol::default();
+    let (bytes, blobs) = seed_document::bundle_for_room(&doc, protocol)?;
+    let header = Header {
+        version: if protocol.is_automerge() { 2 } else { 1 },
+        seed: seed_document::Fingerprints::for_room(protocol).fingerprint(&doc)?,
+        identity: Identity::generate().to_bytes(),
+        access: Identity::generate().to_bytes(),
+    };
     let mut journal = Journal::new(files);
     journal.save_blobs(blobs)?;
     journal.files.write(RoomFile::Seed, &bytes)?;
@@ -166,7 +180,7 @@ pub fn init(files: Arc<dyn RoomFiles>, mut doc: Document) -> Result<(), String> 
 /// Replace the room access token while the server is stopped.
 pub fn rotate_invite(files: Arc<dyn RoomFiles>) -> Result<(), String> {
     let journal = Journal::new(files);
-    let mut header = journal.header()?;
+    let (mut header, _) = journal.header()?;
     journal.files.clear_invitation()?;
     header.access = Identity::generate().to_bytes();
     journal.files.write(RoomFile::Header, &serde_json::to_vec(&header).map_err(|e| e.to_string())?)
@@ -190,12 +204,12 @@ impl Server {
         let mut journal = Journal::new(files.clone());
         let (header, seed, recovered) = journal.load()?;
         journal.files.clear_invitation()?;
-        let storage = Storage::ephemeral(seed, header.identity)?;
+        let storage = Storage::ephemeral_for_protocol(seed, header.identity, recovered.replica.room_protocol())?;
         let transport = Transport::persistent_host("Collate room server", relay, storage.identity(), port, header.access)?;
         let state = DocState::new(recovered.document, None);
         let mut room = Room::new(transport, Mode::Host { delivery: BTreeMap::new() }, storage, state.uid, header.seed);
         room.revision = recovered.history.len() as u64;
-        room.history = recovered.history;
+        room.restore_history_index(recovered.history);
         room.inverses = recovered.inverses;
         room.history_bytes = recovered.history_bytes;
         room.replica = recovered.replica;

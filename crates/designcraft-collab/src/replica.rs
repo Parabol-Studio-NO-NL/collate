@@ -7,32 +7,55 @@ use designcraft_doc::{
 };
 
 use crate::artwork::Placement;
+use crate::automerge_stories::{AutomergeStories, StoryTransaction, check_native_ranges};
+use crate::automerge_text::{AutomergeText, reversible::ReversibleText};
 use crate::text::{AtomId, CaptureHint, MAX_STORY_ATOMS, TextEdit, TextReplica, TextSplice, simple_text};
 use crate::{
-    CommentAnchor, CommentReply, CommentThread, Error, InitialTextFormat, MAX_OPERATIONS, Operation, ShapeFrame, SharedId, layers, pages, validation,
+    CommentAnchor, CommentReply, CommentThread, Error, InitialTextFormat, MAX_OPERATIONS, Operation, RoomProtocol, ShapeFrame, SharedId, layers,
+    pages, validation,
 };
 
 const MAX_ORDER_ITEMS: usize = 512;
 const MAX_THREADS: usize = 512;
 const MAX_REPLIES_PER_THREAD: usize = 64;
 const MAX_COMMENT_ENTRIES: usize = 2_048;
+// Seeding a pristine story for comments does not perform any writes under this actor.
+const COMMENT_SEED_ACTOR: &[u8; 32] = &[0; 32];
 
 /// Per-document identity and comments for a replica initialized from an identical seed.
 #[derive(Clone)]
 pub struct Replica {
+    protocol: RoomProtocol,
     items: BTreeMap<SharedId, Option<ItemId>>,
     ids: BTreeMap<ItemId, SharedId>,
     comments: BTreeMap<SharedId, Arc<CommentThread>>,
     comment_ids: BTreeSet<SharedId>,
     text: BTreeMap<StoryId, TextReplica>,
+    automerge: AutomergeStories,
 }
 
 impl Replica {
     pub fn new(document: &Document) -> Self {
+        Self::for_room(document, RoomProtocol::default())
+    }
+
+    pub fn for_room(document: &Document, protocol: RoomProtocol) -> Self {
         let ids: BTreeMap<_, _> =
             document.spreads.iter().flat_map(|spread| spread.items.iter()).map(|item| (item.id, SharedId::Seed(item.id))).collect();
         let items = ids.iter().map(|(local, shared)| (shared.clone(), Some(*local))).collect();
-        Self { items, ids, comments: BTreeMap::new(), comment_ids: BTreeSet::new(), text: BTreeMap::new() }
+        Self {
+            protocol,
+            items,
+            ids,
+            comments: BTreeMap::new(),
+            comment_ids: BTreeSet::new(),
+            text: BTreeMap::new(),
+            automerge: AutomergeStories::default(),
+        }
+    }
+
+    pub fn room_protocol(&self) -> RoomProtocol {
+        self.protocol
     }
 
     pub fn shared_id(&self, local: ItemId) -> Option<SharedId> {
@@ -51,7 +74,9 @@ impl Replica {
         match &thread.anchor {
             CommentAnchor::Page(id) => !document.spreads.iter().flat_map(|spread| &spread.pages).any(|page| page.id == *id),
             CommentAnchor::Object(id) => self.local_id(id).is_none_or(|local| document.item(local).is_none()),
-            CommentAnchor::Text { .. } => self.comment_text_range(document, &thread.anchor).is_none(),
+            CommentAnchor::Text { .. } | CommentAnchor::AutomergeText { .. } | CommentAnchor::ReversibleText { .. } => {
+                self.comment_text_range(document, &thread.anchor).is_none()
+            }
         }
     }
 
@@ -60,6 +85,26 @@ impl Replica {
         let current = document.story(story)?;
         if current.text.get(range.clone())?.is_empty() {
             return None;
+        }
+        if let Some(replica) = self.automerge.reversible(story) {
+            return if self.protocol.is_automerge() {
+                replica.comment_anchor(range).ok().map(|anchor| CommentAnchor::ReversibleText { story, anchor })
+            } else {
+                None
+            };
+        }
+        if let Some(replica) = self.automerge.get(story) {
+            if !self.protocol.is_automerge() {
+                return None;
+            }
+            return replica.comment_anchor(range).ok().map(|anchor| CommentAnchor::AutomergeText { story, anchor });
+        }
+        if self.protocol.is_automerge()
+            && !self.text.contains_key(&story)
+            && check_native_ranges(document, story).is_ok()
+            && let Ok(replica) = ReversibleText::seed(current, &document.styles)
+        {
+            return replica.comment_anchor(range).ok().map(|anchor| CommentAnchor::ReversibleText { story, anchor });
         }
         let atoms = match self.text.get(&story) {
             Some(replica) => replica.atoms_in(range),
@@ -71,16 +116,139 @@ impl Replica {
 
     /// Resolve a text comment to the span between its first and last surviving original atom.
     pub fn comment_text_range(&self, document: &Document, anchor: &CommentAnchor) -> Option<(StoryId, Range<usize>)> {
-        let CommentAnchor::Text { story, atoms } = anchor else { return None };
-        document.story(*story)?;
-        let range = self.text.get(story)?.visible_anchored_range(atoms)?;
-        Some((*story, range))
+        match anchor {
+            CommentAnchor::Text { story, atoms } => {
+                document.story(*story)?;
+                let range = self.text.get(story)?.visible_anchored_range(atoms)?;
+                Some((*story, range))
+            }
+            CommentAnchor::AutomergeText { story, anchor } => {
+                document.story(*story)?;
+                let range = self.automerge.get(*story)?.comment_range(anchor)?;
+                Some((*story, range))
+            }
+            CommentAnchor::ReversibleText { story, anchor } => {
+                document.story(*story)?;
+                let range = self.automerge.reversible(*story)?.comment_range(anchor)?;
+                Some((*story, range))
+            }
+            _ => None,
+        }
     }
 
     /// Capture a committed local edit while retaining the pre-edit replica. The
     /// engine can restore its local draft and apply the ordered host response.
     pub fn capture(&self, before: &Document, after: &Document, actor: &str, sequence: u64) -> Result<Vec<Operation>, Error> {
         self.capture_selected(before, after, actor, sequence, None)
+    }
+
+    /// Prepare a local Automerge transaction on a replica that owns the local draft. The confirmed
+    /// room replica can merge it independently when it accepts the authenticated transaction.
+    pub fn capture_automerge_text(
+        &mut self,
+        before: &Document,
+        after: &Document,
+        actor: &[u8; 32],
+        splice: Option<(StoryId, TextSplice)>,
+    ) -> Result<Option<StoryTransaction>, Error> {
+        let mut staged = self.automerge.clone();
+        let transaction = staged.capture(before, after, actor, splice)?;
+        if let Some(transaction) = &transaction {
+            self.check_automerge_stories(transaction)?;
+            self.automerge = staged;
+        }
+        Ok(transaction)
+    }
+
+    /// Capture a reversible schema-2 edit while retaining schema-1 history for existing stories.
+    pub fn capture_reversible_text(
+        &mut self,
+        before: &Document,
+        after: &Document,
+        actor: &[u8; 32],
+        sequence: u64,
+        splice: Option<(StoryId, TextSplice)>,
+    ) -> Result<Option<StoryTransaction>, Error> {
+        if !self.protocol.is_automerge() {
+            return Err(Error::UnsupportedEdit);
+        }
+        let mut staged = self.automerge.clone();
+        let transaction = staged.capture_reversible(before, after, actor, sequence, splice)?;
+        if let Some(transaction) = &transaction {
+            self.check_automerge_stories(transaction)?;
+            self.automerge = staged;
+        }
+        Ok(transaction)
+    }
+
+    /// Produce the host-derived inverse for a reversible transaction.
+    pub fn inverse_reversible_text(&self, actor: &[u8; 32], original_sequence: u64, transaction: &StoryTransaction) -> Option<Vec<Operation>> {
+        if !self.protocol.is_automerge() || transaction.reversible_sequence() != Some(original_sequence) {
+            return None;
+        }
+        let actor = automerge::ActorId::from(actor.as_slice()).to_string();
+        Some(
+            transaction
+                .changes
+                .iter()
+                .map(|change| Operation::SetAutomergeTextBatchActive { story: change.story, actor: actor.clone(), original_sequence, active: false })
+                .collect(),
+        )
+    }
+
+    pub fn can_activate_automerge_text_batch(&self, story: StoryId, actor: &str, sequence: u64, active: bool) -> bool {
+        self.protocol.is_automerge() && self.automerge.reversible(story).is_some_and(|replica| replica.can_toggle(actor, sequence, active))
+    }
+
+    /// Accept changes from an authenticated peer or replay changes from a trusted journal.
+    pub fn apply_automerge_text(&mut self, document: &mut Document, actor: &[u8; 32], transaction: &StoryTransaction) -> Result<(), Error> {
+        if transaction.reversible_sequence().is_some() && !self.protocol.is_automerge() {
+            return Err(Error::UnsupportedEdit);
+        }
+        self.check_automerge_stories(transaction)?;
+        self.automerge.apply(document, actor, transaction)
+    }
+
+    pub fn automerge_cursor(&self, story: StoryId, byte: usize) -> Option<Vec<u8>> {
+        if let Some(replica) = self.automerge.reversible(story) {
+            return replica.cursor(byte).ok();
+        }
+        self.automerge.get(story)?.cursor(byte).ok()
+    }
+
+    /// Anchor an existing selection even when the first accepted Automerge edit has just arrived.
+    pub fn automerge_anchors(&self, document: &Document, story: StoryId, [anchor, focus]: [usize; 2]) -> Option<[Vec<u8>; 2]> {
+        if let Some(replica) = self.automerge.reversible(story) {
+            return Some([replica.cursor(anchor).ok()?, replica.cursor(focus).ok()?]);
+        }
+        let seeded;
+        let replica = if let Some(replica) = self.automerge.get(story) {
+            replica
+        } else {
+            if self.protocol.is_automerge() {
+                let replica = ReversibleText::seed(document.story(story)?, &document.styles).ok()?;
+                return Some([replica.cursor(anchor).ok()?, replica.cursor(focus).ok()?]);
+            }
+            seeded = AutomergeText::seed(document.story(story)?, &document.styles, &[0; 32]).ok()?;
+            &seeded
+        };
+        Some([replica.cursor(anchor).ok()?, replica.cursor(focus).ok()?])
+    }
+
+    pub fn resolve_automerge_cursor(&self, story: StoryId, cursor: &[u8]) -> Option<usize> {
+        if let Some(replica) = self.automerge.reversible(story) {
+            return replica.resolve(cursor).ok();
+        }
+        self.automerge.get(story)?.resolve(cursor).ok()
+    }
+
+    fn check_automerge_stories(&self, transaction: &StoryTransaction) -> Result<(), Error> {
+        // An already edited legacy story may have stable comment or undo references that cannot
+        // be inferred from its native text. It needs an explicit history migration.
+        if transaction.changes.iter().any(|change| self.text.contains_key(&change.story)) {
+            return Err(Error::UnsupportedEdit);
+        }
+        Ok(())
     }
 
     pub fn capture_selected(
@@ -219,6 +387,9 @@ impl Replica {
             if Arc::ptr_eq(previous, current) || previous == current {
                 continue;
             }
+            if self.automerge.contains(id) {
+                return Err(Error::UnsupportedEdit);
+            }
             let replica = self.text.get(&id).cloned().map_or_else(|| TextReplica::new(previous, &before.styles), Ok)?;
             let hint = selection
                 .filter(|(old, new)| old.story == id && new.story == id && old.cell.is_none() && new.cell.is_none())
@@ -233,6 +404,9 @@ impl Replica {
 
     /// A sticky predecessor for a local selection. The outer option is absent for unsupported stories.
     pub fn text_anchor(&self, document: &Document, story: StoryId, byte: usize) -> Option<Option<AtomId>> {
+        if self.automerge.contains(story) {
+            return None;
+        }
         if let Some(replica) = self.text.get(&story) {
             return replica.atom_before(byte).ok();
         }
@@ -319,6 +493,7 @@ impl Replica {
                         | Operation::SetResolved { .. }
                         | Operation::Text { .. }
                         | Operation::SetTextBatchActive { .. }
+                        | Operation::SetAutomergeTextBatchActive { .. }
                 )
             })
         {
@@ -351,6 +526,12 @@ impl Replica {
                 Operation::SetTextBatchActive { story, actor, original_sequence, active } => {
                     Operation::SetTextBatchActive { story: *story, actor: actor.clone(), original_sequence: *original_sequence, active: !active }
                 }
+                Operation::SetAutomergeTextBatchActive { story, actor, original_sequence, active } => Operation::SetAutomergeTextBatchActive {
+                    story: *story,
+                    actor: actor.clone(),
+                    original_sequence: *original_sequence,
+                    active: !active,
+                },
                 Operation::Create { .. }
                 | Operation::CreateGraphic { .. }
                 | Operation::CreateText { .. }
@@ -441,6 +622,17 @@ impl Replica {
                     let story = document.story_mut(*story).ok_or(Error::UnknownResource)?;
                     replica.set_batch_active(story, actor, *original_sequence, *active)?;
                 }
+                Operation::SetAutomergeTextBatchActive { story, actor, original_sequence, active } => {
+                    if !self.protocol.is_automerge() {
+                        return Err(Error::UnsupportedEdit);
+                    }
+                    if !updated_stories.insert(*story) {
+                        return Err(Error::DuplicateId);
+                    }
+                    let styles = document.styles.clone();
+                    let story = document.story_mut(*story).ok_or(Error::UnknownResource)?;
+                    self.automerge.toggle(story, &styles, actor, *original_sequence, *active)?;
+                }
                 Operation::CreateComment { id, anchor, text } => self.create_comment(document, id, anchor, text)?,
                 Operation::Reply { thread, id, text } => self.reply(thread, id, text)?,
                 Operation::SetResolved { thread, resolved } => self.comment_mut(thread)?.resolved = *resolved,
@@ -485,7 +677,7 @@ impl Replica {
             .filter(|item| expected.contains(&item.id))
             .map(|item| {
                 let shared = self.shared_id(item.id).ok_or(Error::UnknownObject)?;
-                Ok((item.id, shared, validate_frame_removal(document, item)?))
+                Ok((item.id, shared, validate_frame_removal(document, item, &self.automerge)?))
             })
             .collect::<Result<Vec<_>, Error>>()?;
         if frames.len() != expected.len() {
@@ -539,6 +731,9 @@ impl Replica {
     }
 
     fn apply_text(&mut self, document: &mut Document, id: StoryId, actor: &str, sequence: u64, edits: &[TextEdit]) -> Result<(), Error> {
+        if self.automerge.contains(id) {
+            return Err(Error::UnsupportedEdit);
+        }
         let styles = document.styles.clone();
         let story = document.story_mut(id).ok_or(Error::UnknownResource)?;
         let replica = match self.text.entry(id) {
@@ -588,7 +783,7 @@ impl Replica {
         if item.text_frame().map(|frame| frame.story) != story {
             return Err(Error::UnsupportedObject);
         }
-        validate_frame_removal(document, item)?;
+        validate_frame_removal(document, item, &self.automerge)?;
         document.remove_item(local).map_err(|_| Error::UnknownObject)?;
         self.tombstone_frame(local, id.clone(), story);
         Ok(())
@@ -599,6 +794,7 @@ impl Replica {
         self.items.insert(id, None);
         if let Some(story) = story {
             self.text.remove(&story);
+            self.automerge.remove(story);
         }
     }
 
@@ -651,12 +847,31 @@ impl Replica {
             }
             CommentAnchor::Object(id) if !self.items.contains_key(id) => return Err(Error::UnknownObject),
             CommentAnchor::Text { story, atoms } => {
+                if self.automerge.contains(*story) {
+                    return Err(Error::UnsupportedEdit);
+                }
                 let current = document.story(*story).ok_or(Error::UnknownResource)?;
                 let replica = match self.text.entry(*story) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => entry.insert(TextReplica::new(current, &document.styles)?),
                 };
                 replica.validate_comment_atoms(atoms)?;
+            }
+            CommentAnchor::AutomergeText { story, anchor } => {
+                if !self.protocol.is_automerge() || self.text.contains_key(story) {
+                    return Err(Error::UnsupportedEdit);
+                }
+                let current = document.story(*story).ok_or(Error::UnknownResource)?;
+                check_native_ranges(document, *story)?;
+                self.automerge.open(current, &document.styles, COMMENT_SEED_ACTOR)?.validate_comment_anchor(anchor)?;
+            }
+            CommentAnchor::ReversibleText { story, anchor } => {
+                if !self.protocol.is_automerge() || self.text.contains_key(story) {
+                    return Err(Error::UnsupportedEdit);
+                }
+                let current = document.story(*story).ok_or(Error::UnknownResource)?;
+                check_native_ranges(document, *story)?;
+                self.automerge.open_reversible(current, &document.styles)?.validate_comment_anchor(anchor)?;
             }
             _ => {}
         }
@@ -756,7 +971,7 @@ fn spread_ref(document: &Document, id: SpreadId) -> Result<SpreadRef, Error> {
     document.spreads.iter().position(|spread| spread.id == id).map(SpreadRef::Doc).ok_or(Error::UnknownResource)
 }
 
-fn validate_frame_removal(document: &Document, item: &Item) -> Result<Option<StoryId>, Error> {
+fn validate_frame_removal(document: &Document, item: &Item, automerge: &AutomergeStories) -> Result<Option<StoryId>, Error> {
     validation::editable_frame(item)?;
     if item_is_referenced(document, item.id) {
         return Err(Error::UnsupportedObject);
@@ -767,7 +982,11 @@ fn validate_frame_removal(document: &Document, item: &Item) -> Result<Option<Sto
         if current.frames != [item.id] || story_is_referenced(document, story) {
             return Err(Error::UnsupportedObject);
         }
-        TextReplica::new(current, &document.styles)?;
+        if automerge.contains(story) {
+            crate::automerge_text::validate_story_shape(current)?;
+        } else {
+            TextReplica::new(current, &document.styles)?;
+        }
     }
     Ok(story)
 }

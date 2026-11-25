@@ -113,6 +113,9 @@ impl Asset {
         if self.data.key() == other.data.key() {
             return true;
         }
+        if self.data.shared_reference().is_some() || other.data.shared_reference().is_some() {
+            return self.data == other.data;
+        }
         match (self.data.embedded_bytes(), other.data.embedded_bytes()) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b) || (a.len() == b.len() && **a == **b),
             _ => false,
@@ -428,6 +431,12 @@ impl Document {
         self.merge_duplicate_assets_with(byte_hash);
         let used = self.used_assets();
         self.assets.retain(|id, _| used.contains(id));
+    }
+
+    /// Whether any placed artwork still needs its exact shared original for output.
+    pub fn has_pending_shared_original(&self) -> bool {
+        self.assets.values().any(|asset| asset.data.shared_original_pending())
+            && self.used_assets().iter().any(|id| self.assets.get(id).is_some_and(|asset| asset.data.shared_original_pending()))
     }
 }
 

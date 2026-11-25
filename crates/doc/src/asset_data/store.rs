@@ -260,7 +260,7 @@ mod tests {
     fn linked(data: &AssetData) -> &Linked {
         match &data.repr {
             Repr::Linked(l) => l,
-            Repr::Embedded(_) => panic!("not linked"),
+            Repr::Embedded(_) | Repr::Shared(_) => panic!("not linked"),
         }
     }
 

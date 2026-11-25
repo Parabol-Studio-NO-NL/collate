@@ -38,7 +38,7 @@ fn embed_link_shares_the_original_bytes_and_keeps_the_source_file_private() {
     invited.collaboration.join_code = invite;
     invited.start_seed_download().unwrap();
     wait_for(&mut [&mut host, &mut guest, &mut invited], "both guests join", |apps| {
-        apps.iter().all(|app| app.collaboration.room.as_ref().is_some_and(Room::can_edit))
+        apps.iter().all(|app| app.collaboration.room.as_ref().is_some_and(|room| room.can_edit() && !room.originals.is_pending()))
     });
     for app in [&host, &guest, &invited] {
         let received = &document(app).assets[&asset];

@@ -25,7 +25,6 @@ struct OwnEdit {
     original: u64,
     effective: u64,
     undone: bool,
-    can_redo: bool,
 }
 
 impl Room {
@@ -40,9 +39,16 @@ impl Room {
     pub(super) fn history_patch(&self, actor: ActorId, action: HistoryAction) -> Result<(u64, &[Operation]), String> {
         let (edit, inverse) = history_entry(self.history.iter().map(|(commit, _)| commit), &self.inverses, actor, action)?;
         for operation in inverse {
-            if let Operation::SetTextBatchActive { story, actor, original_sequence, active } = operation
-                && !self.replica.can_activate_text_batch(*story, actor, *original_sequence, *active)
-            {
+            let available = match operation {
+                Operation::SetTextBatchActive { story, actor, original_sequence, active } => {
+                    self.replica.can_activate_text_batch(*story, actor, *original_sequence, *active)
+                }
+                Operation::SetAutomergeTextBatchActive { story, actor, original_sequence, active } => {
+                    self.replica.can_activate_automerge_text_batch(*story, actor, *original_sequence, *active)
+                }
+                _ => true,
+            };
+            if !available {
                 return Err("The text story or edit is no longer available for undo or redo.".into());
             }
         }
@@ -58,7 +64,7 @@ impl Room {
 
 fn history_conflicts(inverse: &Operation, later: &Operation) -> bool {
     // The check above already established that the story survived repagination.
-    !matches!((inverse, later), (Operation::SetTextBatchActive { .. }, Operation::Page { .. })) && inverse.conflicts(later)
+    !(inverse.is_text_compensation() && matches!(later, Operation::Page { .. })) && inverse.conflicts(later)
 }
 
 /// A guest or journal may apply a text toggle only as the recorded author's expected undo or redo.
@@ -88,10 +94,10 @@ fn history_entry<'a, 'b>(
     actor: ActorId,
     action: HistoryAction,
 ) -> Result<(OwnEdit, &'b [Operation]), &'static str> {
-    let own = own_edits(history, actor);
+    let (own, last_new_edit) = own_edits(history, actor);
     let edit = match action {
         HistoryAction::Undo => own.into_iter().rev().find(|entry| !entry.undone),
-        HistoryAction::Redo => own.into_iter().filter(|entry| entry.undone && entry.can_redo).max_by_key(|entry| entry.effective),
+        HistoryAction::Redo => own.into_iter().filter(|entry| entry.undone && entry.effective > last_new_edit).max_by_key(|entry| entry.effective),
     }
     .ok_or("There is no matching shared edit to undo or redo.")?;
     let inverse = inverses
@@ -101,25 +107,24 @@ fn history_entry<'a, 'b>(
     Ok((edit, inverse))
 }
 
-fn own_edits<'a>(history: impl Iterator<Item = &'a Commit>, actor: ActorId) -> Vec<OwnEdit> {
+fn own_edits<'a>(history: impl Iterator<Item = &'a Commit>, actor: ActorId) -> (Vec<OwnEdit>, u64) {
     let mut entries: Vec<OwnEdit> = Vec::new();
+    let mut last_new_edit = 0;
     for commit in history.filter(|commit| commit.actor == actor) {
         match (commit.correction, commit.proposal.history_action) {
             (Some(target), Some(action)) => {
-                if let Some(entry) = entries.iter_mut().find(|entry| entry.original == target) {
+                if let Ok(index) = entries.binary_search_by_key(&target, |entry| entry.original) {
+                    let entry = &mut entries[index];
                     entry.effective = commit.revision;
                     entry.undone = action == HistoryAction::Undo;
-                    entry.can_redo = entry.undone;
                 }
             }
             (None, None) => {
-                for entry in &mut entries {
-                    entry.can_redo = false;
-                }
-                entries.push(OwnEdit { original: commit.revision, effective: commit.revision, undone: false, can_redo: false });
+                last_new_edit = commit.revision;
+                entries.push(OwnEdit { original: commit.revision, effective: commit.revision, undone: false });
             }
             _ => {}
         }
     }
-    entries
+    (entries, last_new_edit)
 }

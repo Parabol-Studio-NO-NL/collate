@@ -60,8 +60,8 @@ pub(super) fn file_save(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// `file.saveACopy`: the document written to `path` without changing which file it is or its
-/// unsaved state. With `embedLinks`, every linked file is copied in: a document that opens
-/// anywhere.
+/// unsaved state. With `embedLinks`, the document includes its linked files. `verifiedLinks`
+/// checks their current bytes and writes a portable copy at a new path.
 pub(super) fn file_save_a_copy(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_param(p, "path").ok_or_else(|| bad("file.saveACopy", "missing `path`"))?;
     let path = with_document_extension(path);
@@ -69,12 +69,23 @@ pub(super) fn file_save_a_copy(s: &mut Session, p: &Value) -> Result<Value> {
         None | Some(Value::Null) => false,
         Some(v) => v.as_bool().ok_or_else(|| bad("file.saveACopy", "`embedLinks` must be true or false"))?,
     };
+    let verified = match p.get("verifiedLinks") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad("file.saveACopy", "`verifiedLinks` must be true or false"))?,
+    };
     let st = s.doc()?;
     let destination = std::path::Path::new(&path);
     let from = st.path.as_deref().map(std::path::Path::new);
-    let mut copy = crate::cmd::native_links::for_destination(&st.doc, from, destination).unwrap_or_else(|| (*st.doc).clone());
+    let mut copy = if verified {
+        crate::file_access::check_write(destination).map_err(EngineError::Other)?;
+        (*st.doc).clone()
+    } else {
+        crate::cmd::native_links::for_destination(&st.doc, from, destination).unwrap_or_else(|| (*st.doc).clone())
+    };
     crate::cmd::datamerge::refresh_relative_paths(&mut copy, destination);
-    if embed {
+    if verified {
+        crate::cmd::native_links::embed_verified_links(&mut copy, from, "file.saveACopy")?;
+    } else if embed {
         crate::cmd::native_links::embed_linked(&mut copy, "file.saveACopy")?;
     }
     if let Some(proxied) = crate::cmd::native_links::with_proxies(&copy, || false) {
@@ -83,7 +94,11 @@ pub(super) fn file_save_a_copy(s: &mut Session, p: &Value) -> Result<Value> {
     let warnings = crate::cmd::native_links::web_save_warnings(&copy);
     let bytes = to_bytes_with_preview(&copy, &s.cache)?;
     #[cfg(not(target_arch = "wasm32"))]
-    crate::io::write_file(&path, &bytes).map_err(EngineError::Other)?;
+    if verified {
+        crate::io::write_new_private(destination, &bytes).map_err(|error| bad("file.saveACopy", format!("{path}: {error}")))?;
+    } else {
+        crate::io::write_file(&path, &bytes).map_err(EngineError::Other)?;
+    }
     Ok(json!({"path": path, "bytes": bytes.len(), "warnings": warnings}))
 }
 

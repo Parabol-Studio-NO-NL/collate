@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     artwork::Placement,
+    automerge_text::{AutomergeCommentAnchor, ReversibleCommentAnchor},
     layers::LayerEdit,
     pages::PageEdit,
     text::{AtomId, TextEdit},
@@ -175,6 +176,15 @@ pub enum CommentAnchor {
     Page(PageId),
     Object(SharedId),
     Text { story: StoryId, atoms: Vec<AtomId> },
+    AutomergeText { story: StoryId, anchor: AutomergeCommentAnchor },
+    ReversibleText { story: StoryId, anchor: ReversibleCommentAnchor },
+}
+
+impl CommentAnchor {
+    /// Whether navigation must resolve the anchor through a story replica.
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text { .. } | Self::AutomergeText { .. } | Self::ReversibleText { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -259,6 +269,12 @@ pub enum Operation {
         original_sequence: u64,
         active: bool,
     },
+    SetAutomergeTextBatchActive {
+        story: StoryId,
+        actor: String,
+        original_sequence: u64,
+        active: bool,
+    },
     Page {
         edit: PageEdit,
     },
@@ -308,13 +324,15 @@ impl Operation {
     }
 
     pub fn is_text_compensation(&self) -> bool {
-        matches!(self, Self::SetTextBatchActive { .. })
+        matches!(self, Self::SetTextBatchActive { .. } | Self::SetAutomergeTextBatchActive { .. })
     }
 
     /// The host calls this with the authenticated endpoint identity before applying a proposal.
     pub fn is_authored_by(&self, actor: &str) -> bool {
         match self {
-            Self::Text { actor: claimed, .. } | Self::SetTextBatchActive { actor: claimed, .. } => claimed == actor,
+            Self::Text { actor: claimed, .. }
+            | Self::SetTextBatchActive { actor: claimed, .. }
+            | Self::SetAutomergeTextBatchActive { actor: claimed, .. } => claimed == actor,
             _ => self.new_id().is_none_or(|id| id.author() == Some(actor)),
         }
     }
@@ -374,8 +392,14 @@ impl Operation {
             (Self::Layer { edit }, other) | (other, Self::Layer { edit }) => {
                 edit.conflicts_with_content() && !matches!(other, Self::CreateComment { .. } | Self::Reply { .. } | Self::SetResolved { .. })
             }
-            (Self::DeleteText { story: a, .. }, Self::Text { story: b, .. } | Self::SetTextBatchActive { story: b, .. })
-            | (Self::Text { story: b, .. } | Self::SetTextBatchActive { story: b, .. }, Self::DeleteText { story: a, .. }) => a == b,
+            (
+                Self::DeleteText { story: a, .. },
+                Self::Text { story: b, .. } | Self::SetTextBatchActive { story: b, .. } | Self::SetAutomergeTextBatchActive { story: b, .. },
+            )
+            | (
+                Self::Text { story: b, .. } | Self::SetTextBatchActive { story: b, .. } | Self::SetAutomergeTextBatchActive { story: b, .. },
+                Self::DeleteText { story: a, .. },
+            ) => a == b,
             (Self::Patch { id: a, change: x }, Self::Patch { id: b, change: y }) => a == b && discriminant(x) == discriminant(y),
             (Self::SetGraphic { id: a, .. }, Self::Patch { id: b, change }) | (Self::Patch { id: b, change }, Self::SetGraphic { id: a, .. }) => {
                 a == b && matches!(change, Change::Geometry(_))

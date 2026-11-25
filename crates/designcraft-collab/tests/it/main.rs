@@ -13,6 +13,8 @@ use designcraft_doc::{
     Content, Document, Fill, Hyperlink, HyperlinkDest, HyperlinkSource, Item, ItemId, LayerId, Shape, SpreadRef, StoryId, TextSel,
 };
 
+mod automerge_stories;
+
 fn seed() -> Document {
     Document::new(&NewDocument::default())
 }
@@ -304,7 +306,9 @@ fn text_comments_follow_original_utf8_atoms_across_edits_undo_and_replay() {
     let (frame, story) = seed.add_text_frame(SpreadRef::Doc(0), Rect::new(0.0, 0.0, 20.0, 20.0), layer, "Aé😊Z", Default::default()).unwrap();
     let mut current = seed.clone();
     let mut replica = Replica::new(&seed);
-    let anchor = replica.text_comment_anchor(&current, story, 1..7).unwrap();
+    // The recorded legacy anchor initializes the old text model even when new room builds
+    // prefer Automerge for unedited stories.
+    let anchor = CommentAnchor::Text { story, atoms: vec![AtomId::Seed(1), AtomId::Seed(2)] };
     let comment = Operation::CreateComment { id: id("alice", 1), anchor: anchor.clone(), text: "Review this range".into() };
     let mut history = vec![comment.clone()];
     replica.apply(&mut current, &[comment]).unwrap();

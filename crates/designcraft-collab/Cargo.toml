@@ -7,18 +7,23 @@ rust-version.workspace = true
 description = "Typed document mutations for Collate collaboration"
 publish = false
 
+[features]
+automerge-rooms = []
+
 [dependencies]
+automerge.workspace = true
 base64 = "0.22"
 craft-image-codecs.workspace = true
 craft-pdf = { workspace = true, features = ["interpret"] }
 designcraft-doc.workspace = true
 designcraft-images.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2 = "0.10"
 thiserror.workspace = true
 
-[dev-dependencies]
-serde_json.workspace = true
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+automerge = { workspace = true, features = ["wasm"] }
 
 [lints]
 workspace = true
