@@ -381,6 +381,17 @@ pub(super) fn verify_legacy_room_protocol_fallback(root: &Path) -> Result<(), St
     let (selected, _) = open(None)?;
     assert_eq!(selected.protocol, RoomProtocol::Automerge);
     assert_eq!(selected.identity().actor(), automerge_actor);
+    drop(selected);
+
+    // Opening a saved room copy must use its journal even if the local document now has artwork
+    // that would require a new room. Its local asset bytes are irrelevant to the recovery.
+    let mut changed = seed.clone();
+    let id = designcraft_doc::AssetId(changed.alloc());
+    changed.assets.insert(id, Arc::new(designcraft_doc::Asset { id, mime: "image/tiff".into(), ..Default::default() }));
+    let (copy, _) = Storage::open_for_protocol(Some(&recovery), path, &changed, None, OpenRoom::SavedHost(None), None)?;
+    assert_eq!(copy.protocol, RoomProtocol::Automerge);
+    assert_eq!(copy.identity().actor(), automerge_actor);
+
     let (legacy, _) = open(Some(RoomProtocol::Legacy))?;
     assert_eq!(legacy.protocol, RoomProtocol::Legacy);
     assert_eq!(legacy.identity().actor(), legacy_actor);
@@ -488,7 +499,8 @@ impl Storage {
         #[cfg(target_os = "macos")]
         let (protocol, mut durable) = {
             // A document that now needs the newer artwork protocol starts its own room.
-            let needs_artwork_room = preferred.supports_print_artwork()
+            let needs_artwork_room = matches!(room, OpenRoom::Active)
+                && preferred.supports_print_artwork()
                 && document
                     .assets
                     .values()
