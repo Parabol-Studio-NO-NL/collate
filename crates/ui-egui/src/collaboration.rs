@@ -113,7 +113,7 @@ fn encode_edit(message: Message) -> Result<WireEdit, String> {
 }
 
 fn accepts_chunked_edit(edits: &[Operation]) -> bool {
-    edits.iter().any(Operation::changes_artwork)
+    edits.iter().any(|edit| edit.changes_artwork() || matches!(edit, Operation::CreateText { .. } | Operation::Text { .. }))
         || matches!(edits, [Operation::CreateComment { anchor: designcraft_collab::CommentAnchor::Text { .. }, .. }])
 }
 

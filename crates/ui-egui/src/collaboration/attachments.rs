@@ -1,7 +1,7 @@
 //! Large binary artwork uses the authenticated room connection. One ordered, bounded stream
 //! precedes its seed or edit; ordinary packets and per-peer flow control stay small.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     sync::Arc,
@@ -31,10 +31,13 @@ pub(super) struct ArtworkProgress {
 
 impl Proposal {
     pub(super) fn artwork_size(&self) -> u64 {
-        self.edits.iter().filter_map(|edit| edit.placement()).map(|p| p.artwork_size()).sum()
+        let bodies: u64 = self.blob_refs().into_iter().map(|id| u64::from(id.length)).sum();
+        // Older records carry a separate inline copy on every placement.
+        let inline: u64 = self.edits.iter().filter_map(|edit| edit.placement()).filter(|p| p.blob().is_none()).map(|p| p.artwork_size()).sum();
+        bodies + inline
     }
 
-    pub(super) fn blob_refs(&self) -> Vec<BlobId> {
+    pub(super) fn blob_refs(&self) -> BTreeSet<BlobId> {
         self.edits.iter().filter_map(|edit| edit.placement()?.blob().map(|(id, _)| id)).collect()
     }
 
@@ -186,17 +189,15 @@ impl BlobDownload {
         let cached = pending.map(Proposal::blobs).transpose()?.unwrap_or_default();
         let mut blobs = Blobs::new();
         for id in proposal.blob_refs() {
-            if let std::collections::btree_map::Entry::Vacant(entry) = blobs.entry(id) {
-                // An acknowledgement can use the exact immutable allocation the guest
-                // already owns. The staged file still has to pass its digest check.
-                let body = if let Some(body) = cached.get(&id) {
-                    self.complete.remove(&id).ok_or(INVALID)?;
-                    body.clone()
-                } else {
-                    self.load(id)?
-                };
-                entry.insert(body);
-            }
+            // An acknowledgement can use the exact immutable allocation the guest
+            // already owns. The staged file still has to pass its digest check.
+            let body = if let Some(body) = cached.get(&id) {
+                self.complete.remove(&id).ok_or(INVALID)?;
+                body.clone()
+            } else {
+                self.load(id)?
+            };
+            blobs.insert(id, body);
         }
         self.finish()?;
         proposal.attach(&blobs)
@@ -214,6 +215,35 @@ pub(super) fn total(blobs: &Blobs) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use designcraft_collab::{Operation, SharedId};
+    use designcraft_doc::ItemId;
+    use serde_json::json;
+
+    #[test]
+    fn repeated_placements_share_the_attachment_budget_but_retain_each_legacy_inline_copy() {
+        let graphic = |item, digest, artwork| Operation::SetGraphic {
+            id: SharedId::Seed(ItemId(item)),
+            placement: Some(Box::new(
+                serde_json::from_value(json!({
+                    "digest": vec![digest; 32], "size": [1, 1], "transform": [1, 0, 0, 1, 0, 0], "artwork": artwork
+                }))
+                .unwrap(),
+            )),
+        };
+        let size: u64 = 600 * 1024 * 1024;
+        let body = json!({"name": "photo.png", "mime": "image/png", "length": size});
+        let legacy = json!({"name": "old.png", "mime": "image/png", "bytes": "YWJj"});
+        let mut proposal = Proposal {
+            base: 0,
+            sequence: 1,
+            history_action: None,
+            edits: vec![graphic(1, 1, body.clone()), graphic(2, 1, body.clone()), graphic(3, 2, legacy.clone()), graphic(4, 2, legacy)],
+        };
+        assert_eq!(proposal.artwork_size(), size + 2 * b"abc".len() as u64);
+        assert_eq!(proposal.blob_refs().len(), 1);
+        proposal.edits.push(graphic(5, 3, body));
+        assert!(proposal.artwork_size() > MAX_ARTWORK_BYTES as u64, "distinct files of the same length must count separately");
+    }
 
     #[test]
     fn staged_artwork_rejects_reordering_corruption_and_overcommit() {

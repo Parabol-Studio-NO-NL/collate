@@ -28,6 +28,8 @@ Binary packets carry the digest, total length and byte offset. Each recipient st
 
 The room allows 1 GiB of retained artwork, including the seed. Edits must also fit the existing metadata and history limits. Raster images have a 12,000-pixel side limit and a 16,777,216-pixel area limit. A room PDF can be up to 512 MiB, with up to 128 pages and 16,384 parsed objects. The selected page and crop travel separately, so a new placement of the same PDF can reuse the original bytes. Admission checks encryption, decoded streams, page dimensions and embedded raster images.
 
-All participants, including an unattended room server, need protocol version 14. Earlier journal formats remain readable. On macOS, the encrypted recovery journal stores large artwork in authenticated chunks and refers to it by digest. The [standalone server](room-server.md) uses a private room directory and writes the artwork and revision before confirming an edit.
+Clipboard pastes can create multiple standalone frames in one transaction, including text frames with supported character and paragraph formatting. Paste into existing stories and placeholder fill use the same bounded text operations as typing. A story and a text batch have a limit of 16,384 atoms each.
+
+All editors and the [standalone server](room-server.md) need protocol version 15 to share a room. Version 14 introduced shared clipboard edits. Version 15 adds binary artwork transfers and receipts. The desktop app can reopen saved journals from versions 9 through 14. On macOS, the encrypted recovery journal stores artwork chunks by digest. The standalone server writes each revision and its artwork to its private room directory before confirming the edit.
 
 An encrypted recovery record belongs to the saved document's path. Save downloaded room documents to enable recovery. Use **Save a Copy** to create a standalone snapshot at another path without moving the active room's recovery record.

@@ -129,7 +129,9 @@ fn a_shared_document_rejects_unsupported_changes_then_restores_standalone_histor
     let original = session.doc().unwrap().clone();
     enable_deferred_edits(&mut session);
 
-    for (command, args) in [("type.fillWithPlaceholder", json!({})), ("file.revert", json!({})), ("edit.undo", json!({})), ("edit.redo", json!({}))] {
+    for (command, args) in
+        [("type.changeCase", json!({"case": "upper"})), ("file.revert", json!({})), ("edit.undo", json!({})), ("edit.redo", json!({}))]
+    {
         assert!(matches!(session.execute(command, &args), Err(EngineError::Other(_))), "{command}");
         assert_eq!(session.doc().unwrap().doc, original.doc);
         assert!(!session.has_deferred_edit());
