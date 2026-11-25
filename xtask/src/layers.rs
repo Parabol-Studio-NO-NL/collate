@@ -56,6 +56,7 @@ pub const TABLE: &[(&str, Class)] = &[
     // L7 apps and tooling
     ("designcraft", Class::Exempt),
     ("cli", Class::Exempt),
+    ("collate-room-server", Class::Exempt),
     ("web", Class::Exempt),
     ("xtask", Class::Exempt),
 ];

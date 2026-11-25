@@ -1,0 +1,22 @@
+[Unit]
+Description=Collate studio document room
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=collate
+Group=collate
+UMask=0077
+StateDirectory=collate
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/collate-room-server serve /var/lib/collate/studio --relay
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

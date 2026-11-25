@@ -87,26 +87,17 @@ fn open_read(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// The whole of the regular file at `path`, at most [`MAX_FILE_BYTES`] (the path checked already).
-fn read_whole(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
+/// Open a file inside the read root and return its handle and length. A non-regular file gives
+/// `None`. Check the opened handle as well as the path so the length describes the file we read.
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<Option<(std::fs::File, u64)>> {
+    touch(path);
+    crate::file_access::check_read(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     if !std::fs::metadata(path)?.is_file() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+        return Ok(None);
     }
     let file = open_read(path)?;
     let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
-    }
-    if meta.len() > MAX_FILE_BYTES {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("longer than {MAX_FILE_BYTES} bytes")));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("longer than {MAX_FILE_BYTES} bytes")));
-    }
-    Ok(bytes)
+    Ok(meta.is_file().then_some((file, meta.len())))
 }
 
 /// The bytes of the file at `path`, inside the automation read root when there is one.
@@ -118,10 +109,17 @@ pub fn read_file(path: impl AsRef<Path>) -> Result<Vec<u8>, String> {
 /// [`read_file`] with the file system's own error, for callers that tell "missing" from other
 /// failures. A refused path is a `PermissionDenied` error carrying the roots' message.
 pub fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
-    let path = path.as_ref();
-    touch(path);
-    crate::file_access::check_read(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
-    read_whole(path)
+    use std::io::Read;
+    let (file, len) = open_regular(path.as_ref())?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"))?;
+    if len > MAX_FILE_BYTES {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("longer than {MAX_FILE_BYTES} bytes")));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("longer than {MAX_FILE_BYTES} bytes")));
+    }
+    Ok(bytes)
 }
 
 /// [`read`] that stops past `cap` bytes: at most `cap + 1` bytes are read, so a device or a file
@@ -289,7 +287,7 @@ mod tests {
         let p = fifo.clone();
         std::thread::spawn(move || {
             let capped = read_capped(&p, 9).map_err(|e| e.kind());
-            let _ = tx.send((read_whole(&p).is_err(), capped));
+            let _ = tx.send((read(&p).is_err(), capped));
         });
         let got = rx.recv_timeout(std::time::Duration::from_secs(10));
         let _ = std::fs::remove_dir_all(&dir);

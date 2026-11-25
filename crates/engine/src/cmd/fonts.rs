@@ -303,13 +303,19 @@ mod tests {
         assert!(r["cataloged"].is_u64() && r["changed"].is_array(), "{r}");
         s.execute("file.new", &json!({})).unwrap();
         s.execute("frame.create", &json!({"rect": [72, 72, 400, 300], "content": "text", "text": "Some text here."})).unwrap();
-        let (revision, undo) = (s.doc().unwrap().revision, s.doc().unwrap().history.undo.len());
+        s.execute("file.new", &json!({})).unwrap();
+        let shared_uid = s.doc().unwrap().uid;
+        s.defer_document_edits(Some(shared_uid));
+        let states = s.documents().iter().map(|st| (st.doc.clone(), st.revision, st.history.undo.len())).collect::<Vec<_>>();
         let cache = Arc::clone(&s.cache);
         s.execute("font.reload", &json!({})).unwrap();
         assert!(!Arc::ptr_eq(&cache, &s.cache), "the layout composed with the old fonts is let go");
-        let st = s.doc().unwrap();
-        assert_ne!(st.revision, revision, "the canvas draws the document again");
-        assert_eq!(st.history.undo.len(), undo, "reloading fonts isn't an edit");
+        for (st, (doc, revision, undo)) in s.documents().iter().zip(states) {
+            assert!(Arc::ptr_eq(&doc, &st.doc), "the document's font choices stay intact");
+            assert_ne!(st.revision, revision, "the canvas draws the document again");
+            assert_eq!(st.history.undo.len(), undo, "reloading fonts isn't an edit");
+        }
+        assert!(s.take_deferred_edit().is_none(), "a local font rescan sends no room edit");
     }
 
     #[test]

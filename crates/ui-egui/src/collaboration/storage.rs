@@ -4,7 +4,8 @@ use designcraft_doc::Document;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
 
-use super::{Commit, Proposal, seed_document};
+use super::{Commit, Proposal, attachments::Blobs, seed_document};
+use designcraft_collab::artwork::BlobId;
 
 const JOURNAL_VERSION: u16 = 1;
 
@@ -45,6 +46,7 @@ pub(super) struct Storage {
     identity: [u8; 32],
     pub(super) seed: Arc<Document>,
     pub(super) archive: Vec<u8>,
+    pub(super) seed_blobs: Blobs,
     encoded_archive: String,
     #[cfg(target_os = "macos")]
     durable: Option<Durable>,
@@ -55,13 +57,15 @@ struct Durable {
     journal: Journal,
     record: RecordId,
     _lease: RecordLock,
+    stored: std::cell::RefCell<std::collections::BTreeSet<BlobId>>,
 }
 
 impl Storage {
     pub(super) fn ephemeral(document: Document, identity: [u8; 32]) -> Result<Self, String> {
-        let archive = seed_document::encode(&document)?;
+        let (archive, seed_blobs) = seed_document::bundle(&document)?;
         Ok(Self {
             identity,
+            seed_blobs,
             seed: Arc::new(document),
             encoded_archive: STANDARD_NO_PAD.encode(&archive),
             archive,
@@ -92,7 +96,7 @@ impl Storage {
         #[cfg(not(target_os = "macos"))]
         let existing: Option<Vec<u8>> = None;
 
-        let saved = if let Some(bytes) = existing {
+        let mut saved = if let Some(bytes) = existing {
             let saved: SavedRoom = serde_json::from_slice(&bytes).map_err(|_| "The local collaboration journal could not be read.")?;
             if saved.version != JOURNAL_VERSION || saved.next_sequence == 0 || saved.confirmed.len() > super::MAX_HISTORY {
                 return Err("The local collaboration journal needs a compatible app version.".into());
@@ -110,15 +114,49 @@ impl Storage {
                 pending: None,
             }
         };
-        let (seed, archive) = match &saved.seed {
-            SavedSeed::Model(seed) => ((**seed).clone(), seed_document::encode(seed)?),
+        let mut loaded = Blobs::new();
+        let mut loaded_bytes = 0u64;
+        let mut read = |id: BlobId| -> Result<Arc<Vec<u8>>, String> {
+            if let Some(bytes) = loaded.get(&id) {
+                return Ok(bytes.clone());
+            }
+            loaded_bytes += u64::from(id.length);
+            if !id.valid() || loaded_bytes > designcraft_collab::artwork::MAX_ARTWORK_BYTES as u64 {
+                return Err("Saved artwork exceeds the room limit.".into());
+            }
+            #[cfg(target_os = "macos")]
+            let body = durable.as_ref().ok_or("The saved artwork is missing.")?.load_blob(id)?;
+            #[cfg(not(target_os = "macos"))]
+            let body = missing_blob(id)?;
+            loaded.insert(id, body.clone());
+            Ok(body)
+        };
+        let (seed, archive, seed_blobs) = match &saved.seed {
+            SavedSeed::Model(seed) => {
+                let (archive, blobs) = seed_document::bundle(seed)?;
+                ((**seed).clone(), archive, blobs)
+            }
             SavedSeed::Archive(encoded) => {
                 let archive = STANDARD_NO_PAD.decode(encoded).map_err(|_| "The saved seed archive is invalid.")?;
-                (seed_document::decode(&archive)?, archive)
+                let mut blobs = Blobs::new();
+                let doc = seed_document::restore_bundle(&archive, |id| {
+                    let body = read(id)?;
+                    blobs.insert(id, body.clone());
+                    Ok(body)
+                })?;
+                (doc, archive, blobs)
             }
         };
+        for proposal in saved.confirmed.iter_mut().map(|c| &mut c.proposal).chain(saved.pending.iter_mut()) {
+            let mut blobs = Blobs::new();
+            for id in proposal.blob_refs() {
+                blobs.insert(id, read(id)?);
+            }
+            proposal.attach(&blobs)?;
+        }
         let storage = Self {
             identity: saved.identity,
+            seed_blobs,
             seed: Arc::new(seed),
             encoded_archive: STANDARD_NO_PAD.encode(&archive),
             archive,
@@ -182,7 +220,12 @@ impl Storage {
         let bytes = serde_json::to_vec(&record).map_err(|_| "The local collaboration journal could not be encoded.")?;
         #[cfg(target_os = "macos")]
         if let Some(durable) = &self.durable {
-            durable.journal.store(durable.record, &bytes).map_err(|error| error.to_string())?;
+            let mut blobs = self.seed_blobs.clone();
+            for proposal in record.confirmed.iter().map(|c| &c.proposal).chain(record.pending) {
+                blobs.extend(proposal.blobs()?);
+            }
+            super::attachments::total(&blobs)?;
+            durable.write(&bytes, &blobs)?;
         }
         #[cfg(not(target_os = "macos"))]
         let _ = bytes;
@@ -202,6 +245,85 @@ impl Durable {
         let record = RecordId { room: hash.finalize().into(), role: if guest_of.is_some() { Role::Guest } else { Role::Host } };
         let journal = Journal::new(root.join("Collaboration"));
         let lease = journal.lock(record).map_err(|error| error.to_string())?;
-        Ok(Self { journal, record, _lease: lease })
+        Ok(Self { journal, record, _lease: lease, stored: Default::default() })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn missing_blob(_: BlobId) -> Result<Arc<Vec<u8>>, String> {
+    Err("The saved artwork is missing.".into())
+}
+
+#[cfg(target_os = "macos")]
+const JOURNAL_PART: usize = 4 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+impl Durable {
+    fn blob_part(&self, id: BlobId, index: usize) -> RecordId {
+        let mut hash = Sha256::new();
+        hash.update(b"Collate encrypted artwork v1");
+        hash.update(self.record.room);
+        hash.update(id.digest);
+        hash.update(id.length.to_be_bytes());
+        hash.update((index as u64).to_be_bytes());
+        RecordId { room: hash.finalize().into(), role: self.record.role }
+    }
+
+    fn load_blob(&self, id: BlobId) -> Result<Arc<Vec<u8>>, String> {
+        let size = id.length as usize;
+        if !id.valid() {
+            return Err("Invalid saved artwork size.".into());
+        }
+        let mut body = Vec::new();
+        let mut hash = Sha256::new();
+        for index in 0..size.div_ceil(JOURNAL_PART) {
+            let part = self.journal.load(self.blob_part(id, index)).map_err(|error| error.to_string())?.ok_or("A saved artwork chunk is missing.")?;
+            if part.len() != JOURNAL_PART.min(size - body.len()) {
+                return Err("A saved artwork chunk is invalid.".into());
+            }
+            if index == 0 {
+                body.try_reserve_exact(size).map_err(|_| "Could not allocate the saved artwork.")?;
+            }
+            hash.update(&part);
+            body.extend(part);
+        }
+        if <[u8; 32]>::from(hash.finalize()) != id.digest {
+            return Err("Saved artwork failed verification.".into());
+        }
+        self.stored.borrow_mut().insert(id);
+        Ok(Arc::new(body))
+    }
+
+    fn delete_parts(&self, id: BlobId, count: usize) {
+        for index in 0..count {
+            let _ = self.journal.delete(self.blob_part(id, index));
+        }
+    }
+
+    fn write(&self, record: &[u8], blobs: &Blobs) -> Result<(), String> {
+        let mut stored = self.stored.borrow_mut();
+        // Write immutable sidecars before the record that references them.
+        for (&id, body) in blobs {
+            if !stored.contains(&id) {
+                for (index, part) in body.chunks(JOURNAL_PART).enumerate() {
+                    if let Err(error) = self.journal.store(self.blob_part(id, index), part) {
+                        self.delete_parts(id, index + 1);
+                        return Err(error.to_string());
+                    }
+                }
+                stored.insert(id);
+            }
+        }
+        self.journal.store(self.record, record).map_err(|error| error.to_string())?;
+        // A declined queued edit no longer needs its encrypted artwork. Once the
+        // metadata is committed, interrupted cleanup cannot damage the journal.
+        stored.retain(|id| {
+            if blobs.contains_key(id) {
+                return true;
+            }
+            self.delete_parts(*id, (id.length as usize).div_ceil(JOURNAL_PART));
+            false
+        });
+        Ok(())
     }
 }

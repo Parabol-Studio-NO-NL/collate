@@ -22,9 +22,13 @@ fn room(app: &DesignApp) -> &Room {
     app.collaboration.room.as_ref().unwrap()
 }
 
-fn wait_for(apps: &mut [&mut DesignApp], stage: &str, done: impl Fn(&[&mut DesignApp]) -> bool) {
+fn wait_for(apps: &mut [&mut DesignApp], stage: &str, done: impl FnMut(&[&mut DesignApp]) -> bool) {
+    wait_for_with_deadline(apps, stage, Duration::from_secs(30), done);
+}
+
+fn wait_for_with_deadline(apps: &mut [&mut DesignApp], stage: &str, timeout: Duration, mut done: impl FnMut(&[&mut DesignApp]) -> bool) {
     let ctx = egui::Context::default();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
     loop {
         for app in apps.iter_mut() {
             app.poll_collaboration(&ctx);
@@ -86,10 +90,14 @@ fn assert_converged_layout(doc: &Document, seed: &Document, shape: ItemId, text_
     assert_eq!(story.text, "ABλCD");
 }
 
-fn artwork_fixture(mut noise: u32) -> Vec<u8> {
+fn artwork_fixture(noise: u32) -> Vec<u8> {
+    artwork_fixture_with_side(noise, 128)
+}
+
+fn artwork_fixture_with_side(mut noise: u32, side: u32) -> Vec<u8> {
     use craft_image_codecs::{ChannelLayout, Format, Image};
 
-    let pixels = (0..128 * 128 * 4)
+    let pixels = (0..side * side * 4)
         .map(|_| {
             noise ^= noise << 13;
             noise ^= noise >> 17;
@@ -97,7 +105,7 @@ fn artwork_fixture(mut noise: u32) -> Vec<u8> {
             noise.to_le_bytes()[0]
         })
         .collect();
-    let image = Image::from_u8(128, 128, ChannelLayout::Rgba, pixels).unwrap();
+    let image = Image::from_u8(side, side, ChannelLayout::Rgba, pixels).unwrap();
     craft_image_codecs::encode(&image, Format::Png, &Default::default()).unwrap()
 }
 
@@ -160,10 +168,20 @@ fn live_placed_artwork_replicates_from_both_peers_and_replays_after_save() {
     host.run("file.saveAs", json!({"path": path})).unwrap();
     let mut reopened = DesignApp::new(Session::new(), Services::default());
     reopened.run("file.open", json!({"path": path})).unwrap();
-    let confirmed = room(&host).history.iter().map(|(commit, _)| commit.clone()).collect();
-    let restored = super::replay::restore(&seed, document(&reopened), confirmed).unwrap();
+    let confirmed: Vec<_> = room(&host).history.iter().map(|(commit, _)| commit.clone()).collect();
+    let mut cache = super::seed_document::Fingerprints::default();
+    let restored = super::replay::restore_cached(&seed, document(&reopened), confirmed.clone(), &mut cache).unwrap();
     assert_eq!(fingerprint(&restored.document).unwrap(), fingerprint(document(&host)).unwrap());
     assert_eq!(restored.document.assets[&expected_asset].data.embedded_bytes().unwrap().as_slice(), &second_image);
+    // Count each allocation once, including the compacted copy reopened from disk.
+    // The replayed buffers survive several checkpoints and the frame replacement.
+    let reopened_bytes = super::seed_document::artwork_size(document(&reopened));
+    assert_eq!(cache.bytes_hashed, reopened_bytes + (first_image.len() + second_image.len()) as u64);
+    let mut changed = document(&reopened).clone();
+    let mut altered = second_image.clone();
+    *altered.last_mut().unwrap() ^= 1;
+    std::sync::Arc::make_mut(changed.assets.get_mut(&expected_asset).unwrap()).data = designcraft_doc::AssetData::embedded(altered);
+    assert!(super::replay::restore_cached(&seed, &changed, confirmed, &mut cache).is_err(), "equal length cannot identify a checkpoint");
 }
 
 #[test]
@@ -226,8 +244,10 @@ fn placed_pdf_page_and_crop_converge_and_render_after_reopen() {
     host.run("file.place", json!({"path": file, "pdfPage": 2, "x": 80, "y": 360})).unwrap();
     wait_for(&mut [&mut host, &mut guest], "second PDF crop is kept distinct", |apps| apps.iter().all(|app| room(app).revision == 3));
     let history = &room(&host).history;
-    assert!(history[0].1.len() > designcraft_collab_core::MAX_PAYLOAD);
-    assert!(history[1..].iter().all(|(_, edit)| edit.len() < designcraft_collab_core::MAX_PAYLOAD));
+    assert!(history[0].1.artwork_size > designcraft_collab_core::MAX_PAYLOAD as u64);
+    assert_eq!(history[0].1.blobs.len(), 1);
+    assert!(history.iter().all(|(_, edit)| edit.len() < designcraft_collab_core::MAX_PAYLOAD));
+    assert!(history[1..].iter().all(|(_, edit)| edit.blobs.is_empty()));
     std::fs::remove_file(&file).unwrap();
     assert_eq!(document(&host), document(&guest));
     let confirmed = document(&guest);
@@ -1100,18 +1120,36 @@ fn shared_clipboard_and_placeholder_fill_reach_both_peers() {
     host.run("edit.pasteWithoutFormatting", json!({})).unwrap();
     wait_for_revision(&mut host, &mut guest, "paste without formatting restores the copied words", 8);
     assert_eq!(document(&guest).story(original.id).unwrap().text, original.text);
-    let external = artwork_fixture(31);
+    let external = artwork_fixture_with_side(31, 800);
     host.run("file.new", json!({})).unwrap();
     host.run("edit.pasteImage", json!({"base64": designcraft_engine::cmd::base64_encode(&external)})).unwrap();
+    let first = host.session.doc().unwrap().selection.items[0];
+    host.run("edit.copy", json!({})).unwrap();
+    host.run("edit.pasteInPlace", json!({})).unwrap();
+    let second = host.session.doc().unwrap().selection.items[0];
+    assert_ne!(first, second);
+    host.run("selection.set", json!({"ids": [first, second]})).unwrap();
     host.run("edit.copy", json!({})).unwrap();
     host.run("file.activate", json!({"index": 0})).unwrap();
     host.run("selection.set", json!({"ids": []})).unwrap();
     host.run("edit.paste", json!({})).unwrap();
     wait_for_revision(&mut host, &mut guest, "clipboard imports embedded artwork from another document", 9);
-    let [artwork] = host.session.doc().unwrap().selection.items.as_slice() else { panic!("expected one pasted graphic") };
-    let asset = document(&guest).item(*artwork).unwrap().graphic().unwrap().asset;
-    assert_eq!(document(&guest).assets[&asset].data.embedded_bytes().unwrap().as_slice(), &external);
+    let selected = &host.session.doc().unwrap().selection.items;
+    assert_eq!(selected.len(), 2);
+    for id in selected {
+        let asset = document(&guest).item(*id).unwrap().graphic().unwrap().asset;
+        assert_eq!(document(&guest).assets[&asset].data.embedded_bytes().unwrap().as_slice(), &external);
+    }
+    let wire = &room(&host).history.last().unwrap().1;
+    assert!(wire.len() < designcraft_collab_core::MAX_PAYLOAD);
+    assert_eq!(wire.artwork_size, external.len() as u64);
     assert_eq!(document(&host), document(&guest));
+    let mut late = editor(&seed, "Late guest");
+    join(&mut late, room(&host).invitation.as_deref().unwrap());
+    wait_for(&mut [&mut host, &mut guest, &mut late], "late guest replays the clipboard artwork", |apps| {
+        room(apps[2]).can_edit() && room(apps[2]).revision == room(apps[0]).revision
+    });
+    assert_eq!(document(&host), document(&late));
 }
 
 #[test]
@@ -1528,5 +1566,12 @@ fn concurrent_editor_text_inserts_and_deletes_keep_the_other_peers_atoms() {
     assert_eq!(*document(&guest), unchanged);
 }
 
+mod embedded_link;
+mod font_notice;
+mod seed_artwork;
+mod version_handshake;
+
 #[cfg(target_os = "macos")]
 mod restart;
+
+mod large_artwork;

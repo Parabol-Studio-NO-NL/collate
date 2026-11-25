@@ -94,6 +94,9 @@ pub type Result<T> = std::result::Result<T, DocError>;
 /// readers that use doubles).
 pub const MAX_NEXT_ID: u64 = 1 << 53;
 
+/// Largest encoded artwork file a collaborative document can transfer.
+pub const MAX_SHARED_ARTWORK_BYTES: usize = 1 << 30;
+
 /// Edit › Transparency Blend Space: the colour space transparency is flattened in (CMYK for
 /// print documents, RGB for screen ones, as InDesign defaults).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

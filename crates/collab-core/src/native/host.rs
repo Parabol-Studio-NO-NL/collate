@@ -2,6 +2,7 @@ use iroh::{Endpoint, EndpointAddr, endpoint::Incoming};
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -14,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ActorId, Peer};
 
-use super::{Event, MAX_GUESTS, MAX_PAYLOAD, Outgoing, QUEUE_CAPACITY, Worker, actor, wire};
+use super::{Event, MAX_GUESTS, MAX_PAYLOAD, QUEUE_CAPACITY, Worker, actor, wire};
 use wire::{Admit, FromHost, Hello, IO_TIMEOUT, MAX_TICKET_ADDRESSES, Ticket};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -30,16 +31,49 @@ struct Seat {
     stop: CancellationToken,
 }
 
+/// Send directly to the authenticated participant's bounded queue. Backpressure must
+/// reach the application cursor before it advances, even when the network is slow.
+#[derive(Clone, Default)]
+pub(super) struct Routes(Arc<Mutex<BTreeMap<ActorId, mpsc::Sender<FromHost>>>>);
+
+impl Routes {
+    pub(super) fn send(&self, target: Option<ActorId>, bytes: Vec<u8>) -> Result<(), String> {
+        let routes = self.0.lock().map_err(|_| "The peer session is offline.")?;
+        if target.is_some_and(|actor| !routes.contains_key(&actor)) {
+            return Err("The participant is offline.".into());
+        }
+        let mut permits = Vec::new();
+        for (_, mailbox) in routes.iter().filter(|(id, _)| target.is_none_or(|actor| actor == **id)) {
+            // Leave room for roster notifications while large transfers are active.
+            if mailbox.capacity() <= MAX_GUESTS {
+                return Err("The peer session is catching up.".into());
+            }
+            permits.push(mailbox.try_reserve().map_err(|_| "The peer session is catching up.")?);
+        }
+        if let Some(last) = permits.pop() {
+            let message = FromHost::Message(bytes);
+            for permit in permits {
+                permit.send(message.clone());
+            }
+            last.send(message);
+        }
+        Ok(())
+    }
+}
+
 enum Request {
     Admit(Seat, oneshot::Sender<Admit>),
     Message(ConnectionKey, Vec<u8>),
 }
 
-pub(super) async fn run(worker: &mut Worker, endpoint: &Endpoint, local: Peer, relay: bool) -> Result<(), String> {
+pub(super) async fn run(worker: &mut Worker, endpoint: &Endpoint, local: Peer, relay: bool, access: Option<[u8; 32]>) -> Result<(), String> {
     if relay {
         let _ = timeout(Duration::from_secs(4), endpoint.online()).await;
     }
     let mut ticket = Ticket::new(advertised_address(endpoint), relay);
+    if let Some(access) = access {
+        ticket.access = access;
+    }
     let mut address_check = interval(Duration::from_secs(3));
     let (requests, mut incoming) = mpsc::channel(QUEUE_CAPACITY);
     let mut tasks = JoinSet::new();
@@ -69,7 +103,7 @@ pub(super) async fn run(worker: &mut Worker, endpoint: &Endpoint, local: Peer, r
                 }
             }
             Some(request) = incoming.recv() => room.receive(worker, request).await,
-            Some(message) = worker.inbox.recv() => room.send(worker, message).await,
+
         }
     }
 }
@@ -122,15 +156,11 @@ impl Room {
         let roster = self.guests.values().map(|guest| guest.peer.clone()).collect();
         if reply.send(Admit::Welcome { host: self.host.clone(), peers: roster }).is_ok() {
             let stale = self.deliver(&FromHost::PeerJoined(peer.clone()), None);
+            if let Ok(mut routes) = worker.routes.0.lock() {
+                routes.insert(peer.actor, seat.mailbox.clone());
+            }
             self.guests.insert(peer.actor, seat);
             worker.publish(Event::PeerJoined(peer)).await;
-            self.remove(worker, stale).await;
-        }
-    }
-
-    async fn send(&mut self, worker: &Worker, message: Outgoing) {
-        if message.generation == 1 {
-            let stale = self.deliver(&FromHost::Message(message.bytes), message.peer);
             self.remove(worker, stale).await;
         }
     }
@@ -146,6 +176,9 @@ impl Room {
     async fn remove(&mut self, worker: &Worker, mut stale: Vec<ActorId>) {
         while let Some(actor) = stale.pop() {
             if let Some(seat) = self.guests.remove(&actor) {
+                if let Ok(mut routes) = worker.routes.0.lock() {
+                    routes.remove(&actor);
+                }
                 seat.stop.cancel();
                 worker.publish(Event::PeerLeft(actor)).await;
                 stale.extend(self.deliver(&FromHost::PeerLeft(actor), None));
@@ -215,6 +248,31 @@ async fn exchange(
                 host.send(Request::Message(key, bytes)).await.ok()?;
             }
             message = outgoing.recv() => wire::write(output, &message?).await.ok()?,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slow_recipient_can_retry_without_disrupting_other_guests() {
+        let slow = ActorId([1; 32]);
+        let fast = ActorId([2; 32]);
+        let routes = Routes::default();
+        let (slow_tx, mut slow_rx) = mpsc::channel(MAX_GUESTS + 1);
+        let (fast_tx, mut fast_rx) = mpsc::channel(MAX_GUESTS + 1);
+        routes.0.lock().unwrap().extend([(slow, slow_tx), (fast, fast_tx)]);
+        routes.send(Some(slow), vec![1]).unwrap();
+        assert!(routes.send(None, vec![2]).is_err());
+        assert!(fast_rx.try_recv().is_err(), "a broadcast must reach everyone exactly once");
+        routes.send(Some(fast), vec![3]).unwrap();
+        assert!(matches!(fast_rx.try_recv(), Ok(FromHost::Message(bytes)) if bytes == [3]));
+        assert!(matches!(slow_rx.try_recv(), Ok(FromHost::Message(bytes)) if bytes == [1]));
+        routes.send(None, vec![2]).unwrap();
+        for rx in [&mut slow_rx, &mut fast_rx] {
+            assert!(matches!(rx.try_recv(), Ok(FromHost::Message(bytes)) if bytes == [2]));
         }
     }
 }

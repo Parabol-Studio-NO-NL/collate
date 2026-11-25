@@ -44,6 +44,24 @@ fn link_status(s: &mut Session) -> Value {
     s.execute("links.list", &json!({})).unwrap()[0]["status"].clone()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn shared_placement_reads_only_regular_files_inside_the_read_root() {
+    let (base, roots) = folders("shared-placement");
+    let inside = base.join("in/art.png");
+    let outside = base.join("outside/art.png");
+    std::fs::write(&inside, PNG).unwrap();
+    std::fs::write(&outside, PNG).unwrap();
+    confine(Some(&roots), || {
+        assert_eq!(Session::read_shared_placement(&p(&inside)).unwrap(), PNG);
+        let refused = Session::read_shared_placement(&p(&outside)).unwrap_err().to_string();
+        assert!(refused.contains("outside the read root"), "{refused}");
+        let directory = Session::read_shared_placement(&p(&base.join("in"))).unwrap_err().to_string();
+        assert!(directory.contains("regular artwork file"), "{directory}");
+    });
+    let _ = std::fs::remove_dir_all(base);
+}
+
 #[test]
 fn a_link_outside_the_read_root_reads_as_missing() {
     let (base, roots) = folders("links");

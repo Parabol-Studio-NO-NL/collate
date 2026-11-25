@@ -15,7 +15,7 @@ pub use operations::{Appearance, Change, CommentAnchor, CommentReply, CommentThr
 pub use replica::Replica;
 
 /// The room protocol must identify the exact adapter schema used by all replicas.
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const MAX_OPERATIONS: usize = 64;
 
 #[derive(Debug, Error, PartialEq, Eq)]

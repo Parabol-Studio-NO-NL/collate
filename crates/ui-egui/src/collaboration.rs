@@ -1,5 +1,6 @@
 //! Native app-thread room controller. Network messages never enter the command registry.
 
+mod attachments;
 mod controls;
 mod edit_wire;
 mod history;
@@ -8,6 +9,8 @@ mod presence;
 mod replay;
 mod seed;
 mod seed_document;
+#[cfg(unix)]
+pub mod server;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -63,7 +66,9 @@ enum Message {
     CaughtUp { revision: u64 },
     Propose(Proposal),
     Commit(Commit),
-    Declined { sequence: u64 },
+    Declined { sequence: u64, artwork_limit: bool },
+    RetryArtwork,
+    ArtworkReceipt { revision: u64, sequence: u64, digest: [u8; 32] },
     Incompatible,
     RequestSeed,
     SeedOffer(SeedAdvertisement),
@@ -95,8 +100,16 @@ fn encode_packet(message: Message) -> Result<Vec<u8>, String> {
 fn encode_edit(message: Message) -> Result<WireEdit, String> {
     let can_chunk =
         matches!(&message, Message::Propose(proposal) | Message::Commit(Commit { proposal, .. }) if accepts_chunked_edit(&proposal.edits));
+    let (blobs, artwork_size) = match &message {
+        Message::Propose(p) | Message::Commit(Commit { proposal: p, .. }) => (p.blobs()?, p.artwork_size()),
+        _ => (attachments::Blobs::new(), 0),
+    };
+    attachments::total(&blobs)?;
     let bytes = if can_chunk { encode_packet(message)? } else { encode(message)? };
-    WireEdit::new(bytes)
+    let mut wire = WireEdit::new(bytes)?;
+    wire.blobs = blobs;
+    wire.artwork_size = artwork_size;
+    Ok(wire)
 }
 
 fn accepts_chunked_edit(edits: &[Operation]) -> bool {
@@ -114,16 +127,20 @@ struct Delivery {
     sent: usize,
     cursor: SendCursor,
     announced: bool,
+    receipt: Option<usize>,
 }
 
 struct Room {
     transport: Transport,
+    #[cfg(unix)]
+    server_journal: Option<server::Journal>,
     storage: Storage,
     history: Vec<(Commit, WireEdit)>,
     inverses: Vec<Option<Vec<Operation>>>,
     history_bytes: usize,
     seed_delivery: SeedDelivery,
     receiving_edits: BTreeMap<ActorId, SeedDownload>,
+    receiving_blobs: BTreeMap<ActorId, attachments::BlobDownload>,
     sending_proposal: Option<(WireEdit, SendCursor)>,
     online: bool,
     has_joined: bool,
@@ -307,6 +324,7 @@ impl DesignApp {
         room.fatal = false;
         room.last_send = None;
         room.receiving_edits.clear();
+        room.receiving_blobs.clear();
         room.sending_proposal = None;
         c.join_code.clear();
         Ok(())
@@ -322,10 +340,12 @@ impl DesignApp {
         if cfg!(target_os = "macos") && self.session.recovery_dir.is_some() && (st.path.is_none() || st.is_dirty()) {
             return Err("Save the seed document before starting or joining a room.".into());
         }
-        let (storage, saved) = Storage::open(self.session.recovery_dir.as_deref(), st.path.as_deref(), &st.doc, guest_of)?;
+        let mut opened = (*st.doc).clone();
+        seed_document::prepare_local_copy(&mut opened)?;
+        let (storage, saved) = Storage::open(self.session.recovery_dir.as_deref(), st.path.as_deref(), &opened, guest_of)?;
         let seed = fingerprint(&storage.seed)?;
         let uid = st.uid;
-        let recovered = replay::restore(&storage.seed, &st.doc, saved.confirmed)?;
+        let recovered = replay::restore(&storage.seed, &opened, saved.confirmed)?;
         let revision = recovered.history.len() as u64;
         if saved.pending.as_ref().is_some_and(|pending| host || pending.base > revision || pending.sequence >= saved.next_sequence) {
             return Err("The local collaboration journal has an invalid pending edit.".into());
@@ -359,9 +379,7 @@ impl DesignApp {
 }
 
 fn fingerprint(doc: &Document) -> Result<[u8; 32], String> {
-    let mut canonical = doc.clone();
-    canonical.compact_assets();
-    seed_document::fingerprint(&canonical)
+    seed_document::Fingerprints::default().canonical(doc)
 }
 
 impl Room {
@@ -369,6 +387,8 @@ impl Room {
         let replica = Replica::new(&storage.seed);
         Self {
             transport,
+            #[cfg(unix)]
+            server_journal: None,
             mode,
             storage,
             doc_uid,
@@ -379,6 +399,7 @@ impl Room {
             history_bytes: 0,
             seed_delivery: SeedDelivery::default(),
             receiving_edits: BTreeMap::new(),
+            receiving_blobs: BTreeMap::new(),
             sending_proposal: None,
             online: false,
             has_joined: false,
@@ -439,21 +460,51 @@ impl Room {
             let Some(event) = self.transport.try_event() else { break };
             self.on_event(session, event);
         }
+        let expired: Vec<_> = self.receiving_blobs.iter().filter(|(_, stream)| stream.expired()).map(|(&peer, _)| peer).collect();
+        for peer in expired {
+            self.drop_transfer(peer);
+            if matches!(self.mode, Mode::Host { .. }) {
+                self.reply(peer, Message::RetryArtwork);
+            }
+        }
         self.advance_delivery();
-        self.seed_delivery.advance(&self.transport);
+        self.seed_delivery.advance(&self.transport, &self.storage.seed_blobs);
         self.advance_proposal();
+    }
+
+    fn artwork_progress(&self) -> Option<attachments::ArtworkProgress> {
+        if let Some(progress) = self.receiving_blobs.values().find_map(|stream| stream.progress()) {
+            return Some(progress);
+        }
+        match &self.mode {
+            Mode::Guest { .. } => self.sending_proposal.as_ref().and_then(|(wire, cursor)| wire.progress(cursor)),
+            Mode::Host { delivery } => self
+                .seed_delivery
+                .progress(&self.storage.seed_blobs)
+                .or_else(|| delivery.values().find_map(|d| self.history.get(d.sent)?.1.progress(&d.cursor))),
+        }
     }
 
     fn advance_proposal(&mut self) {
         let (Mode::Guest { ready: true, .. }, Some(pending)) = (&self.mode, &self.pending) else { return };
+        if self.sending_proposal.is_none() && self.last_send.is_some() && self.host.is_some_and(|host| self.receiving_blobs.contains_key(&host)) {
+            return;
+        }
         if self.sending_proposal.is_none() && self.last_send.is_none_or(|last| last.elapsed() >= Duration::from_secs(2)) {
             self.sending_proposal = match encode_edit(Message::Propose(pending.clone())) {
-                Ok(wire) => Some((wire, SendCursor::default())),
+                Ok(mut wire) => {
+                    // The ordered transport delivered the attachments before the
+                    // proposal. Retry just its metadata while waiting for a receipt.
+                    if self.last_send.is_some() {
+                        wire.blobs.clear();
+                    }
+                    Some((wire, SendCursor::default()))
+                }
                 Err(error) => return self.stop_with_error(&error),
             };
         }
         let Some((wire, cursor)) = self.sending_proposal.as_mut() else { return };
-        for _ in 0..8 {
+        for _ in 0..32 {
             match wire.send_next(cursor, |frame| self.transport.submit(frame)) {
                 Ok(true) => {
                     self.sending_proposal = None;
@@ -482,6 +533,7 @@ impl Room {
                 self.peers.remove(&actor);
                 self.presence.remove(&actor);
                 self.seed_delivery.stop(actor);
+                self.receiving_blobs.remove(&actor);
                 self.receiving_edits.remove(&actor);
                 if let Mode::Host { delivery, .. } = &mut self.mode {
                     delivery.remove(&actor);
@@ -493,6 +545,7 @@ impl Room {
                 self.peers.clear();
                 self.presence.clear();
                 self.receiving_edits.clear();
+                self.receiving_blobs.clear();
                 self.sending_proposal = None;
                 if matches!(self.mode, Mode::Guest { .. }) {
                     self.mode = Mode::Guest { ready: false, hello_sent: false };
@@ -504,6 +557,17 @@ impl Room {
 
     fn on_packet(&mut self, session: &mut Session, actor: ActorId, bytes: &[u8]) {
         if self.fatal {
+            return;
+        }
+        if attachments::is_part(bytes) {
+            if self.can_receive_edit(actor) {
+                let other: usize = self.receiving_blobs.iter().filter(|(a, _)| **a != actor).map(|(_, b)| b.reserved()).sum();
+                let allowance = designcraft_collab::artwork::MAX_ARTWORK_BYTES.saturating_sub(other);
+                if let Err(error) = self.receiving_blobs.entry(actor).or_default().append(bytes, allowance) {
+                    self.drop_transfer(actor);
+                    self.error = Some(error);
+                }
+            }
             return;
         }
         let Ok(packet) = serde_json::from_slice::<Packet>(bytes) else { return };
@@ -558,6 +622,7 @@ impl Room {
 
     fn drop_transfer(&mut self, actor: ActorId) {
         self.receiving_edits.remove(&actor);
+        self.receiving_blobs.remove(&actor);
         if matches!(self.mode, Mode::Guest { .. }) {
             self.mode = Mode::Guest { ready: false, hello_sent: false };
             self.error = Some("Requesting missing edits from the host.".into());
@@ -572,13 +637,27 @@ impl Room {
                     self.reply(actor, Message::Incompatible);
                 } else if let Mode::Host { delivery, .. } = &mut self.mode {
                     self.receiving_edits.remove(&actor);
-                    delivery.insert(actor, Delivery { sent: revision as usize, cursor: SendCursor::default(), announced: false });
+                    self.receiving_blobs.remove(&actor);
+                    delivery.insert(actor, Delivery { sent: revision as usize, cursor: SendCursor::default(), announced: false, receipt: None });
                 }
             }
-            Message::Propose(proposal) if self.serving(actor) => {
+            Message::Propose(mut proposal) if self.serving(actor) => {
                 let sequence = proposal.sequence;
-                if self.admit(session, actor, proposal).is_err() {
-                    self.reply(actor, Message::Declined { sequence });
+                let transfer = self.receiving_blobs.remove(&actor).unwrap_or_default();
+                let duplicate = self.history.iter().any(|(old, _)| old.actor == actor && old.proposal.sequence == sequence);
+                let uploaded = !duplicate && transfer.reserved() > 0 && proposal.history_action.is_none();
+                let validated = if duplicate {
+                    Ok(())
+                } else {
+                    self.check_artwork_budget(proposal.artwork_size()).and_then(|()| transfer.attach(&mut proposal, None))
+                };
+                if let Err(error) = validated.and_then(|()| self.admit(session, actor, proposal)) {
+                    self.reply(actor, Message::Declined { sequence, artwork_limit: error == attachments::ARTWORK_LIMIT });
+                } else if uploaded
+                    && let Mode::Host { delivery } = &mut self.mode
+                    && let Some(state) = delivery.get_mut(&actor)
+                {
+                    state.receipt = self.history.len().checked_sub(1);
                 }
             }
             Message::Presence { state, .. } if self.serving(actor) && state.is_valid() => {
@@ -591,7 +670,19 @@ impl Room {
 
     fn on_host_message(&mut self, session: &mut Session, message: Message) {
         match message {
-            Message::Commit(commit) => {
+            Message::ArtworkReceipt { revision, sequence, digest } => {
+                if revision > self.revision
+                    && let Err(error) = self.confirm_upload(session, revision, sequence, digest)
+                {
+                    self.stop_with_error(&error);
+                }
+            }
+            Message::Commit(mut commit) => {
+                if let Some(host) = self.host
+                    && let Err(error) = self.receiving_blobs.remove(&host).unwrap_or_default().attach(&mut commit.proposal, self.pending.as_ref())
+                {
+                    return self.stop_with_error(&error);
+                }
                 if commit.revision > self.revision {
                     if commit.revision != self.revision + 1 {
                         self.mode = Mode::Guest { ready: false, hello_sent: false };
@@ -614,13 +705,34 @@ impl Room {
                 self.error = None;
                 self.mode = Mode::Guest { ready: true, hello_sent: true };
             }
-            Message::Declined { sequence } => self.decline_pending(sequence),
+            Message::Declined { sequence, artwork_limit } => self.decline_pending(sequence, artwork_limit),
+            Message::RetryArtwork if self.pending.is_some() => {
+                self.sending_proposal = None;
+                self.last_send = None;
+            }
             Message::Presence { actor, state } if state.is_valid() && self.peers.contains_key(&actor) => {
                 self.presence.insert(actor, state);
             }
             Message::Incompatible => self.stop_with_error("Open the same saved document as the host and try again."),
             _ => {}
         }
+    }
+
+    fn confirm_upload(&mut self, session: &mut Session, revision: u64, sequence: u64, digest: [u8; 32]) -> Result<(), String> {
+        if revision == self.revision + 1
+            && let Some(local) = &self.local
+            && let Some(pending) = self.pending.as_ref().filter(|p| p.sequence == sequence)
+        {
+            let candidate = Commit { revision, actor: local.actor, proposal: pending.clone(), correction: None };
+            if encode_edit(Message::Commit(candidate.clone())).is_ok_and(|wire| wire.digest() == digest) {
+                return self.commit(session, candidate);
+            }
+        }
+        // A restarted or out-of-date guest may no longer own this exact pending
+        // proposal. A fresh Hello requests the complete commit and verified body.
+        self.mode = Mode::Guest { ready: false, hello_sent: false };
+        self.error = Some("Requesting missing edits from the host.".into());
+        Ok(())
     }
 
     fn stop_with_error(&mut self, error: &str) {
@@ -642,10 +754,20 @@ impl Room {
         match &mut self.mode {
             Mode::Host { delivery } => {
                 for (&actor, state) in delivery {
-                    for _ in 0..8 {
-                        let Some((_, wire)) = self.history.get(state.sent) else { break };
-                        match wire.send_next(&mut state.cursor, |frame| self.transport.send_to(actor, frame)) {
+                    for _ in 0..32 {
+                        let Some((commit, wire)) = self.history.get(state.sent) else { break };
+                        let sent = if state.receipt == Some(state.sent) {
+                            let receipt =
+                                Message::ArtworkReceipt { revision: commit.revision, sequence: commit.proposal.sequence, digest: wire.digest() };
+                            encode(receipt).and_then(|frame| self.transport.send_to(actor, frame)).map(|_| true)
+                        } else {
+                            wire.send_next(&mut state.cursor, |frame| self.transport.send_to(actor, frame))
+                        };
+                        match sent {
                             Ok(true) => {
+                                if state.receipt == Some(state.sent) {
+                                    state.receipt = None;
+                                }
                                 state.sent += 1;
                                 state.cursor = SendCursor::default();
                             }
@@ -705,6 +827,7 @@ impl Room {
         let proposal = Proposal { sequence: self.next_sequence, base: self.revision, edits, history_action };
         self.next_sequence = self.next_sequence.checked_add(1).ok_or("The shared room reached its edit limit.")?;
         let wire = encode_edit(Message::Propose(proposal.clone()))?;
+        self.check_artwork_budget(wire.artwork_size)?;
         if matches!(self.mode, Mode::Host { .. }) {
             self.admit(session, actor, proposal)
         } else if self.pending.is_none() {
@@ -776,7 +899,7 @@ impl Room {
         Ok(())
     }
 
-    fn decline_pending(&mut self, sequence: u64) {
+    fn decline_pending(&mut self, sequence: u64, artwork_limit: bool) {
         let Some(proposal) = self.pending.as_ref().filter(|proposal| proposal.sequence == sequence) else { return };
         let submitted = typing::submitted_typing(proposal);
         let comment = match proposal.edits.as_slice() {
@@ -795,13 +918,25 @@ impl Room {
             return;
         }
         self.rejected_comment = comment;
-        self.error = Some("The host could not accept this edit. The confirmed document is still open.".into());
+        self.error = Some(
+            if artwork_limit { attachments::ARTWORK_LIMIT } else { "The host could not accept this edit. The confirmed document is still open." }
+                .into(),
+        );
         self.preserve_rejected_typing(submitted);
+    }
+
+    fn check_artwork_budget(&self, next: u64) -> Result<(), String> {
+        let retained: u64 = self.history.iter().map(|(_, wire)| wire.artwork_size).sum();
+        if seed_document::artwork_size(&self.storage.seed) + retained + next > designcraft_collab::artwork::MAX_ARTWORK_BYTES as u64 {
+            return Err(attachments::ARTWORK_LIMIT.into());
+        }
+        Ok(())
     }
 
     fn commit(&mut self, session: &mut Session, commit: Commit) -> Result<(), String> {
         history::verify_text_compensation(&commit, self.history.iter().map(|(original, _)| original), &self.inverses)?;
         let bytes = encode_edit(Message::Commit(commit.clone()))?;
+        self.check_artwork_budget(bytes.artwork_size)?;
         if self.history.len() >= MAX_HISTORY || self.history_bytes.saturating_add(bytes.len()) > MAX_HISTORY_BYTES {
             return Err("The shared room reached its history limit.".into());
         }
@@ -821,6 +956,14 @@ impl Room {
         let acknowledged = self.matches_pending(&commit);
         let pending = if acknowledged { None } else { self.pending.as_ref() };
         self.storage.write(self.history.iter().map(|(c, _)| c).chain(std::iter::once(&commit)), pending, self.next_sequence)?;
+        #[cfg(unix)]
+        if let Some(journal) = &mut self.server_journal
+            && let Err(error) = journal.append(&commit)
+        {
+            let message = format!("Could not store the confirmed edit: {error}");
+            self.stop_with_error(&message);
+            return Err(message);
+        }
         let created_layer = (local_edit
             && self.layer_entry == Some((commit.proposal.sequence, st.active_layer))
             && matches!(commit.proposal.edits.as_slice(), [Operation::Layer { edit: LayerEdit::Create { .. } }]))

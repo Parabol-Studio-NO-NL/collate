@@ -9,14 +9,23 @@ use super::{
 use crate::cmd::links::{FileLink, give_placed};
 use crate::cmd::native_links::Pending;
 
-const MAX_SHARED_ARTWORK_BYTES: usize = 2 * 1024 * 1024;
-const SHARED_ARTWORK_LIMIT: &str = "a shared graphic can be at most 2 MiB";
+use designcraft_doc::MAX_SHARED_ARTWORK_BYTES;
+const SHARED_ARTWORK_LIMIT: &str = "a shared graphic can be at most 1 GiB";
 
 impl Session {
     /// Read the artwork for shared placement without exceeding the room's byte limit.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn read_shared_placement(path: &str) -> Result<Vec<u8>> {
-        let bytes = crate::io::read_capped(path, MAX_SHARED_ARTWORK_BYTES as u64).map_err(|error| EngineError::Other(error.to_string()))?;
+        use std::io::Read;
+        let Some((file, len)) = crate::io::open_regular(path.as_ref()).map_err(|e| EngineError::Other(e.to_string()))? else {
+            return Err(bad("file.place", "choose a regular artwork file"));
+        };
+        if len > MAX_SHARED_ARTWORK_BYTES as u64 {
+            return Err(bad("file.place", SHARED_ARTWORK_LIMIT));
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len as usize).map_err(|_| bad("file.place", "not enough memory for this artwork"))?;
+        file.take(MAX_SHARED_ARTWORK_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|e| EngineError::Other(e.to_string()))?;
         if bytes.len() > MAX_SHARED_ARTWORK_BYTES {
             return Err(bad("file.place", SHARED_ARTWORK_LIMIT));
         }
@@ -33,6 +42,8 @@ pub(super) fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(bad("file.place", SHARED_ARTWORK_LIMIT));
         }
         (base64_decode(b), str_param(p, "name").unwrap_or("image").to_string(), None)
+    } else if let Some(bytes) = s.take_shared_placement() {
+        (bytes, str_param(p, "name").unwrap_or("image").to_owned(), None)
     } else if let Some(path) = str_param(p, "path") {
         if !shared {
             before = crate::cmd::datamerge::fingerprint_from_path(path);

@@ -125,8 +125,12 @@ impl DesignApp {
 }
 
 fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, current_page: usize, history: [bool; 2]) -> Option<Action> {
-    if c.joining.is_some() {
-        ui.label(tr(lang, "Receiving the shared document…"));
+    if let Some(joining) = &c.joining {
+        if let Some(progress) = joining.artwork_progress() {
+            artwork_progress(ui, lang, progress);
+        } else {
+            ui.label(tr(lang, "Receiving the shared document…"));
+        }
         return ui.button(tr(lang, "Cancel")).clicked().then_some(Action::CancelDownload);
     }
     let Some(room) = c.room.as_mut() else {
@@ -165,7 +169,11 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
             _ => "Connecting…",
         }
     };
-    ui.label(tr(lang, status));
+    if let Some(progress) = room.artwork_progress().filter(|_| room.online && !room.fatal) {
+        artwork_progress(ui, lang, progress);
+    } else {
+        ui.label(tr(lang, status));
+    }
     if let Some(error) = &room.error {
         ui.label(tr(lang, error));
     }
@@ -233,6 +241,13 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         });
     }
     action
+}
+
+fn artwork_progress(ui: &mut Ui, lang: &str, progress: super::attachments::ArtworkProgress) {
+    let template = if progress.sending { "Sending artwork ({percent}%)" } else { "Receiving artwork ({percent}%)" };
+    let fraction = progress.bytes as f64 / progress.total.max(1) as f64;
+    let label = tr(lang, template).replace("{percent}", &((fraction * 100.0) as u32).to_string());
+    ui.add(egui::ProgressBar::new(fraction as f32).text(label));
 }
 
 fn comments(c: &mut Collaboration, st: &designcraft_engine::DocState, lang: &str, ui: &mut Ui, current_page: usize) -> Option<Action> {

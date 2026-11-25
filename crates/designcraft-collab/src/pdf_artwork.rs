@@ -10,9 +10,10 @@ use craft_pdf::syntax::{
 use designcraft_doc::{Asset, PdfCrop};
 use serde::{Deserialize, Serialize};
 
-use crate::artwork::{MAX_ARTWORK_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGE_SIDE, valid_dimensions};
+use crate::artwork::{MAX_IMAGE_PIXELS, MAX_IMAGE_SIDE, valid_dimensions};
 
 pub const PDF_MIME: &str = "application/pdf";
+const MAX_PDF_BYTES: usize = 512 * 1024 * 1024;
 const MAX_PDF_PAGES: usize = 128;
 const MAX_PDF_OBJECTS: usize = 16_384;
 const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
@@ -49,13 +50,13 @@ pub(crate) fn validate_crop(asset: &Asset, allow_pending: bool) -> Result<(), &'
 }
 
 pub(crate) fn inspect(bytes: &[u8], page: u32, verify_body: bool) -> Result<PdfPage, &'static str> {
-    if !bytes.starts_with(b"%PDF-") || bytes.len() > MAX_ARTWORK_BYTES {
+    if !bytes.starts_with(b"%PDF-") || bytes.len() > MAX_PDF_BYTES {
         return Err(INVALID);
     }
     // Apply the PDF backend's own limits while it parses xref streams. The
     // aggregate check below bounds the materialized streams in a room asset.
     let options = craft_pdf::OpenOptions {
-        max_input_bytes: MAX_ARTWORK_BYTES,
+        max_input_bytes: MAX_PDF_BYTES,
         decode_limits: DecodeLimits::default()
             .with_max_decoded_stream(MAX_STREAM_BYTES)
             .with_max_decoded_image(MAX_EXPANDED_BYTES as u64)

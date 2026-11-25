@@ -289,6 +289,20 @@ impl Operation {
         }
     }
 
+    pub fn placement(&self) -> Option<&Placement> {
+        match self {
+            Self::CreateGraphic { placement, .. } | Self::SetGraphic { placement: Some(placement), .. } => Some(placement),
+            _ => None,
+        }
+    }
+
+    pub fn placement_mut(&mut self) -> Option<&mut Placement> {
+        match self {
+            Self::CreateGraphic { placement, .. } | Self::SetGraphic { placement: Some(placement), .. } => Some(placement),
+            _ => None,
+        }
+    }
+
     pub fn changes_artwork(&self) -> bool {
         matches!(self, Self::CreateGraphic { .. } | Self::SetGraphic { .. })
     }

@@ -306,9 +306,13 @@ pub fn text_attrs(app: &mut DesignApp) -> Option<Value> {
 /// ends, and 0 with no document open.
 pub fn preflight_errors(app: &mut DesignApp, ctx: &egui::Context) -> Option<usize> {
     match crate::preflight_worker::issues(app, ctx) {
-        Some(issues) => Some(issues.iter().filter(|i| i.severity == "error").count()),
+        Some(issues) => Some(preflight_error_count(&issues)),
         None => app.session.active().is_none().then_some(0),
     }
+}
+
+pub(crate) fn preflight_error_count(issues: &[designcraft_engine::cmd::preflight::Issue]) -> usize {
+    issues.iter().filter(|i| i.severity == "error").count()
 }
 
 /// Height of one swatch-menu row.
