@@ -47,6 +47,7 @@ packaging/room-server
 crates/ui-egui/src/chrome/status_bar.rs	shared_font_notice(
 crates/engine/src/cmd/file/place.rs	MAX_SHARED_ARTWORK_BYTES
 crates/doc/src/lib.rs	pub const MAX_SHARED_ARTWORK_BYTES:
+crates/doc/src/assets.rs	pub fn compact_assets_with_hash(
 crates/ui-egui/src/app/files.rs	place_shared_bytes(
 crates/collab-core
 crates/designcraft-collab

@@ -1,7 +1,7 @@
 use designcraft_collab::{Operation, Replica};
 use designcraft_doc::Document;
 
-use super::{Commit, MAX_HISTORY_BYTES, Message, edit_wire::WireEdit, encode_edit, fingerprint};
+use super::{Commit, MAX_HISTORY_BYTES, Message, edit_wire::WireEdit, encode_edit, seed_document::Fingerprints};
 
 pub(super) struct RoomReplay {
     pub(super) document: Document,
@@ -12,11 +12,15 @@ pub(super) struct RoomReplay {
 }
 
 pub(super) fn restore(seed: &Document, opened: &Document, confirmed: Vec<Commit>) -> Result<RoomReplay, String> {
+    restore_cached(seed, opened, confirmed, &mut Fingerprints::default())
+}
+
+pub(super) fn restore_cached(seed: &Document, opened: &Document, confirmed: Vec<Commit>, cache: &mut Fingerprints) -> Result<RoomReplay, String> {
     if opened.created != seed.created {
         return Err("The saved document is from a different room copy. Open the original file to resume.".into());
     }
-    let opened_fingerprint = fingerprint(opened)?;
-    let mut found_opened = fingerprint(seed)? == opened_fingerprint;
+    let opened_fingerprint = cache.canonical(opened)?;
+    let mut found_opened = cache.canonical(seed)? == opened_fingerprint;
     let mut document = seed.clone();
     let mut replica = Replica::new(seed);
     let mut history = Vec::with_capacity(confirmed.len());
@@ -39,7 +43,7 @@ pub(super) fn restore(seed: &Document, opened: &Document, confirmed: Vec<Commit>
         replica.apply(&mut document, edits).map_err(|error| error.to_string())?;
         inverses.push(inverse);
         if !found_opened {
-            found_opened = fingerprint(&document)? == opened_fingerprint;
+            found_opened = cache.canonical(&document)? == opened_fingerprint;
         }
         history.push((commit, bytes));
     }

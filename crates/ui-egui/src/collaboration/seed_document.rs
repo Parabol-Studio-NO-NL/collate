@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[cfg(test)]
 use craft_image_codecs::Format;
@@ -62,24 +62,67 @@ pub(super) fn model_bytes(doc: &Document) -> Result<Vec<u8>, String> {
     Ok(output.0)
 }
 
-pub(super) fn fingerprint(doc: &Document) -> Result<[u8; 32], String> {
-    validate_model(doc)?;
-    let payloads = payloads(doc, false)?;
-    let mut normalized = doc.clone();
-    normalized.created = 0;
-    normalized.modified = 0;
-    normalized.font_scope = 0;
-    let model = model_bytes(&normalized)?;
-    let mut fingerprint = Sha256::new();
-    fingerprint.update(b"CoDesign native seed\0");
-    fingerprint.update((model.len() as u64).to_be_bytes());
-    fingerprint.update(model);
-    for (name, data) in payloads {
-        fingerprint.update((name.len() as u64).to_be_bytes());
-        fingerprint.update(name.as_bytes());
-        fingerprint.update(Sha256::digest(data));
+/// A weak owner pins the allocation identity without retaining the artwork's
+/// bytes. Replacing the data, even with the same length, gets a distinct entry.
+#[derive(Default)]
+pub(super) struct Fingerprints {
+    digests: BTreeMap<*const Vec<u8>, (Weak<Vec<u8>>, [u8; 32])>,
+    #[cfg(test)]
+    pub(super) bytes_hashed: u64,
+}
+
+impl Fingerprints {
+    fn digest(&mut self, body: &Arc<Vec<u8>>) -> [u8; 32] {
+        self.digests
+            .entry(Arc::as_ptr(body))
+            .or_insert_with(|| {
+                #[cfg(test)]
+                {
+                    self.bytes_hashed += body.len() as u64;
+                }
+                (Arc::downgrade(body), Sha256::digest(body.as_slice()).into())
+            })
+            .1
     }
-    Ok(fingerprint.finalize().into())
+
+    pub(super) fn canonical(&mut self, doc: &Document) -> Result<[u8; 32], String> {
+        let mut canonical = doc.clone();
+        canonical.compact_assets_with_hash(|asset| {
+            asset.data.embedded_bytes().map_or_else(
+                || asset.data.key().0,
+                |body| {
+                    let digest = self.digest(body);
+                    u64::from_be_bytes(std::array::from_fn(|i| digest[i]))
+                },
+            )
+        });
+        self.fingerprint(&canonical)
+    }
+
+    fn fingerprint(&mut self, doc: &Document) -> Result<[u8; 32], String> {
+        validate_model(doc)?;
+        let payloads = payloads(doc, false)?;
+        let mut normalized = doc.clone();
+        normalized.created = 0;
+        normalized.modified = 0;
+        normalized.font_scope = 0;
+        let model = model_bytes(&normalized)?;
+        let mut fingerprint = Sha256::new();
+        fingerprint.update(b"CoDesign native seed\0");
+        fingerprint.update((model.len() as u64).to_be_bytes());
+        fingerprint.update(model);
+        for (name, data) in payloads {
+            fingerprint.update((name.len() as u64).to_be_bytes());
+            fingerprint.update(name.as_bytes());
+            fingerprint.update(self.digest(data));
+        }
+        Ok(fingerprint.finalize().into())
+    }
+}
+
+#[cfg(test)]
+pub(super) fn fingerprint(doc: &Document) -> Result<[u8; 32], String> {
+    Fingerprints::default().fingerprint(doc)
 }
 
 const BUNDLE_MAGIC: &[u8] = b"Collate shared assets v1\n";
@@ -346,11 +389,11 @@ fn asset_name(directory: &str, id: u64, mime: &str) -> Result<String, String> {
     Ok(format!("{directory}/{id}.{extension}"))
 }
 
-fn payloads(doc: &Document, verify_image_body: bool) -> Result<Vec<(String, &[u8])>, String> {
+fn payloads(doc: &Document, verify_image_body: bool) -> Result<Vec<(String, &Arc<Vec<u8>>)>, String> {
     let mut entries = Vec::new();
     let mut pixels = 0u64;
     for asset in doc.assets.values() {
-        let data = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?.as_slice();
+        let data = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
         if data.len() > MAX_ARTWORK_BYTES {
             return Err(TOO_LARGE.into());
         }
@@ -368,7 +411,7 @@ fn payloads(doc: &Document, verify_image_body: bool) -> Result<Vec<(String, &[u8
         entries.push((asset_name("assets", asset.id.0, &asset.mime)?, data));
 
         if let Some(proxy) = &asset.proxy {
-            let data = proxy.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?.as_slice();
+            let data = proxy.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;
             if data.len() as u64 > MAX_PROXY_BYTES {
                 return Err(TOO_LARGE.into());
             }
@@ -393,7 +436,7 @@ pub(super) fn check_artwork(doc: &Document) -> Result<(), String> {
     payloads(doc, false).map(|_| ())
 }
 
-fn expanded_size(entries: &[(String, &[u8])]) -> u64 {
+fn expanded_size(entries: &[(String, &Arc<Vec<u8>>)]) -> u64 {
     entries.iter().map(|(_, data)| data.len() as u64).sum()
 }
 

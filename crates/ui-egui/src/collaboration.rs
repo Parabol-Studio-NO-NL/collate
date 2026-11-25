@@ -377,9 +377,7 @@ impl DesignApp {
 }
 
 fn fingerprint(doc: &Document) -> Result<[u8; 32], String> {
-    let mut canonical = doc.clone();
-    canonical.compact_assets();
-    seed_document::fingerprint(&canonical)
+    seed_document::Fingerprints::default().canonical(doc)
 }
 
 impl Room {

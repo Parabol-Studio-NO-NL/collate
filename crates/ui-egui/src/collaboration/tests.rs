@@ -168,10 +168,20 @@ fn live_placed_artwork_replicates_from_both_peers_and_replays_after_save() {
     host.run("file.saveAs", json!({"path": path})).unwrap();
     let mut reopened = DesignApp::new(Session::new(), Services::default());
     reopened.run("file.open", json!({"path": path})).unwrap();
-    let confirmed = room(&host).history.iter().map(|(commit, _)| commit.clone()).collect();
-    let restored = super::replay::restore(&seed, document(&reopened), confirmed).unwrap();
+    let confirmed: Vec<_> = room(&host).history.iter().map(|(commit, _)| commit.clone()).collect();
+    let mut cache = super::seed_document::Fingerprints::default();
+    let restored = super::replay::restore_cached(&seed, document(&reopened), confirmed.clone(), &mut cache).unwrap();
     assert_eq!(fingerprint(&restored.document).unwrap(), fingerprint(document(&host)).unwrap());
     assert_eq!(restored.document.assets[&expected_asset].data.embedded_bytes().unwrap().as_slice(), &second_image);
+    // Count each allocation once, including the compacted copy reopened from disk.
+    // The replayed buffers survive several checkpoints and the frame replacement.
+    let reopened_bytes = super::seed_document::artwork_size(document(&reopened));
+    assert_eq!(cache.bytes_hashed, reopened_bytes + (first_image.len() + second_image.len()) as u64);
+    let mut changed = document(&reopened).clone();
+    let mut altered = second_image.clone();
+    *altered.last_mut().unwrap() ^= 1;
+    std::sync::Arc::make_mut(changed.assets.get_mut(&expected_asset).unwrap()).data = designcraft_doc::AssetData::embedded(altered);
+    assert!(super::replay::restore_cached(&seed, &changed, confirmed, &mut cache).is_err(), "equal length cannot identify a checkpoint");
 }
 
 #[test]

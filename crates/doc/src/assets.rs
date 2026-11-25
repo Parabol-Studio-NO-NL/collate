@@ -383,10 +383,14 @@ impl Document {
     /// Merge assets holding the same file into the first of them (lowest id), rewriting the
     /// references; returns how many assets were removed.
     pub fn merge_duplicate_assets(&mut self) -> usize {
+        let state = std::collections::hash_map::RandomState::new();
+        self.merge_duplicate_assets_with(|asset| asset.bytes_hash(&state))
+    }
+
+    fn merge_duplicate_assets_with(&mut self, mut byte_hash: impl FnMut(&Asset) -> u64) -> usize {
         if !self.asset_refs(&mut |_| {}) {
             return 0;
         }
-        let fingerprint = std::collections::hash_map::RandomState::new();
         let mut hashes = HashMap::new();
         let mut reps: HashMap<_, Vec<&Arc<Asset>>> = HashMap::new();
         let mut map = HashMap::new();
@@ -396,7 +400,7 @@ impl Document {
             if a.data.is_empty() && a.link.is_none() {
                 continue;
             }
-            let hash = *hashes.entry(a.data.key()).or_insert_with(|| a.bytes_hash(&fingerprint));
+            let hash = *hashes.entry(a.data.key()).or_insert_with(|| byte_hash(a));
             let bucket = reps.entry((hash, a.mime.as_str(), a.page, a.link.as_deref())).or_default();
             // A fingerprint only selects candidates; equality still checks the actual file.
             match bucket.iter().find(|r| r.same_file(a)) {
@@ -413,7 +417,15 @@ impl Document {
 
     /// Merge duplicate assets and drop the ones nothing references (what a saved file holds).
     pub fn compact_assets(&mut self) {
-        self.merge_duplicate_assets();
+        let state = std::collections::hash_map::RandomState::new();
+        self.compact_assets_with_hash(|asset| asset.bytes_hash(&state));
+    }
+
+    /// Compact with reusable content hashes when comparing a sequence of document
+    /// revisions. Equal file bytes must produce equal hashes. Exact equality is
+    /// still checked before merging candidates.
+    pub fn compact_assets_with_hash(&mut self, byte_hash: impl FnMut(&Asset) -> u64) {
+        self.merge_duplicate_assets_with(byte_hash);
         let used = self.used_assets();
         self.assets.retain(|id, _| used.contains(id));
     }

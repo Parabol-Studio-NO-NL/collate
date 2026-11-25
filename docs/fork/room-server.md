@@ -22,7 +22,7 @@ In another terminal, copy the contents of `invitation.txt` inside the room direc
 
 The default listener uses UDP port 7337. The same-network setup works directly on a LAN or a routed VPN. For a public VPS, allow that UDP port in its firewall and the provider firewall. Add `--relay` to `serve` to enable Iroh’s default public discovery and encrypted relay fallback when a direct path is unavailable. The relay forwards traffic while the room state stays on your server. A static IP or a routable VPN address keeps existing invitations useful after restarts.
 
-Run one process per document with a separate private room directory. Set `COLLATE_ROOM_PORT` to another UDP port for each additional room. Keep the host awake and connected while editors need access. The server loads each room’s confirmed artwork into memory. Allow headroom beyond the document’s asset size for parsing, rendering validation, the protocol’s temporary transfer files and the operating system.
+Run one process per document with a separate private room directory. Set `COLLATE_ROOM_PORT` to another UDP port for each additional room. Keep the host awake and connected while editors need access. The server loads each room’s confirmed artwork into memory. On an Apple Silicon Mac, a blank room used about 20 MiB of resident memory. A test room with one 1 GiB PNG used about 1.02 GiB while listening and peaked at 2.51 GiB during native document import. The test image had small pixel dimensions. Larger decoded images and multiple rooms need additional headroom. Allow disk space for the room, incoming temporary files, exports and backups.
 
 ## Keep a room running on an office Mac
 

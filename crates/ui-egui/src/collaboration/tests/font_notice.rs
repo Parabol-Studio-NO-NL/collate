@@ -17,8 +17,10 @@ fn guest_sees_missing_fonts_on_join_and_after_peer_edits() {
     guest.collaboration.join_code = room(&host).invitation.clone().unwrap();
     guest.start_seed_download().unwrap();
     wait_for(&mut [&mut host, &mut guest], "guest receives seed", |apps| apps[1].collaboration.room.as_ref().is_some_and(Room::can_edit));
-    let mut h =
-        egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 400.0)).build_ui_state(|ui, guest| crate::chrome::status_bar(guest, ui), guest);
+    let mut h = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1000.0, 400.0))
+        .with_context_setup(|ctx| ctx.set_fonts(crate::theme::font_definitions(&[], "en")))
+        .build_ui_state(|ui, guest| crate::chrome::status_bar(guest, ui), guest);
     let notice = h.get_by_label("Missing fonts (1)");
     assert_eq!(notice.accesskit_node().live(), egui::accesskit::Live::Polite);
     notice.focus();
