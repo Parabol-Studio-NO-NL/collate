@@ -30,7 +30,7 @@ pub(super) struct FrameEntry {
 impl FrameEntry {
     pub(super) fn capture(sequence: u64, edit: &DeferredEdit, operations: &[Operation]) -> Option<Self> {
         let caret = edit.new_text_selection()?;
-        // The adapter allows a single story creation or conversion per proposal.
+        // Commands that enter a new text frame create or convert a single frame.
         let frame = operations.iter().find_map(Operation::new_text_frame)?.clone();
         Some(Self { sequence, frame, origin: edit.before_selection.clone(), anchor: caret.anchor, focus: caret.focus })
     }

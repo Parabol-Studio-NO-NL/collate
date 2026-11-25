@@ -26,6 +26,6 @@ The initial seed fingerprint covers normalized document metadata and the SHA-256
 
 PDF placements retain the original document bytes. The selected page, crop and normalized crop geometry travel separately, so another placement of the same PDF can reuse its bytes even if it shows a different page or crop. A room PDF can be up to 2 MiB, with up to 128 pages and 16,384 parsed objects. Admission rejects encrypted PDFs, checks decoded streams against per-stream and aggregate limits, and bounds page dimensions and embedded raster images.
 
-All participants need a build supporting protocol version 13 to share a room. Version 13 adds the three new patterns and the paragraph language, four line insets and near-flush threshold operations. Saved journals from versions 9 through 12 remain readable.
+All participants need a build supporting protocol version 14 to share a room. Version 14 lets clipboard pastes create multiple standalone frames in one transaction, including text frames with supported character and paragraph formatting. Paste into existing stories and placeholder fill use the same bounded text operations as typing. A story and a text batch have a limit of 16,384 atoms each. Saved journals from versions 9 through 13 remain readable.
 
 An encrypted recovery record belongs to the saved document's path. Save downloaded room documents to enable recovery. Use **Save a Copy** to create a standalone snapshot at another path without moving the active room's recovery record.

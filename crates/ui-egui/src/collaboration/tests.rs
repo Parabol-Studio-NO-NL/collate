@@ -551,7 +551,7 @@ fn remote_canvas_presence_moves_and_clears_without_editing_the_document() {
     wait_for_paint(&mut host, &mut guest, Event::PointerGone, None, false);
 }
 
-fn wait_for_layer_revision(host: &mut DesignApp, guest: &mut DesignApp, stage: &str, revision: u64) {
+fn wait_for_revision(host: &mut DesignApp, guest: &mut DesignApp, stage: &str, revision: u64) {
     wait_for(&mut [host, guest], stage, |apps| apps.iter().all(|app| room(app).revision == revision));
 }
 
@@ -571,7 +571,7 @@ fn concurrent_layers_keep_canonical_ids_and_peer_local_activation() {
     assert_eq!(host_draft, guest_draft, "both peers allocated the same draft ID");
     assert_eq!(host.session.doc().unwrap().active_layer, base);
     assert_eq!(guest.session.doc().unwrap().active_layer, base);
-    wait_for_layer_revision(&mut host, &mut guest, "both layers are confirmed", 2);
+    wait_for_revision(&mut host, &mut guest, "both layers are confirmed", 2);
     assert_eq!(document(&host), document(&guest));
     let artwork = document(&host).layers.iter().find(|layer| layer.name == "Artwork").unwrap().id;
     let proof = document(&guest).layers.iter().find(|layer| layer.name == "Proof").unwrap().id;
@@ -581,7 +581,7 @@ fn concurrent_layers_keep_canonical_ids_and_peer_local_activation() {
 
     host.run("frame.create", json!({"rect": [25, 35, 110, 125], "content": "unassigned"})).unwrap();
     guest.run("frame.create", json!({"rect": [150, 45, 220, 130], "content": "unassigned"})).unwrap();
-    wait_for_layer_revision(&mut host, &mut guest, "both drawings are confirmed", 4);
+    wait_for_revision(&mut host, &mut guest, "both drawings are confirmed", 4);
     assert_eq!(document(&host), document(&guest));
     let items = &document(&host).spreads[0].items;
     let artwork_frame = items.iter().find(|item| item.layer == artwork).unwrap().id;
@@ -590,26 +590,26 @@ fn concurrent_layers_keep_canonical_ids_and_peer_local_activation() {
     let proof_bounds = document(&guest).item(proof_frame).unwrap().bounds();
 
     host.run("layer.set", json!({"id": artwork.0, "name": "Locked artwork", "locked": true, "visible": false, "printable": false})).unwrap();
-    wait_for_layer_revision(&mut host, &mut guest, "layer options", 5);
+    wait_for_revision(&mut host, &mut guest, "layer options", 5);
     let received = document(&guest).layer(artwork).unwrap();
     assert_eq!(received.name, "Locked artwork");
     assert!(received.locked && !received.visible && !received.printable);
 
     guest.run("layer.move", json!({"id": proof.0, "to": 0})).unwrap();
-    wait_for_layer_revision(&mut host, &mut guest, "shared layer order", 6);
+    wait_for_revision(&mut host, &mut guest, "shared layer order", 6);
     assert_eq!(document(&host).layers[0].id, proof);
     assert_eq!(host.session.doc().unwrap().active_layer, artwork);
     assert_eq!(guest.session.doc().unwrap().active_layer, proof);
 
     guest.run("layer.new", json!({"name": "Spare"})).unwrap();
     guest.run("layer.activate", json!({"id": base.0})).unwrap();
-    wait_for_layer_revision(&mut host, &mut guest, "later local activation survives confirmation", 7);
+    wait_for_revision(&mut host, &mut guest, "later local activation survives confirmation", 7);
     let spare = document(&guest).layers.iter().find(|layer| layer.name == "Spare").unwrap().id;
     assert_eq!(guest.session.doc().unwrap().active_layer, base);
     guest.run("layer.activate", json!({"id": proof.0})).unwrap();
 
     host.run("layer.merge", json!({"ids": [proof.0, base.0], "into": base.0})).unwrap();
-    wait_for_layer_revision(&mut host, &mut guest, "layer merge", 8);
+    wait_for_revision(&mut host, &mut guest, "layer merge", 8);
     assert_eq!(guest.session.doc().unwrap().active_layer, spare);
     assert_eq!(room(&guest).replica.local_id(&proof_identity), Some(proof_frame));
     let moved = document(&guest).item(proof_frame).unwrap();
@@ -639,9 +639,9 @@ fn verify_layer_removal_and_copy(
             vec![Operation::CreateComment { id, anchor: CommentAnchor::Object(artwork_identity.clone()), text: "Art review".into() }],
         )
         .unwrap();
-    wait_for_layer_revision(host, guest, "layer artwork comment", 9);
+    wait_for_revision(host, guest, "layer artwork comment", 9);
     guest.run("layer.delete", json!({"id": artwork.0})).unwrap();
-    wait_for_layer_revision(host, guest, "occupied layer removal", 10);
+    wait_for_revision(host, guest, "occupied layer removal", 10);
     assert_eq!(host.session.doc().unwrap().active_layer, spare);
     assert_eq!(document(host), document(guest));
     for app in [&*host, &*guest] {
@@ -651,23 +651,23 @@ fn verify_layer_removal_and_copy(
     }
 
     host.run("layer.deleteUnused", json!({})).unwrap();
-    wait_for_layer_revision(host, guest, "clear empty layers", 11);
+    wait_for_revision(host, guest, "clear empty layers", 11);
     assert_eq!(host.session.doc().unwrap().active_layer, base);
     assert_eq!(guest.session.doc().unwrap().active_layer, base);
     assert_eq!(document(host), document(guest));
     assert_eq!(document(host).layers.len(), 1);
 
     guest.run("layer.new", json!({"name": "Overlay"})).unwrap();
-    wait_for_layer_revision(host, guest, "empty overlay", 12);
+    wait_for_revision(host, guest, "empty overlay", 12);
     let overlay = document(guest).layers[0].id;
     guest.run("layer.duplicate", json!({"id": overlay.0})).unwrap();
-    wait_for_layer_revision(host, guest, "duplicate an empty layer", 13);
+    wait_for_revision(host, guest, "duplicate an empty layer", 13);
     let copied = document(host).layers[0].id;
     assert_ne!(copied, overlay);
     assert_eq!(document(guest).layer(copied).unwrap().name, "Overlay copy");
     assert_eq!(guest.session.doc().unwrap().active_layer, copied);
     host.run("layer.others", json!({"id": base.0, "hide": true, "lock": true})).unwrap();
-    wait_for_layer_revision(host, guest, "hide and lock the other layers", 14);
+    wait_for_revision(host, guest, "hide and lock the other layers", 14);
     assert_eq!(document(host), document(guest));
     assert!(document(guest).layers.iter().filter(|layer| layer.id != base).all(|layer| layer.locked && !layer.visible));
 }
@@ -1022,6 +1022,84 @@ fn share_window_posts_and_reselects_text_without_editing_the_story() {
     assert_eq!(app.session.active().unwrap().selection.text.unwrap().range(), 1..5);
     assert_eq!(document(app).story(story).unwrap().text, text);
     assert_eq!(room(app).revision, 1);
+}
+
+#[test]
+fn shared_clipboard_and_placeholder_fill_reach_both_peers() {
+    let seed = Document::new(&NewDocument::default());
+    let mut host = editor(&seed, "Clipboard host");
+    let frame = host.run("frame.create", json!({"rect": [40, 40, 530, 660], "content": "text"})).unwrap();
+    let story = StoryId(frame["story"].as_u64().unwrap());
+    let shape = host.run("frame.create", json!({"rect": [100, 120, 160, 180], "shape": "ellipse"})).unwrap();
+    let shape = ItemId(shape["id"].as_u64().unwrap());
+    let styled = host.run("frame.create", json!({"rect": [100, 200, 300, 300], "content": "text", "text": "Styled copy"})).unwrap();
+    host.run("text.select", json!({"story": styled["story"], "anchor": 0, "focus": "Styled copy".len()})).unwrap();
+    host.run("type.char", json!({"attrs": {"size": 22}})).unwrap();
+    let seed = document(&host).clone();
+    let mut guest = editor(&seed, "Clipboard guest");
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "clipboard host starts", |apps| room(apps[0]).invitation.is_some() && room(apps[0]).can_edit());
+    join(&mut guest, room(&host).invitation.as_deref().unwrap());
+    wait_for(&mut [&mut host, &mut guest], "clipboard guest joins", |apps| room(apps[1]).can_edit());
+
+    guest.run("selection.set", json!({"ids": [frame["id"]]})).unwrap();
+    guest.run("type.fillWithPlaceholder", json!({})).unwrap();
+    assert_eq!(document(&guest), &seed);
+    wait_for_revision(&mut host, &mut guest, "placeholder fills the shared frame", 1);
+    let filler = &document(&host).story(story).unwrap().text;
+    assert!(filler.contains('\n'));
+
+    host.run("text.select", json!({"story": story.0, "anchor": 0, "focus": filler.len()})).unwrap();
+    let pasted = "Café and Ω.\r\n".repeat(120);
+    host.run("edit.paste", json!({"text": pasted})).unwrap();
+    wait_for_revision(&mut host, &mut guest, "clipboard text replaces the shared selection", 2);
+    let pasted = pasted.replace("\r\n", "\n");
+    assert_eq!(document(&guest).story(story).unwrap().text, pasted);
+    assert_eq!(host.session.doc().unwrap().selection.text.unwrap().focus, pasted.len());
+
+    host.run("selection.set", json!({"ids": [shape.0]})).unwrap();
+    host.run("edit.copy", json!({})).unwrap();
+    host.run("edit.pasteInPlace", json!({})).unwrap();
+    wait_for_revision(&mut host, &mut guest, "copied shape pastes in place", 3);
+    let [copy] = host.session.doc().unwrap().selection.items.as_slice() else { panic!("expected one pasted shape") };
+    assert_ne!(*copy, shape);
+    assert_eq!(document(&guest).item(*copy).unwrap().bounds(), seed.item(shape).unwrap().bounds());
+
+    guest.run("selection.set", json!({"ids": []})).unwrap();
+    guest.services.clipboard_text = Some(Box::new(|| Some("Text pasted onto a page".into())));
+    guest.run("edit.paste", json!({})).unwrap();
+    wait_for_revision(&mut host, &mut guest, "clipboard text creates a shared frame", 4);
+    assert!(document(&host).stories.values().any(|story| story.text == "Text pasted onto a page"));
+    let image = host
+        .run(
+            "edit.pasteImage",
+            json!({
+                "base64": designcraft_engine::cmd::base64_encode(&artwork_fixture(29)), "at": [100, 100]
+            }),
+        )
+        .unwrap();
+    wait_for_revision(&mut host, &mut guest, "clipboard image is shared", 5);
+    host.run("selection.set", json!({"ids": [image["id"], styled["id"], frame["id"]]})).unwrap();
+    host.run("edit.copy", json!({})).unwrap();
+    host.run("edit.paste", json!({})).unwrap();
+    wait_for_revision(&mut host, &mut guest, "mixed clipboard selection is shared", 6);
+    let selected = &host.session.doc().unwrap().selection.items;
+    assert_eq!(selected.len(), 3);
+    let copied: Vec<_> = selected.iter().map(|id| document(&guest).item(*id).unwrap()).collect();
+    assert!(copied.iter().any(|item| item.graphic().is_some()));
+    let copied_stories: Vec<_> =
+        copied.iter().filter_map(|item| item.text_frame()).map(|frame| document(&guest).story(frame.story).unwrap()).collect();
+    let original = seed.story(StoryId(styled["story"].as_u64().unwrap())).unwrap();
+    assert!(copied_stories.iter().any(|story| story.text == original.text && story.chars == original.chars));
+    assert!(copied_stories.iter().any(|story| story.text == pasted));
+
+    host.run("text.select", json!({"story": styled["story"], "anchor": 0, "focus": "Styled copy".len()})).unwrap();
+    host.run("edit.cut", json!({})).unwrap();
+    wait_for_revision(&mut host, &mut guest, "cut removes text from the shared story", 7);
+    host.run("edit.pasteWithoutFormatting", json!({})).unwrap();
+    wait_for_revision(&mut host, &mut guest, "paste without formatting restores the copied words", 8);
+    assert_eq!(document(&guest).story(original.id).unwrap().text, original.text);
+    assert_eq!(document(&host), document(&guest));
 }
 
 #[test]

@@ -7,8 +7,10 @@ use designcraft_doc::{
 };
 
 use crate::artwork::Placement;
-use crate::text::{AtomId, CaptureHint, TextEdit, TextReplica, TextSplice};
-use crate::{CommentAnchor, CommentReply, CommentThread, Error, MAX_OPERATIONS, Operation, ShapeFrame, SharedId, layers, pages, validation};
+use crate::text::{AtomId, CaptureHint, MAX_STORY_ATOMS, TextEdit, TextReplica, TextSplice, simple_text};
+use crate::{
+    CommentAnchor, CommentReply, CommentThread, Error, InitialTextFormat, MAX_OPERATIONS, Operation, ShapeFrame, SharedId, layers, pages, validation,
+};
 
 const MAX_ORDER_ITEMS: usize = 512;
 const MAX_THREADS: usize = 512;
@@ -255,6 +257,28 @@ impl Replica {
             .iter()
             .map(|(&original, shared)| Ok((replica.local_id(shared).ok_or(Error::UnknownObject)?, original)))
             .collect::<Result<_, Error>>()?;
+        // Canonical allocation can spend IDs differently from the clipboard, for example when
+        // a graphic reuses an existing asset. Map each new frame and its own story back to the draft.
+        let mut new_stories = Vec::new();
+        for op in ops {
+            let Operation::CreateText { id, .. } = op else { continue };
+            let canonical = replica.local_id(id).ok_or(Error::UnknownObject)?;
+            let draft = *local_ids.get(&canonical).ok_or(Error::UnknownObject)?;
+            let canonical_story = projected.item(canonical).and_then(Item::text_frame).ok_or(Error::UnknownResource)?.story;
+            let draft_story = after.item(draft).and_then(Item::text_frame).ok_or(Error::UnknownResource)?.story;
+            let mut story = projected.stories.remove(&canonical_story).ok_or(Error::UnknownResource)?;
+            let model = Arc::make_mut(&mut story);
+            model.id = draft_story;
+            model.rev = after.story(draft_story).ok_or(Error::UnknownResource)?.rev;
+            model.frames = vec![draft];
+            projected.item_mut(canonical).and_then(|item| item.text_frame_mut()).ok_or(Error::UnknownResource)?.story = draft_story;
+            new_stories.push((draft_story, story));
+        }
+        for (id, story) in new_stories {
+            if projected.stories.insert(id, story).is_some() {
+                return Err(Error::UnsupportedEdit);
+            }
+        }
         for spread in &mut projected.spreads {
             if spread.items.iter().any(|item| local_ids.contains_key(&item.id)) {
                 for item in &mut Arc::make_mut(spread).items {
@@ -368,15 +392,21 @@ impl Replica {
         {
             return Err(Error::UnsupportedEdit);
         }
-        if operations.iter().filter_map(Operation::new_text_frame).nth(1).is_some() {
-            return Err(Error::UnsupportedEdit);
-        }
         let mut updated_stories = BTreeSet::new();
         for op in operations {
             match op {
                 Operation::Create { id, spread, frame } => self.create(document, id, *spread, frame, None)?,
                 Operation::CreateGraphic { id, spread, frame, placement } => self.create(document, id, *spread, frame, Some(placement))?,
-                Operation::CreateText { id, spread, frame, text, vertical } => self.create_text(document, id, *spread, frame, text, *vertical)?,
+                Operation::CreateText { id, spread, frame, text, vertical, format } => {
+                    let story = self.create_text(document, id, *spread, frame, text, *vertical)?;
+                    if let Some(format) = format {
+                        let styles = document.styles.clone();
+                        let story = document.story_mut(story).ok_or(Error::UnknownResource)?;
+                        story.chars.clone_from(&format.chars);
+                        story.paras.clone_from(&format.paras);
+                        TextReplica::new(story, &styles)?;
+                    }
+                }
                 Operation::ConvertText { id } => self.convert_text(document, id)?,
                 Operation::Delete { id, spread } => self.delete(document, id, *spread, None)?,
                 Operation::DeleteText { id, spread, story } => self.delete(document, id, *spread, Some(*story))?,
@@ -471,12 +501,10 @@ impl Replica {
         frame: &ShapeFrame,
         text: &str,
         vertical: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<StoryId, Error> {
         self.check_new_id(id)?;
         validation::created_frame(document, frame)?;
-        if text.len() > 8 * 1024 || !crate::text::simple_text(text) {
-            return Err(Error::Invalid("initial story text"));
-        }
+        validate_initial_text(text)?;
         document.next_id.checked_add(2).ok_or(Error::Limit)?;
         let destination = spread_ref(document, spread)?;
         let rect = frame.geometry.path.bounds().ok_or(Error::Invalid("text frame"))?;
@@ -487,14 +515,14 @@ impl Replica {
         item.fill.clone_from(&frame.fill);
         item.stroke.clone_from(&frame.stroke);
         frame.appearance.apply(item);
-        let story = document.story_mut(story).ok_or(Error::UnknownResource)?;
         if vertical {
-            story.vertical = true;
-            story.rev = story.rev.wrapping_add(1);
+            let model = document.story_mut(story).ok_or(Error::UnknownResource)?;
+            model.vertical = true;
+            model.rev = model.rev.wrapping_add(1);
         }
         self.ids.insert(local, id.clone());
         self.items.insert(id.clone(), Some(local));
-        Ok(())
+        Ok(story)
     }
 
     fn convert_text(&self, document: &mut Document, id: &SharedId) -> Result<(), Error> {
@@ -657,6 +685,16 @@ impl Replica {
     }
 }
 
+fn validate_initial_text(text: &str) -> Result<(), Error> {
+    if text.len() > MAX_STORY_ATOMS * 4 || text.chars().count() > MAX_STORY_ATOMS {
+        return Err(Error::Limit);
+    }
+    if !simple_text(text) {
+        return Err(Error::Invalid("initial story text"));
+    }
+    Ok(())
+}
+
 fn capture_creation(before: &Document, after: &Document, item: &Item, id: SharedId, spread: SpreadId) -> Result<Operation, Error> {
     let frame = Box::new(ShapeFrame::from_item(item));
     match &item.content {
@@ -667,7 +705,14 @@ fn capture_creation(before: &Document, after: &Document, item: &Item, id: Shared
         }
         Content::Text(text) if before.story(text.story).is_none() => {
             let story = after.story(text.story).ok_or(Error::UnknownResource)?;
-            Ok(Operation::CreateText { id, spread, frame, text: story.text.clone(), vertical: story.vertical })
+            if story.frames != [item.id] {
+                return Err(Error::UnsupportedObject);
+            }
+            let default_para = ParaFormat { style: after.styles.default_paragraph.clone(), ..Default::default() };
+            let format =
+                (story.chars.len() != 1 || story.chars[0].format != Default::default() || story.paras.iter().any(|para| *para != default_para))
+                    .then(|| Box::new(InitialTextFormat { chars: story.chars.clone(), paras: story.paras.clone() }));
+            Ok(Operation::CreateText { id, spread, frame, text: story.text.clone(), vertical: story.vertical, format })
         }
         _ => Err(Error::UnsupportedObject),
     }

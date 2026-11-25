@@ -3,7 +3,7 @@ use std::mem::discriminant;
 use designcraft_doc::color::BlendMode;
 use designcraft_doc::geom::corners::CornerOptions;
 use designcraft_doc::geom::{Affine, PathData};
-use designcraft_doc::{Fill, Item, ItemId, LayerId, PageId, Shape, SpreadId, StoryId, Stroke};
+use designcraft_doc::{CharRun, Fill, Item, ItemId, LayerId, PageId, ParaFormat, Shape, SpreadId, StoryId, Stroke};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -192,25 +192,93 @@ pub struct CommentThread {
     pub resolved: bool,
 }
 
+/// Formatting of a new standalone text frame, validated by the same rules as story edits.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialTextFormat {
+    pub(crate) chars: Vec<CharRun>,
+    pub(crate) paras: Vec<ParaFormat>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
 pub enum Operation {
-    Create { id: SharedId, spread: SpreadId, frame: Box<ShapeFrame> },
-    CreateGraphic { id: SharedId, spread: SpreadId, frame: Box<ShapeFrame>, placement: Box<Placement> },
-    CreateText { id: SharedId, spread: SpreadId, frame: Box<ShapeFrame>, text: String, vertical: bool },
-    ConvertText { id: SharedId },
-    Delete { id: SharedId, spread: SpreadId },
-    DeleteText { id: SharedId, spread: SpreadId, story: StoryId },
-    Patch { id: SharedId, change: Change },
-    SetGraphic { id: SharedId, placement: Option<Box<Placement>> },
-    Reorder { spread: SpreadId, items: Vec<SharedId> },
-    Text { story: StoryId, actor: String, sequence: u64, edits: Vec<TextEdit> },
-    SetTextBatchActive { story: StoryId, actor: String, original_sequence: u64, active: bool },
-    Page { edit: PageEdit },
-    Layer { edit: LayerEdit },
-    CreateComment { id: SharedId, anchor: CommentAnchor, text: String },
-    Reply { thread: SharedId, id: SharedId, text: String },
-    SetResolved { thread: SharedId, resolved: bool },
+    Create {
+        id: SharedId,
+        spread: SpreadId,
+        frame: Box<ShapeFrame>,
+    },
+    CreateGraphic {
+        id: SharedId,
+        spread: SpreadId,
+        frame: Box<ShapeFrame>,
+        placement: Box<Placement>,
+    },
+    CreateText {
+        id: SharedId,
+        spread: SpreadId,
+        frame: Box<ShapeFrame>,
+        text: String,
+        vertical: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<Box<InitialTextFormat>>,
+    },
+    ConvertText {
+        id: SharedId,
+    },
+    Delete {
+        id: SharedId,
+        spread: SpreadId,
+    },
+    DeleteText {
+        id: SharedId,
+        spread: SpreadId,
+        story: StoryId,
+    },
+    Patch {
+        id: SharedId,
+        change: Change,
+    },
+    SetGraphic {
+        id: SharedId,
+        placement: Option<Box<Placement>>,
+    },
+    Reorder {
+        spread: SpreadId,
+        items: Vec<SharedId>,
+    },
+    Text {
+        story: StoryId,
+        actor: String,
+        sequence: u64,
+        edits: Vec<TextEdit>,
+    },
+    SetTextBatchActive {
+        story: StoryId,
+        actor: String,
+        original_sequence: u64,
+        active: bool,
+    },
+    Page {
+        edit: PageEdit,
+    },
+    Layer {
+        edit: LayerEdit,
+    },
+    CreateComment {
+        id: SharedId,
+        anchor: CommentAnchor,
+        text: String,
+    },
+    Reply {
+        thread: SharedId,
+        id: SharedId,
+        text: String,
+    },
+    SetResolved {
+        thread: SharedId,
+        resolved: bool,
+    },
 }
 
 impl Operation {
