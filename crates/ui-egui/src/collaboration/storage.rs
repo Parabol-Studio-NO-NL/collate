@@ -364,7 +364,8 @@ pub(super) fn verify_legacy_room_protocol_fallback(root: &Path) -> Result<(), St
     assert_eq!(selected.protocol, RoomProtocol::Legacy);
     assert_eq!(selected.identity().actor(), legacy_actor);
     assert!(saved.pending.is_empty());
-    assert!(!directory.join(journal_directory(RoomProtocol::Automerge)).exists());
+    let unused = directory.join(journal_directory(RoomProtocol::Automerge));
+    assert!(matches!(designcraft_engine::io::metadata(unused), Err(error) if error.kind() == std::io::ErrorKind::NotFound));
     drop(selected);
 
     let (automerge, _) = open(Some(RoomProtocol::Automerge))?;

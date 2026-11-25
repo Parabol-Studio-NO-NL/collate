@@ -1638,6 +1638,8 @@ mod book;
 mod embedded_link;
 mod font_notice;
 #[cfg(feature = "automerge-rooms")]
+mod linked_copy;
+#[cfg(feature = "automerge-rooms")]
 mod optimistic;
 mod seed_artwork;
 #[cfg(feature = "automerge-rooms")]

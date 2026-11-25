@@ -5,13 +5,12 @@
 //! operations on an artwork worker because files may be hydrated by a sync client.
 
 use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use designcraft_collab::artwork::BlobId;
-use designcraft_engine::{file_access, io as engine_io};
+use designcraft_engine::io as engine_io;
 use sha2::{Digest, Sha256};
 
 const DIRECTORY: &str = ".collate-artwork-v1";
@@ -27,7 +26,7 @@ impl SharedArtworkFolder {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Choose an absolute shared artwork folder."));
         }
         let root = engine_io::canonicalize(root)?;
-        if !engine_io::metadata(&root)?.is_dir() {
+        if !engine_io::Metadata::is_dir(&engine_io::metadata(&root)?) {
             return Err(io::Error::from(io::ErrorKind::NotADirectory));
         }
         Ok(Self { root })
@@ -53,24 +52,9 @@ impl SharedArtworkFolder {
         }
         let directory = self.directory(true)?.ok_or(io::ErrorKind::NotFound)?;
         let target = directory.join(blob_name(id));
-        file_access::check_write(&target).map_err(permission_error)?;
-        match fs::symlink_metadata(&target) {
-            Ok(_) => return check_existing(&target, id),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-
-        let mut stage = tempfile::Builder::new().prefix(".incoming-").tempfile_in(&directory)?;
-        stage.write_all(bytes)?;
-        stage.as_file().sync_all()?;
-        match stage.persist_noclobber(&target) {
-            Ok(_) => {
-                #[cfg(unix)]
-                File::open(directory)?.sync_all()?;
-                Ok(())
-            }
-            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => check_existing(&target, id),
-            Err(error) => Err(error.error),
+        match engine_io::write_new_private(&target, bytes) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => check_existing(&target, id),
+            result => result,
         }
     }
 
@@ -80,32 +64,20 @@ impl SharedArtworkFolder {
             if engine_io::canonicalize(&self.root)? != self.root {
                 return Err(permission_error("The configured artwork folder has moved."));
             }
-            file_access::check_write(&directory).map_err(permission_error)?;
-            match create_private_directory(&directory) {
+            match engine_io::create_private_dir(&directory) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
             }
         }
 
-        file_access::check_read(&directory).map_err(permission_error)?;
-        match fs::symlink_metadata(&directory) {
-            Ok(meta) if meta.is_dir() && engine_io::canonicalize(&directory)? == directory => Ok(Some(directory)),
+        match engine_io::symlink_metadata(&directory) {
+            Ok(meta) if engine_io::Metadata::is_dir(&meta) && engine_io::canonicalize(&directory)? == directory => Ok(Some(directory)),
             Ok(_) => Err(permission_error("The Collate artwork folder must be a regular local directory.")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }
-}
-
-fn create_private_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(path)
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(path)
 }
 
 fn blob_name(id: BlobId) -> String {
@@ -124,27 +96,11 @@ fn matches_blob(id: BlobId, bytes: &[u8]) -> bool {
     bytes.len() == id.length as usize && <[u8; 32]>::from(Sha256::digest(bytes)) == id.digest
 }
 
-fn open_blob(path: &Path, id: BlobId) -> io::Result<Option<File>> {
-    file_access::check_read(path).map_err(permission_error)?;
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() && meta.len() == u64::from(id.length) => {}
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+fn open_blob(path: &Path, id: BlobId) -> io::Result<Option<engine_io::File>> {
+    match engine_io::open_canonical_file_with_length(path, u64::from(id.length)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        result => result,
     }
-    match engine_io::canonicalize(path) {
-        Ok(canonical) if canonical == path => {}
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    }
-    let file = match engine_io::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let meta = file.metadata()?;
-    Ok((meta.is_file() && meta.len() == u64::from(id.length)).then_some(file))
 }
 
 fn check_existing(path: &Path, id: BlobId) -> io::Result<()> {
@@ -170,6 +126,7 @@ fn check_existing(path: &Path, id: BlobId) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Barrier;
 
     use super::*;

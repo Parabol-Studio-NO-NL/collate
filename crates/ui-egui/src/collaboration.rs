@@ -5,6 +5,7 @@ mod controls;
 mod edit_wire;
 mod history;
 mod join;
+mod linked_copy;
 mod presence;
 mod replay;
 mod seed;
@@ -220,10 +221,11 @@ pub(crate) struct Collaboration {
     pub(crate) open: bool,
     name: String,
     join_code: String,
-    relay: bool,
+    relay: Option<bool>,
     artwork_folder: Option<PathBuf>,
     room: Option<Room>,
     joining: Option<PendingJoin>,
+    linked_copy: Option<linked_copy::CopyResult>,
     message: Option<String>,
     room_conflict: Option<RoomConflict>,
     comment: String,
@@ -234,6 +236,7 @@ pub(crate) struct Collaboration {
 
 impl DesignApp {
     pub(crate) fn poll_collaboration(&mut self, ctx: &egui::Context) {
+        self.poll_linked_copy(ctx);
         self.poll_seed_download(ctx);
         let Some(room) = self.collaboration.room.as_mut() else { return };
         let Some(st) = self.session.documents().iter().find(|st| st.uid == room.doc_uid) else {
@@ -508,7 +511,7 @@ impl DesignApp {
         let (transport, mode) = if let Some((_, ticket)) = invitation {
             (Transport::join_with_identity(ticket, &c.name, storage.identity())?, Mode::Guest { ready: false, hello_sent: false })
         } else {
-            (Transport::host_with_identity(&c.name, c.relay, storage.identity())?, Mode::Host { delivery: BTreeMap::new() })
+            (Transport::host_with_identity(&c.name, c.relay.unwrap_or(false), storage.identity())?, Mode::Host { delivery: BTreeMap::new() })
         };
         if !matches!(room, OpenRoom::NewHost(_)) {
             storage.write(recovered.history.iter().map(|(commit, _)| commit), &saved.pending, saved.next_sequence)?;

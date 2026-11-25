@@ -606,6 +606,20 @@ pub(super) fn prepare_local_copy(doc: &mut Document) -> Result<(), String> {
 }
 
 fn validate_model(doc: &Document, protocol: RoomProtocol) -> Result<(), String> {
+    validate_document_structure(doc, protocol)?;
+    for (&id, asset) in &doc.assets {
+        if id != asset.id {
+            return Err(INVALID.into());
+        }
+        if has_external_bytes(asset) || has_link_provenance(asset) {
+            return Err(UNSUPPORTED_LINKS.into());
+        }
+        validate_asset_metadata(asset)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_document_structure(doc: &Document, protocol: RoomProtocol) -> Result<(), String> {
     if doc.assets.len() > max_assets(protocol) {
         return Err(TOO_LARGE.into());
     }
@@ -618,15 +632,6 @@ fn validate_model(doc: &Document, protocol: RoomProtocol) -> Result<(), String> 
     }
     if !doc.data_merge.is_empty() || has_linked_story(doc) {
         return Err(UNSUPPORTED_LINKS.into());
-    }
-    for (&id, asset) in &doc.assets {
-        if id != asset.id {
-            return Err(INVALID.into());
-        }
-        if has_external_bytes(asset) || has_link_provenance(asset) {
-            return Err(UNSUPPORTED_LINKS.into());
-        }
-        validate_asset_metadata(asset)?;
     }
     Ok(())
 }

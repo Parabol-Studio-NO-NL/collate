@@ -6,12 +6,13 @@ use designcraft_engine::Session;
 use egui::{Button, Context, TextEdit, Ui, Window};
 use serde_json::json;
 
-use super::{Collaboration, Mode, Room, history::HistoryAction, presence};
+use super::{Collaboration, Mode, Room, history::HistoryAction, linked_copy, presence};
 use crate::{DesignApp, app::file_dialogs::Bound, i18n::tr};
 
 enum Action {
     Connect(bool),
     StartNewRoom,
+    ShareLinkedCopy,
     OpenSavedRoomCopy,
     ReceiveSeed,
     CancelDownload,
@@ -50,6 +51,11 @@ impl DesignApp {
             }
             Some(Action::StartNewRoom) => {
                 if let Err(error) = self.start_new_room_from_current() {
+                    self.collaboration.message = Some(error);
+                }
+            }
+            Some(Action::ShareLinkedCopy) => {
+                if let Err(error) = self.ask_share_linked_copy() {
                     self.collaboration.message = Some(error);
                 }
             }
@@ -150,6 +156,11 @@ impl DesignApp {
 }
 
 fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, current_page: usize, history: [bool; 2]) -> Option<Action> {
+    if c.linked_copy.is_some() {
+        let message = ui.label(tr(lang, "Preparing the shared copy…"));
+        ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
+        return None;
+    }
     if let Some(joining) = &c.joining {
         if let Some(progress) = joining.artwork_progress() {
             artwork_progress(ui, lang, progress);
@@ -162,7 +173,8 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         ui.label(tr(lang, "Open a saved document to host a room, or use an invitation to join."));
         ui.label(tr(lang, "Your name"));
         ui.add(TextEdit::singleline(&mut c.name).char_limit(60).hint_text(tr(lang, "Your name")));
-        ui.checkbox(&mut c.relay, tr(lang, "Allow internet relay"));
+        let relay = c.relay.get_or_insert(RoomProtocol::CURRENT.is_automerge());
+        ui.checkbox(relay, tr(lang, "Allow internet relay"));
         let folder = if RoomProtocol::Automerge.is_supported() { show_artwork_folder(c, lang, ui) } else { None };
         let has_name = !c.name.trim().is_empty();
         let has_document = session.active().is_some();
@@ -184,7 +196,13 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
                 None
             }
         } else {
-            let host = ui.add_enabled(has_name && has_document, Button::new(tr(lang, "Start sharing"))).clicked().then_some(Action::Connect(true));
+            let (label, action) =
+                if RoomProtocol::Automerge.is_supported() && session.active().is_some_and(|state| linked_copy::has_linked_artwork(&state.doc)) {
+                    ("Share a copy with artwork…", Action::ShareLinkedCopy)
+                } else {
+                    ("Start sharing", Action::Connect(true))
+                };
+            let host = ui.add_enabled(has_name && has_document, room_button(lang, label)).clicked().then_some(action);
             if cfg!(target_os = "macos") && session.recovery_dir.is_some() && session.active().is_some_and(|state| state.path.is_some()) {
                 let recovery = ui.collapsing(tr(lang, "Room recovery"), |ui| ui.add(room_button(lang, "Open saved room copy")).clicked());
                 if recovery.body_returned == Some(true) { Some(Action::OpenSavedRoomCopy) } else { host }
@@ -286,7 +304,7 @@ fn show_artwork_folder(c: &Collaboration, lang: &str, ui: &mut Ui) -> Option<Act
         ui.label(tr(lang, "Choose the same synced folder on each computer to share large originals."));
         if let Some(path) = &c.artwork_folder {
             let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-            let selected = tr(lang, "Selected folder: {name}").replace("{name}", &name);
+            let selected = tr(lang, "Using {name}").replace("{name}", &name);
             let message = ui.label(selected);
             ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
         }

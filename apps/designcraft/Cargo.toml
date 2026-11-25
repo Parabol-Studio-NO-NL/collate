@@ -8,6 +8,7 @@ publish = false
 default-run = "designcraft"
 
 [features]
+default = ["automerge-rooms"]
 automerge-rooms = ["designcraft-ui-egui/automerge-rooms"]
 sparkle = ["dep:sparkle-updater", "objc2-app-kit/NSApplication", "objc2-foundation/NSBundle"]
 

@@ -9,7 +9,7 @@
 //! it asks for the bytes.
 
 pub use craft_docpath::Refused;
-pub use std::fs::Metadata;
+pub use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
 
 /// The path to open for a path stored in a document (a link, a data source, a book chapter),
@@ -144,6 +144,19 @@ pub fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     open_read(path)
 }
 
+/// Open a regular file of the expected length at a canonical path without accepting links.
+/// Check the path, then the opened handle, before handing its contents to the caller.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn open_canonical_file_with_length(path: &Path, length: u64) -> std::io::Result<Option<File>> {
+    let meta = symlink_metadata(path)?;
+    if !meta.is_file() || meta.len() != length || std::fs::canonicalize(path)? != path {
+        return Ok(None);
+    }
+    let file = open_read(path)?;
+    let meta = file.metadata()?;
+    Ok((meta.is_file() && meta.len() == length).then_some(file))
+}
+
 /// The text of the file at `path`, inside the automation read root when there is one.
 pub fn read_to_string(path: impl AsRef<Path>) -> Result<String, String> {
     let path = path.as_ref();
@@ -158,6 +171,46 @@ pub fn create_dir_all(path: impl AsRef<Path>) -> Result<(), String> {
     let path = path.as_ref();
     crate::file_access::check_write(path)?;
     std::fs::create_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Create one private directory, inside the automation write root when there is one.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn create_private_dir(path: impl AsRef<Path>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    touch(path);
+    crate::file_access::check_write(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir(path)
+}
+
+/// Publish a complete private file inside the write root without replacing an existing entry.
+/// A same-directory stage keeps partial content off the destination, including on collision.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_new_private(path: impl AsRef<Path>, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::{self, Write as _};
+
+    let path = path.as_ref();
+    touch(path);
+    crate::file_access::check_write(path).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let directory = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let mut stage = tempfile::Builder::new().prefix(".incoming-").tempfile_in(directory)?;
+    stage.write_all(bytes)?;
+    stage.as_file().sync_all()?;
+    stage.persist_noclobber(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    let _ = File::open(directory).and_then(|directory| directory.sync_all());
+    Ok(())
 }
 
 /// Write `bytes` to the file at `path`, inside the automation write root when there is one.
@@ -210,6 +263,16 @@ pub fn metadata(path: impl AsRef<Path>) -> std::io::Result<Metadata> {
     touch(path);
     crate::file_access::check_read(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     std::fs::metadata(path)
+}
+
+/// What the file system says about the directory entry itself, inside the read root.
+/// The final link is reported as a link instead of reading its target's metadata.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn symlink_metadata(path: impl AsRef<Path>) -> std::io::Result<Metadata> {
+    let path = path.as_ref();
+    touch(path);
+    crate::file_access::check_read(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    std::fs::symlink_metadata(path)
 }
 
 /// [`metadata`] of the regular file at `path`: `None` when there is none automation may read.

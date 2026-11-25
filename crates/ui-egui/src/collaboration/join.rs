@@ -6,6 +6,7 @@ use std::time::Duration;
 use designcraft_collab::{RoomProtocol, artwork::BlobId};
 use designcraft_collab_core::{ActorId, Event, Identity, Peer, Session as Transport};
 use designcraft_doc::{Asset, Document};
+use designcraft_engine::file_access;
 use web_time::Instant;
 
 use super::attachments::{self, BlobCursor, BlobDownload, Blobs};
@@ -258,11 +259,13 @@ impl OriginalDownloads {
         }
         self.checked_folder = Some(id);
         let folder = folder.to_path_buf();
+        let roots = file_access::current();
         let (sender, result) = mpsc::sync_channel(1);
         if std::thread::Builder::new()
             .name("collate-shared-artwork".into())
             .spawn(move || {
-                let body = SharedArtworkFolder::open(&folder).and_then(|folder| folder.load(id)).ok().flatten();
+                let body =
+                    file_access::confine(roots.as_ref(), || SharedArtworkFolder::open(&folder).and_then(|folder| folder.load(id)).ok().flatten());
                 let _ = sender.send(body.filter(|bytes| seed_document::verify_original(&asset, bytes).is_ok()));
             })
             .is_err()
@@ -351,6 +354,7 @@ impl SeedDelivery {
             if protocol.is_automerge() && seed_document::use_preview_seed(document) {
                 let document = document.clone();
                 let artwork_folder = artwork_folder.map(Path::to_path_buf);
+                let roots = file_access::current();
                 let (sender, receiver) = mpsc::sync_channel(1);
                 std::thread::Builder::new()
                     .name("collate-room-previews".into())
@@ -359,11 +363,14 @@ impl SeedDelivery {
                         let originals = artwork_folder.as_ref().and_then(|_| preview.as_ref().ok()).map(|preview| preview.originals.clone());
                         if sender.send(preview).is_ok()
                             && let (Some(path), Some(originals)) = (artwork_folder, originals)
-                            && let Ok(folder) = SharedArtworkFolder::open(&path)
                         {
-                            for (id, original) in originals {
-                                let _ = folder.publish(id, &original);
-                            }
+                            file_access::confine(roots.as_ref(), || {
+                                if let Ok(folder) = SharedArtworkFolder::open(&path) {
+                                    for (id, original) in originals {
+                                        let _ = folder.publish(id, &original);
+                                    }
+                                }
+                            });
                         }
                     })
                     .map_err(|_| "Could not prepare the room previews.")?;

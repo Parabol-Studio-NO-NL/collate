@@ -16,7 +16,7 @@ room="$HOME/Collate Studio Room"
 
 Omit the document path to create a blank room. Import reads the original once. For linked artwork, first use **Embed** in Collate’s Links panel and save the document. Import removes the local source paths from the server’s copy. The room holds the working copy from then on.
 
-Build with `--features automerge-rooms` to initialize a protocol 17 room. Use a compatible desktop build to join it. The same build opens existing protocol 15 room directories and serves them in their original protocol.
+The server initializes new rooms with protocol 17. Use an updated desktop build to join them. The same server opens existing protocol 15 room directories and serves them in their original protocol.
 
 In another terminal, copy the contents of `invitation.txt` inside the room directory. On macOS, run `pbcopy < "$HOME/Collate Studio Room/invitation.txt"`. Choose **Join shared document…** on Collate’s Home screen and paste the invitation. Use a second Collate instance or another computer to test simultaneous edits. For a second macOS instance run `open -n -a Collate`. Anyone with the invitation can join and edit, so send it privately.
 

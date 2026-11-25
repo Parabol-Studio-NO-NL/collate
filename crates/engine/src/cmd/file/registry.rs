@@ -50,7 +50,7 @@ pub fn specs() -> Vec<CommandSpec> {
         }),
         cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?} — a `path` without the .designcraft extension gets it → {path: the file written, bytes}", has_doc, file_save),
         cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path} — a path without the .designcraft extension gets it → {path: the file written, bytes}", has_doc, file_save),
-        cmd!(noundo "file.saveACopy", "Save a Copy…", ["File"], None, "{path, embedLinks?: copy every linked file in (fails when one is missing or changed)} — writes the document without changing which file it is or its unsaved state; a path without the .designcraft extension gets it → {path: the file written, bytes, warnings}", has_doc, file_save_a_copy),
+        cmd!(noundo "file.saveACopy", "Save a Copy…", ["File"], None, "{path, embedLinks?: copy every linked file in, verifiedLinks?: embed current verified originals into a new file and remove local artwork links} — writes the document without changing which file it is or its unsaved state; a path without the .designcraft extension gets it → {path: the file written, bytes, warnings}", has_doc, file_save_a_copy),
         cmd!(noundo "file.revert", "Revert", ["File"], None, "{} — back to the last saved version (not undoable)", can_revert, file_revert),
         cmd!(query "file.recovery.list", "Recovery Data", [], None, "{dir?} → [{uid, path, title, saved}] unsaved documents left by a crash (default: the session's recovery folder)", always, |s, p| {
             let dir = recovery_dir(s, p, FolderAccess::Read)?;
