@@ -35,6 +35,47 @@ fn a_preview_seed_keeps_the_original_fingerprint_with_multiple_native_proxies() 
 
 #[cfg(feature = "automerge-rooms")]
 #[test]
+fn many_individually_small_originals_open_as_bounded_raster_previews() {
+    use crate::collaboration::seed_document::{preview_seed, restore_preview_seed, use_preview_seed, verify_original};
+
+    let (mut seed, icon, _) = embedded_image_fixture();
+    let side = 72;
+    // Reuse the synthetic illustration generator from the book fixture.
+    for number in 1..=80 {
+        let id = AssetId(seed.alloc());
+        let asset = designcraft_doc::Asset {
+            id,
+            name: format!("Book illustration {number}.png"),
+            mime: "image/png".into(),
+            data: AssetData::embedded(artwork_fixture_with_side(number, side)),
+            pixels: Some((side, side)),
+            ..Default::default()
+        };
+        seed.assets.insert(id, Arc::new(asset));
+    }
+
+    assert!(use_preview_seed(&seed));
+    let mut preview = preview_seed(&seed).unwrap();
+    let original_bytes: u64 = seed.assets.values().map(|asset| asset.data.len()).sum();
+    let eager_bytes: usize = preview.eager.values().map(|bytes| bytes.len()).sum();
+    assert!((eager_bytes as u64) < original_bytes / 2);
+    let (partial, originals) = restore_preview_seed(&preview.archive, |id| Ok(preview.eager.remove(&id).unwrap())).unwrap();
+    assert_eq!(partial.assets[&icon], seed.assets[&icon]);
+    assert_eq!(originals.len(), seed.assets.len() - 1);
+    assert_eq!(fingerprint(&partial).unwrap(), fingerprint(&seed).unwrap());
+
+    for (id, targets) in originals {
+        let bytes = &preview.originals[&id];
+        for target in targets {
+            verify_original(&target, bytes).unwrap();
+            assert!(target.data.install_verified_original(bytes.clone()));
+        }
+    }
+    assert_eq!(partial, seed);
+}
+
+#[cfg(feature = "automerge-rooms")]
+#[test]
 fn a_guest_edits_from_previews_before_the_verified_original_is_available() {
     let (mut seed, asset, _) = embedded_image_fixture();
     let bytes = artwork_fixture_with_side(781, 720);

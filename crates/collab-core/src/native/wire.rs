@@ -17,7 +17,10 @@ const APP_LINK: &str = "codesign-collab://join#";
 const MAX_INVITATION: usize = 4096;
 const MAX_FRAME: usize = 64 * 1024;
 pub(super) const MAX_TICKET_ADDRESSES: usize = 16;
-pub(super) const IO_TIMEOUT: Duration = Duration::from_secs(12);
+/// Bound connection setup and admission before a peer can use the room stream.
+pub(super) const ADMISSION_TIMEOUT: Duration = Duration::from_secs(12);
+/// Keep an admitted stream alive through brief relay throttling or artwork backpressure.
+pub(super) const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Ticket {
@@ -118,9 +121,9 @@ pub(super) async fn read<T: serde::de::DeserializeOwned>(input: &mut Input) -> R
     decode(&frame)
 }
 
-pub(super) async fn write(output: &mut Output, value: &impl Serialize) -> Result<(), String> {
+pub(super) async fn write(output: &mut Output, value: &impl Serialize, deadline: Duration) -> Result<(), String> {
     let data = encode(value)?;
-    timeout(IO_TIMEOUT, output.send(data.as_slice()))
+    timeout(deadline, output.send(data.as_slice()))
         .await
         .map_err(|_| "The peer stopped accepting messages.")?
         .map_err(|_| "The peer connection closed.".into())

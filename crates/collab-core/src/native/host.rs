@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{ActorId, Peer};
 
 use super::{Event, MAX_GUESTS, MAX_PAYLOAD, QUEUE_CAPACITY, Worker, actor, wire};
-use wire::{Admit, FromHost, Hello, IO_TIMEOUT, MAX_TICKET_ADDRESSES, Ticket};
+use wire::{ADMISSION_TIMEOUT, Admit, FromHost, Hello, MAX_TICKET_ADDRESSES, Ticket, WRITE_STALL_TIMEOUT};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct ConnectionKey {
@@ -188,7 +188,7 @@ impl Room {
 }
 
 async fn serve(incoming: Incoming, access: [u8; 32], host: mpsc::Sender<Request>) -> Option<ConnectionKey> {
-    let acknowledged = timeout(IO_TIMEOUT, async {
+    let acknowledged = timeout(ADMISSION_TIMEOUT, async {
         let connection = incoming.await.ok()?;
         let (mut output, mut input) = wire::framed(connection.accept_bi().await.ok()?);
         let hello: Hello = wire::read(&mut input).await.ok()?;
@@ -211,7 +211,7 @@ async fn serve(incoming: Incoming, access: [u8; 32], host: mpsc::Sender<Request>
     host.send(Request::Admit(seat, reply)).await.ok()?;
     match admission.await.ok()? {
         welcome @ Admit::Welcome { .. } => {
-            if wire::write(&mut output, &welcome).await.is_ok() {
+            if wire::write(&mut output, &welcome, ADMISSION_TIMEOUT).await.is_ok() {
                 tokio::select! {
                     _ = stop.cancelled() => {},
                     _ = exchange(&mut input, &mut output, &mut outgoing, &host, key) => {},
@@ -228,7 +228,7 @@ async fn serve(incoming: Incoming, access: [u8; 32], host: mpsc::Sender<Request>
 }
 
 async fn reject(output: &mut wire::Output, response: Admit) {
-    if wire::write(output, &response).await.is_ok() {
+    if wire::write(output, &response, ADMISSION_TIMEOUT).await.is_ok() {
         let _ = output.get_mut().finish();
         let _ = timeout(Duration::from_secs(1), output.get_mut().stopped()).await;
     }
@@ -240,15 +240,24 @@ async fn exchange(
     outgoing: &mut mpsc::Receiver<FromHost>,
     host: &mpsc::Sender<Request>,
     key: ConnectionKey,
-) -> Option<()> {
-    loop {
-        tokio::select! {
-            proposal = wire::read::<Vec<u8>>(input) => {
-                let bytes = proposal.ok().filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_PAYLOAD)?;
-                host.send(Request::Message(key, bytes)).await.ok()?;
+) {
+    let receive = async {
+        while let Ok(bytes) = wire::read::<Vec<u8>>(input).await {
+            if bytes.is_empty() || bytes.len() > MAX_PAYLOAD || host.send(Request::Message(key, bytes)).await.is_err() {
+                break;
             }
-            message = outgoing.recv() => wire::write(output, &message?).await.ok()?,
         }
+    };
+    let transmit = async {
+        while let Some(message) = outgoing.recv().await {
+            if wire::write(output, &message, WRITE_STALL_TIMEOUT).await.is_err() {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        _ = receive => {},
+        _ = transmit => {},
     }
 }
 
