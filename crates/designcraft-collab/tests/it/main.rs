@@ -13,6 +13,8 @@ use designcraft_doc::{
     Content, Document, Fill, Hyperlink, HyperlinkDest, HyperlinkSource, Item, ItemId, LayerId, Shape, SpreadRef, StoryId, TextSel,
 };
 
+mod automerge_stories;
+
 fn seed() -> Document {
     Document::new(&NewDocument::default())
 }

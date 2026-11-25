@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, MAX_OPERATIONS, validation};
 
 mod capture;
-mod paragraph;
+pub(crate) mod paragraph;
 pub(crate) use capture::CaptureHint;
 pub use capture::TextSplice;
 use paragraph::ParagraphFormat;
@@ -88,7 +88,7 @@ impl BasicTextFormat {
         }
     }
 
-    fn validate(&self, styles: &Styles) -> Result<(), Error> {
+    pub(crate) fn validate(&self, styles: &Styles) -> Result<(), Error> {
         validate_character_style(styles, &self.style)?;
         validate_format_name(self.font_family.as_deref())?;
         validate_format_name(self.font_style.as_deref())?;

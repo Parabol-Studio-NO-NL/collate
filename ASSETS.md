@@ -6,6 +6,10 @@ Every non-code asset in this repository (fonts, images, example art, presets) is
 
 Generated-in-code art is original and has no file to list: the UI icon set (`crates/ui-egui/src/icons.rs`), default swatches, and the sample magazine's imagery (`crates/engine/src/sample.rs`).
 
+The collaboration book test generates original sample text and illustrations in `crates/ui-egui/src/collaboration/tests/book.rs` using its chapter text and the synthetic PNG generator in `crates/ui-egui/src/collaboration/tests.rs`. This fixture uses the repository's MIT OR Apache-2.0 licence.
+
+Collaboration replication uses the Rust dependency [Automerge 0.12.0](https://crates.io/crates/automerge/0.12.0), by the Automerge contributors, under the MIT licence (see NOTICE).
+
 | Asset | Author | Source | Licence | Notes |
 |---|---|---|---|---|
 | German hyphenation patterns (embedded by `hypher` 0.1.8, feature `german`) | Deutschsprachige Trennmustermannschaft: Stephan Hennig, Werner Lemberg, Günter Milde, Sander van Geloven, Georg Pfeiffer, Gisbert W. Selke, Tobias Wendorf, Keno Wehr | https://github.com/typst/hypher/blob/d81cc506416bffef2a75ee2dc969d4b41bc36613/patterns/hyph-de-1996.tex | MIT (copyright 2013–2024; full text in NOTICE) | Version 2024-02-28; reformed German spelling (2006), despite the `de-1996` filename; no separate old-spelling or Swiss patterns |

@@ -5,7 +5,7 @@ use super::{Error, validate_format_name};
 
 /// Paragraph attributes whose native values can be represented exactly in the room.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct ParagraphFormat {
+pub(crate) struct ParagraphFormat {
     style: String,
     align: Option<Align>,
     left_indent: Option<f64>,
@@ -23,7 +23,7 @@ pub(super) struct ParagraphFormat {
 }
 
 impl ParagraphFormat {
-    pub(super) fn from_doc(format: &ParaFormat, styles: &Styles) -> Result<Self, Error> {
+    pub(crate) fn from_doc(format: &ParaFormat, styles: &Styles) -> Result<Self, Error> {
         let attrs = &format.para;
         let shared = Self {
             style: format.style.clone(),

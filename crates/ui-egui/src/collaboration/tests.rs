@@ -1566,6 +1566,7 @@ fn concurrent_editor_text_inserts_and_deletes_keep_the_other_peers_atoms() {
     assert_eq!(*document(&guest), unchanged);
 }
 
+mod book;
 mod embedded_link;
 mod font_notice;
 mod seed_artwork;

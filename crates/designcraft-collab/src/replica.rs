@@ -7,6 +7,7 @@ use designcraft_doc::{
 };
 
 use crate::artwork::Placement;
+use crate::automerge_stories::{AutomergeStories, StoryTransaction};
 use crate::text::{AtomId, CaptureHint, MAX_STORY_ATOMS, TextEdit, TextReplica, TextSplice, simple_text};
 use crate::{
     CommentAnchor, CommentReply, CommentThread, Error, InitialTextFormat, MAX_OPERATIONS, Operation, ShapeFrame, SharedId, layers, pages, validation,
@@ -25,6 +26,7 @@ pub struct Replica {
     comments: BTreeMap<SharedId, Arc<CommentThread>>,
     comment_ids: BTreeSet<SharedId>,
     text: BTreeMap<StoryId, TextReplica>,
+    automerge: AutomergeStories,
 }
 
 impl Replica {
@@ -32,7 +34,7 @@ impl Replica {
         let ids: BTreeMap<_, _> =
             document.spreads.iter().flat_map(|spread| spread.items.iter()).map(|item| (item.id, SharedId::Seed(item.id))).collect();
         let items = ids.iter().map(|(local, shared)| (shared.clone(), Some(*local))).collect();
-        Self { items, ids, comments: BTreeMap::new(), comment_ids: BTreeSet::new(), text: BTreeMap::new() }
+        Self { items, ids, comments: BTreeMap::new(), comment_ids: BTreeSet::new(), text: BTreeMap::new(), automerge: AutomergeStories::default() }
     }
 
     pub fn shared_id(&self, local: ItemId) -> Option<SharedId> {
@@ -57,6 +59,9 @@ impl Replica {
 
     /// Capture the original visible atoms of a nonempty UTF-8 byte range.
     pub fn text_comment_anchor(&self, document: &Document, story: StoryId, range: Range<usize>) -> Option<CommentAnchor> {
+        if self.automerge.get(story).is_some() {
+            return None;
+        }
         let current = document.story(story)?;
         if current.text.get(range.clone())?.is_empty() {
             return None;
@@ -81,6 +86,47 @@ impl Replica {
     /// engine can restore its local draft and apply the ordered host response.
     pub fn capture(&self, before: &Document, after: &Document, actor: &str, sequence: u64) -> Result<Vec<Operation>, Error> {
         self.capture_selected(before, after, actor, sequence, None)
+    }
+
+    /// Prepare a local Automerge transaction on a replica that owns the local draft. The confirmed
+    /// room replica can merge it independently when it accepts the authenticated transaction.
+    pub fn capture_automerge_text(
+        &mut self,
+        before: &Document,
+        after: &Document,
+        actor: &[u8; 32],
+        splice: Option<(StoryId, TextSplice)>,
+    ) -> Result<Option<StoryTransaction>, Error> {
+        let mut staged = self.automerge.clone();
+        let transaction = staged.capture(before, after, actor, splice)?;
+        if let Some(transaction) = &transaction {
+            self.check_automerge_stories(transaction)?;
+            self.automerge = staged;
+        }
+        Ok(transaction)
+    }
+
+    /// Accept changes from an authenticated peer or replay changes from a trusted journal.
+    pub fn apply_automerge_text(&mut self, document: &mut Document, actor: &[u8; 32], transaction: &StoryTransaction) -> Result<(), Error> {
+        self.check_automerge_stories(transaction)?;
+        self.automerge.apply(document, actor, transaction)
+    }
+
+    pub fn automerge_cursor(&self, story: StoryId, byte: usize) -> Option<Vec<u8>> {
+        self.automerge.get(story)?.cursor(byte).ok()
+    }
+
+    pub fn resolve_automerge_cursor(&self, story: StoryId, cursor: &[u8]) -> Option<usize> {
+        self.automerge.get(story)?.resolve(cursor).ok()
+    }
+
+    fn check_automerge_stories(&self, transaction: &StoryTransaction) -> Result<(), Error> {
+        // An already edited legacy story may have stable comment or undo references that cannot
+        // be inferred from its native text. It needs an explicit history migration.
+        if transaction.changes.iter().any(|change| self.text.contains_key(&change.story)) {
+            return Err(Error::UnsupportedEdit);
+        }
+        Ok(())
     }
 
     pub fn capture_selected(
@@ -219,6 +265,9 @@ impl Replica {
             if Arc::ptr_eq(previous, current) || previous == current {
                 continue;
             }
+            if self.automerge.get(id).is_some() {
+                return Err(Error::UnsupportedEdit);
+            }
             let replica = self.text.get(&id).cloned().map_or_else(|| TextReplica::new(previous, &before.styles), Ok)?;
             let hint = selection
                 .filter(|(old, new)| old.story == id && new.story == id && old.cell.is_none() && new.cell.is_none())
@@ -233,6 +282,9 @@ impl Replica {
 
     /// A sticky predecessor for a local selection. The outer option is absent for unsupported stories.
     pub fn text_anchor(&self, document: &Document, story: StoryId, byte: usize) -> Option<Option<AtomId>> {
+        if self.automerge.get(story).is_some() {
+            return None;
+        }
         if let Some(replica) = self.text.get(&story) {
             return replica.atom_before(byte).ok();
         }
@@ -539,6 +591,9 @@ impl Replica {
     }
 
     fn apply_text(&mut self, document: &mut Document, id: StoryId, actor: &str, sequence: u64, edits: &[TextEdit]) -> Result<(), Error> {
+        if self.automerge.get(id).is_some() {
+            return Err(Error::UnsupportedEdit);
+        }
         let styles = document.styles.clone();
         let story = document.story_mut(id).ok_or(Error::UnknownResource)?;
         let replica = match self.text.entry(id) {
@@ -599,6 +654,7 @@ impl Replica {
         self.items.insert(id, None);
         if let Some(story) = story {
             self.text.remove(&story);
+            self.automerge.remove(story);
         }
     }
 
@@ -651,6 +707,9 @@ impl Replica {
             }
             CommentAnchor::Object(id) if !self.items.contains_key(id) => return Err(Error::UnknownObject),
             CommentAnchor::Text { story, atoms } => {
+                if self.automerge.get(*story).is_some() {
+                    return Err(Error::UnsupportedEdit);
+                }
                 let current = document.story(*story).ok_or(Error::UnknownResource)?;
                 let replica = match self.text.entry(*story) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),

@@ -3,6 +3,8 @@
 use thiserror::Error;
 
 pub mod artwork;
+pub mod automerge_stories;
+pub mod automerge_text;
 pub mod layers;
 mod operations;
 pub mod pages;
