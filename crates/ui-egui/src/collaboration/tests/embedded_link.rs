@@ -59,4 +59,9 @@ fn embed_link_shares_the_original_bytes_and_keeps_the_source_file_private() {
         assert!(snapshot.assets[&asset].data.embedded_bytes().unwrap().as_slice() == pixels);
         assert!(std::fs::read(&path).unwrap() == original);
     }
+
+    host.run("file.save", json!({})).unwrap();
+    let saved = designcraft_format::load(&std::fs::read(path).unwrap()).unwrap();
+    assert!(!has_local_provenance(&saved.assets[&asset]));
+    assert!(saved.assets[&asset].data.embedded_bytes().unwrap().as_slice() == pixels);
 }
