@@ -62,6 +62,61 @@ pub use craft_idml::value::{base64_decode, base64_encode};
 pub use export::{ExportOptions, export_idml, export_idml_report, export_idml_with};
 pub use import::{Imported, import_idml, import_idml_report, import_idml_report_with_previews, import_idml_with};
 
+/// What an IDML package can't keep of a document (see [`unwritten`]): a save that writes IDML
+/// loses it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unwritten {
+    /// Editorial notes (Type › Notes): not written at all.
+    pub editorial_notes: usize,
+    /// Endnotes: their text stays in the endnote frame as plain text, numbers included, but the
+    /// references and the notes themselves are gone.
+    pub endnotes: usize,
+    /// Paragraphs and paragraph styles with explicit Ragtime settings.
+    pub ragtime: usize,
+    /// Document and parent pages that would lose their modular grid settings or row guide ownership.
+    pub modular_grids: usize,
+}
+
+impl Unwritten {
+    /// Nothing is lost.
+    pub fn is_empty(&self) -> bool {
+        *self == Unwritten::default()
+    }
+}
+
+fn has_ragtime(attrs: &designcraft_doc::ParaAttrs) -> bool {
+    attrs.rag_pattern.is_some() || attrs.rag_inset.is_some() || attrs.rag_line_insets.is_some() || attrs.rag_near_threshold.is_some()
+}
+
+fn story_ragtime(story: &designcraft_doc::Story) -> usize {
+    let paragraphs = story.paras.iter().filter(|p| has_ragtime(&p.para)).count();
+    let cells = story.tables.values().flat_map(|table| &table.cells).map(|cell| story_ragtime(&cell.text)).sum::<usize>();
+    let notes = story.notes.iter().chain(&story.endnotes).map(|note| story_ragtime(&note.text)).sum::<usize>();
+    paragraphs + cells + notes
+}
+
+/// What [`export_idml`] leaves out of `d`. Count Ragtime settings where they are defined,
+/// so a style counts even when unused and paragraphs inheriting it do not count twice.
+pub fn unwritten(d: &designcraft_doc::Document) -> Unwritten {
+    let mut lost = Unwritten {
+        ragtime: d.styles.paragraph.iter().filter(|style| has_ragtime(&style.para)).count(),
+        modular_grids: d
+            .spreads
+            .iter()
+            .chain(&d.parents)
+            .flat_map(|spread| &spread.pages)
+            .filter(|page| page.modular_grid.is_some() || page.guides.iter().any(|g| g.modular_row))
+            .count(),
+        ..Default::default()
+    };
+    for story in d.stories.values() {
+        lost.editorial_notes += story.editorial.len();
+        lost.endnotes += story.endnotes.len();
+        lost.ragtime += story_ragtime(story);
+    }
+    lost
+}
+
 /// The IDML package mimetype (content of the first, stored `mimetype` entry).
 pub const MIMETYPE: &str = craft_idml::MIMETYPE;
 /// The DOM version written to every part.

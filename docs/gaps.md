@@ -185,7 +185,7 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
   Profile / Edit Original, File ▸ Open PDF / Document and Print Presets / User
   Settings, Type ▸ Size presets, Table ▸ Table Options / Cell Options submenus, Paste Before/After,
   Convert Columns, Object ▸ Interactive ▸ Convert to (form fields),
-  View ▸ Extras badges and Story Editor options (Show/Hide Depth Ruler and Show/Hide Style Name Column are there). Overriding a
+  View ▸ Extras badges and Story Editor options (Show/Hide Depth Ruler, Show/Hide Style Name Column and Show/Hide Paragraph Break Marks are there). Overriding a
   base parent's items on a parent spread itself (overrides work on document pages only); Save
   as Parent; new parents for an alternate layout (its pages keep their source pages' parents).
 - **Estimate:** 40–70 h (most are thin wrappers over existing engine features).
@@ -234,7 +234,9 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
   images are not yet measured on a real catalogue).
 - **Have:** placed graphics link to their files instead of embedding them; a document stores a proxy and a hash, loads original bytes on demand through a 512 MiB cache, and opens without reading them (see [linked-artwork.md](linked-artwork.md)). Compose 300k characters ~38 ms warm, damage-region repaint (< 1 ms while typing),
   parallel story composition, and an edit composes only the paragraphs it can change in a plain
-  story (240 paragraphs: 3 composed for a typed character). Automatic recovery writes on a
+  story (240 paragraphs: 3 composed for a typed character); list/footnote/endnote numbering
+  across stories built once per document version (a 677-story IDML with 8 continuing lists:
+  69 s → 37 ms to compose). Automatic recovery writes on a
   background thread and streams to disk, so an autosave of that catalogue no longer blocks the
   interface thread for 30-100 s (`file.recovery.save {background}`, `file.recovery.progress`). A
   snapshot still being written when its document is saved, reverted or closed is cancelled before
