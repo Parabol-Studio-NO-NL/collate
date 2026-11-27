@@ -18,5 +18,5 @@ designcraft-ui-egui = { workspace = true }
 designcraft-doc = { workspace = true }
 designcraft-format = { workspace = true }
 craft-atomic = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 tempfile = { workspace = true }

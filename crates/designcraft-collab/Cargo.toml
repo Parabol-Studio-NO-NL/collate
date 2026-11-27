@@ -12,14 +12,14 @@ automerge-rooms = []
 
 [dependencies]
 automerge.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 craft-image-codecs.workspace = true
 craft-pdf = { workspace = true, features = ["interpret"] }
 designcraft-doc.workspace = true
 designcraft-images.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
