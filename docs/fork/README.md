@@ -66,10 +66,21 @@ Enter your target leading. With **Fit leading to margins** selected, Collate fin
 
 ## Develop
 
+Use the same checkout and Cargo target directory for day-to-day work. The development profile keeps incremental compilation and line tables for workspace crates. Build the native app in that profile and use a focused test command for the code you changed.
+
+```sh
+python3 tools/fork/build.py build -p designcraft
+python3 tools/fork/build.py test -p designcraft-collab-core --features native
+./target/debug/designcraft
+```
+
+Use `python3 tools/fork/build.py check -p designcraft` when you only need compiler diagnostics. The wrapper checks free space before, during, and after Cargo runs, and reports the elapsed time and how much disk space the build cache gained or lost. It stops below **5 GiB free** and warns above **12 GiB of cached build output**. Adjust the defaults with `--min-free-gib` and `--warn-cache-gib` before the Cargo command. The wrapper leaves existing cache files in place.
+
+Keep the warm development profile for source edits. When you need space, preview cleanup of an unused profile with `cargo clean --release --dry-run --verbose` or of an unused architecture with `cargo clean --target wasm32-unknown-unknown --dry-run --verbose`. Remove `--dry-run` to apply the cleanup. Use the same Cargo configuration and environment you built with.
+
 The **Native Sparkle fixture** runs on changes to the updater and macOS packaging. On a disposable GitHub-hosted macOS runner, it uses a temporary certificate and two ad hoc Collate builds to exercise **Check for Updates** over loopback HTTPS. It verifies the signed appcast and archive, then checks that Sparkle installs and relaunches the newer build from the scratch path.
 
 ```sh
-cargo run --locked -p designcraft
 cargo test --locked -p designcraft-collab
 cargo test --locked -p designcraft-collab-core --all-features
 cargo test --locked -p designcraft-engine --test it deferred_edits
