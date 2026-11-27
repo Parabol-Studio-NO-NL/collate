@@ -22,7 +22,7 @@ mod typing;
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -468,6 +468,12 @@ impl DesignApp {
 
     fn connect_to_room(&mut self, host: bool, room: OpenRoom, preferred_protocol: Option<RoomProtocol>) -> Result<(), String> {
         let st = self.session.active().ok_or("Open the saved document before connecting.")?;
+        // Reimporting IDML can assign different IDs to the objects in a room's journal.
+        if st.path.as_deref().and_then(|path| Path::new(path).extension()).is_some_and(|ext| ext.eq_ignore_ascii_case("idml")) {
+            return Err(
+                "Save this document as a .designcraft file before sharing it. To receive the host’s copy, choose Join and receive document.".into()
+            );
+        }
         if st.interaction.is_some() || st.preview_stash.is_some() {
             return Err("Finish the current document edit before connecting.".into());
         }
