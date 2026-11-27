@@ -66,6 +66,33 @@ fn document(app: &DesignApp) -> &Document {
     &app.session.doc().unwrap().doc
 }
 
+#[test]
+fn an_idml_working_file_cannot_seed_a_room_but_can_stay_open_while_joining() {
+    let dir = tempfile::tempdir().unwrap();
+    let seed = Document::new(&NewDocument::default());
+    let mut guest = editor(&seed, "Guest");
+    let idml_path = dir.path().join("Imported.IDML").to_str().unwrap().to_string();
+    guest.session.doc_mut().unwrap().path = Some(idml_path.clone());
+    guest.session.recovery_dir = Some(dir.path().join("recovery"));
+    let error = guest.connect_collaboration(true).unwrap_err();
+    assert!(error.contains(".designcraft"));
+    assert!(guest.collaboration.room.is_none());
+    assert!(dir.path().read_dir().unwrap().next().is_none());
+
+    let mut host = editor(&seed, "Host");
+    host.run("file.saveAs", json!({"path": dir.path().join("Host.designcraft")})).unwrap();
+    host.connect_collaboration(true).unwrap();
+    wait_for(&mut [&mut host], "native working file starts a room", |apps| room(apps[0]).invitation.is_some());
+    guest.collaboration.join_code = room(&host).invitation.clone().unwrap();
+    assert!(guest.connect_collaboration(false).unwrap_err().contains(".designcraft"));
+    guest.start_seed_download().unwrap();
+    wait_for(&mut [&mut host, &mut guest], "guest receives the native document", |apps| {
+        apps[1].collaboration.room.as_ref().is_some_and(Room::can_edit)
+    });
+    assert!(guest.session.active().unwrap().path.is_none());
+    assert!(guest.session.documents().iter().any(|doc| doc.path.as_deref() == Some(idml_path.as_str())));
+}
+
 fn deliver_room_packet(sender: &DesignApp, recipient: &mut DesignApp, message: super::Message) {
     let actor = room(sender).local.as_ref().unwrap().actor;
     let bytes = super::encode(message).unwrap();
