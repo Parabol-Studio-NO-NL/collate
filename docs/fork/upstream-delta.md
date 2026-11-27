@@ -2,7 +2,9 @@
 
 The [upstream revision marker](../../tools/fork/upstream-revision) records the latest reviewed DesignCraft commit.
 
-The review of `b7a8a9ac73314eb50dd8ec9c2dcacc3f1d7d555a` covers a single change to DesignCraft's release workflow. It forwards an upstream distribution credential between workflows. Collate distributes official builds through the private studio release workflow, so the source import records the review in the revision marker and excludes upstream release automation.
+The import through `ecce20f17241e78e4cb915b235506d33d7d62f0a` includes DesignCraft’s editor, document-format, rendering and browser changes since `b7a8a9ac`. Collate retains its own desktop identity, profiles, update channel and packaging. DesignCraft’s nightly launcher, signing workflows, keys, and nightly artwork are excluded from the snapshot.
+
+Croatian hyphenation remains deferred. The pattern file offers LPPL or an older Unicode-style data licence. Both fall outside the current Craft licence allowlist. Revisit the import when Craft approves one of those terms or an allowlisted pattern set becomes available. [DesignCraft PR #2425](https://github.com/storytold/designcraft/pull/2425) · [Craft licence policy](https://github.com/storytold/craft-contrib/blob/main/standards/licences.md)
 
 | Path | Change | Upstream potential |
 | --- | --- | --- |
