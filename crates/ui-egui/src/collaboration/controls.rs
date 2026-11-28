@@ -1,12 +1,12 @@
 use std::ops::Range;
 
 use designcraft_collab::{CommentAnchor, Operation, RoomProtocol, SharedId};
-use designcraft_doc::{Document, StoryId, TextSel};
+use designcraft_doc::{AssetId, Document, StoryId, TextSel};
 use designcraft_engine::Session;
 use egui::{Button, Context, TextEdit, Ui, Window};
 use serde_json::json;
 
-use super::{Collaboration, Mode, Room, history::HistoryAction, linked_copy, presence};
+use super::{Collaboration, Mode, Room, history::HistoryAction, linked_copy, oversized, presence};
 use crate::{DesignApp, app::file_dialogs::Bound, i18n::tr};
 
 enum Action {
@@ -23,6 +23,7 @@ enum Action {
     History(HistoryAction),
     Comment(Box<Operation>),
     SelectCommentText(StoryId, Range<usize>),
+    ShowImage(AssetId),
 }
 
 impl DesignApp {
@@ -125,6 +126,16 @@ impl DesignApp {
                     Err(error) => room.error = Some(error),
                 }
             }
+            Some(Action::ShowImage(asset)) => {
+                if self.run("links.goTo", json!({"asset": asset.0})).is_ok()
+                    && let Some(st) = self.session.active()
+                    && let Some(loc) = st.selection.items.first().and_then(|&id| st.doc.find(id))
+                    && let Some(item) = st.doc.item_at(&loc)
+                {
+                    let bounds = st.doc.parent_xf(&loc).transform_rect_bbox(item.bounds());
+                    crate::canvas::go_to_spread_rect(self, loc.spread, bounds);
+                }
+            }
             Some(Action::SelectCommentText(story, range)) => {
                 if self.run("tool.select", json!({"tool": "type"})).is_ok()
                     && self.run("text.select", json!({"story": story.0, "anchor": range.start, "focus": range.end})).is_ok()
@@ -196,13 +207,17 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
                 None
             }
         } else {
-            let (label, action) =
-                if RoomProtocol::Automerge.is_supported() && session.active().is_some_and(|state| linked_copy::has_linked_artwork(&state.doc)) {
-                    ("Share a copy with artwork…", Action::ShareLinkedCopy)
-                } else {
-                    ("Start sharing", Action::Connect(true))
-                };
-            let host = ui.add_enabled(has_name && has_document, room_button(lang, label)).clicked().then_some(action);
+            let oversized = oversized_images(c, session);
+            let can_copy = RoomProtocol::Automerge.is_supported();
+            let shown = if can_copy && !oversized.is_empty() { show_oversized(lang, ui, oversized) } else { None };
+            let (label, action) = if can_copy && !oversized.is_empty() {
+                ("Share a copy with smaller images…", Action::ShareLinkedCopy)
+            } else if can_copy && session.active().is_some_and(|state| linked_copy::has_linked_artwork(&state.doc)) {
+                ("Share a copy with artwork…", Action::ShareLinkedCopy)
+            } else {
+                ("Start sharing", Action::Connect(true))
+            };
+            let host = ui.add_enabled(has_name && has_document, room_button(lang, label)).clicked().then_some(action).or(shown);
             if cfg!(target_os = "macos") && session.recovery_dir.is_some() && session.active().is_some_and(|state| state.path.is_some()) {
                 let recovery = ui.collapsing(tr(lang, "Room recovery"), |ui| ui.add(room_button(lang, "Open saved room copy")).clicked());
                 if recovery.body_returned == Some(true) { Some(Action::OpenSavedRoomCopy) } else { host }
@@ -217,7 +232,7 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         let download = ui.add_enabled(can_join, Button::new(tr(lang, "Join and receive document"))).clicked();
         let join = ui.add_enabled(can_join && has_document, Button::new(tr(lang, "Join with open document"))).clicked();
         if let Some(message) = &c.message {
-            ui.label(tr(lang, message));
+            message_label(ui, lang, message, false);
         }
         return folder.or(host).or(if download { Some(Action::ReceiveSeed) } else { join.then_some(Action::Connect(false)) });
     };
@@ -229,7 +244,10 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
         ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
     }
     if let Some(error) = &room.error {
-        ui.label(tr(lang, error));
+        message_label(ui, lang, error, false);
+    }
+    if let Some(notice) = &room.notice {
+        message_label(ui, lang, notice, true);
     }
     if let Some(code) = &room.invitation
         && ui.button(tr(lang, "Copy invitation code")).clicked()
@@ -296,6 +314,53 @@ fn show(c: &mut Collaboration, session: &Session, lang: &str, ui: &mut Ui, curre
             }
         });
     }
+    action
+}
+
+/// A message whose first line is fixed text and whose later lines may name files.
+/// Each line is translated on its own; a line naming a file is shown as written.
+fn message_label(ui: &mut Ui, lang: &str, message: &str, announce: bool) {
+    let text = message.lines().map(|line| tr(lang, line)).collect::<Vec<_>>().join("\n");
+    let label = ui.label(text);
+    if announce {
+        ui.ctx().accesskit_node_builder(label.id, |node| node.set_live(egui::accesskit::Live::Polite));
+    }
+}
+
+fn oversized_images<'a>(c: &'a mut Collaboration, session: &Session) -> &'a [oversized::OversizedImage] {
+    let Some(st) = session.active() else { return &[] };
+    let key = (st.uid, st.revision);
+    if c.oversized.as_ref().is_none_or(|(cached, _)| *cached != key) {
+        c.oversized = Some((key, oversized::oversized_images(&st.doc)));
+    }
+    c.oversized.as_ref().map_or(&[], |(_, images)| images)
+}
+
+/// Name each image a room cannot share and say what sharing does about it.
+fn show_oversized(lang: &str, ui: &mut Ui, images: &[oversized::OversizedImage]) -> Option<Action> {
+    let heading = if images.len() == 1 { "One image is too large to share" } else { "Some images are too large to share" };
+    let heading = ui.strong(tr(lang, heading));
+    ui.ctx().accesskit_node_builder(heading.id, |node| node.set_live(egui::accesskit::Live::Polite));
+    let mut action = None;
+    for image in images.iter().take(5) {
+        ui.horizontal(|ui| {
+            let size =
+                tr(lang, "{width} × {height} px").replace("{width}", &image.pixels.0.to_string()).replace("{height}", &image.pixels.1.to_string());
+            ui.label(format!("{} · {size}", image.name));
+            let show = tr(lang, "Show");
+            let button = ui.add(Button::new(show));
+            let name = format!("{show} {}", image.name);
+            ui.ctx().accesskit_node_builder(button.id, |node| node.set_label(name));
+            if button.clicked() {
+                action = Some(Action::ShowImage(image.id));
+            }
+        });
+    }
+    if images.len() > 5 {
+        ui.label(tr(lang, "and {count} more").replace("{count}", &(images.len() - 5).to_string()));
+    }
+    ui.label(tr(lang, oversized::LIMIT));
+    ui.label(tr(lang, "Sharing makes a copy with smaller versions of these images. This document keeps the originals."));
     action
 }
 

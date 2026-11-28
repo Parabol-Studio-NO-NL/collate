@@ -323,6 +323,23 @@ pub fn raster_dimensions(mime: &str, bytes: &[u8], max_pixels: u64, verify_body:
     Ok(dimensions)
 }
 
+/// The pixel size of a readable raster image that is too large for a room, or `None` when it fits
+/// or is not a raster image a room shares.
+pub fn exceeds_room_limit(mime: &str, bytes: &[u8]) -> Option<(u32, u32)> {
+    let (format, _) = raster_format(mime)?;
+    let dimensions = match format {
+        RasterFormat::Codec(_) => craft_image_codecs::probe_allocation_size(bytes).ok()?,
+        RasterFormat::Psd => designcraft_images::pixel_size(bytes)?,
+    };
+    if dimensions.0 == 0 || dimensions.1 == 0 {
+        return None;
+    }
+    let pixels = u64::from(dimensions.0) * u64::from(dimensions.1);
+    let over_decode_budget = matches!(format, RasterFormat::Psd)
+        && pixels.saturating_mul(designcraft_images::decode_bytes_per_pixel(bytes) as u64) > MAX_IMAGE_PIXELS * 16;
+    (!valid_dimensions(dimensions, MAX_IMAGE_PIXELS) || over_decode_budget).then_some(dimensions)
+}
+
 fn psd_dimensions(bytes: &[u8], max_pixels: u64, verify_body: bool) -> Result<(u32, u32), &'static str> {
     if !designcraft_images::is_psd(bytes) {
         return Err("A shared image does not match its declared format.");

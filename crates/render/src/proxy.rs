@@ -62,6 +62,47 @@ pub fn make_proxy_with_limits(bytes: &[u8], page: u32, max_side: u32, max_bytes:
     None
 }
 
+/// A full-quality replacement for an image that is too large to share: at most `max_side` on each
+/// side and `max_pixels` in all, keeping the aspect ratio, and at most `max_bytes` encoded.
+/// `None` when the image already fits, can't be decoded, or no encoding fits.
+pub fn reduce_to_fit(bytes: &[u8], max_side: u32, max_pixels: u64, max_bytes: usize) -> Option<ProxyImage> {
+    let (w, h) = image_size(bytes)?;
+    let target = fit_area(w, h, max_side, max_pixels);
+    if target == (w, h) || max_bytes == 0 {
+        return None;
+    }
+    let pm = decode_for_proxy(bytes, 0, target.0.max(target.1))?;
+    let (dw, dh) = (u32::from(pm.width()), u32::from(pm.height()));
+    // A reduced decode stops at or above the target, so fit what it decoded.
+    let (tw, th) = fit_area(dw, dh, max_side, max_pixels);
+    let pm = if (tw, th) == (dw, dh) { pm } else { resample(&pm, tw, th)? };
+    let (cw, ch) = (u32::from(pm.width()), u32::from(pm.height()));
+    let (rgba, opaque) = unpremultiplied(&pm);
+    let encoded = if opaque {
+        [92, 85, 75].into_iter().find_map(|quality| encode_jpeg(cw, ch, &rgba, quality).filter(|data| data.len() <= max_bytes))
+    } else {
+        encode_png(cw, ch, rgba).filter(|data| data.len() <= max_bytes)
+    };
+    encoded.map(|data| ProxyImage { mime: if opaque { "image/jpeg" } else { "image/png" }, pixels: (cw, ch), data })
+}
+
+/// `(w, h)` scaled down to fit `max_side` and `max_pixels`; never up.
+fn fit_area(w: u32, h: u32, max_side: u32, max_pixels: u64) -> (u32, u32) {
+    let area = u64::from(w) * u64::from(h);
+    let by_area = if area > max_pixels { (max_pixels as f64 / area as f64).sqrt() } else { 1.0 };
+    let by_side = f64::from(max_side) / f64::from(w.max(h).max(1));
+    let scale = by_area.min(by_side);
+    if scale >= 1.0 {
+        return (w, h);
+    }
+    let mut size = (((f64::from(w) * scale) as u32).max(1), ((f64::from(h) * scale) as u32).max(1));
+    // Rounding can leave the product just above the limit.
+    while u64::from(size.0) * u64::from(size.1) > max_pixels && size.0.max(size.1) > 1 {
+        if size.0 >= size.1 { size.0 -= 1 } else { size.1 -= 1 }
+    }
+    size
+}
+
 /// Decode `bytes`, through reduced decoding when it still leaves at least [`MAX_SIDE_PX`].
 fn decode_for_proxy(bytes: &[u8], page: u32, max_side: u32) -> Option<Pixmap> {
     if page == 0 && designcraft_images::supports_reduced_decode(bytes) {
@@ -188,6 +229,21 @@ mod tests {
         let q = make_proxy(&png(300, 200, false), 0).unwrap();
         assert_eq!(q.pixels, (300, 200));
         eprintln!("proxy png {} bytes, jpeg {} bytes", p.data.len(), q.data.len());
+    }
+
+    #[test]
+    fn a_reduced_copy_fits_the_limits_and_keeps_its_shape() {
+        let original = png(900, 400, false);
+        let reduced = reduce_to_fit(&original, 800, 100_000, usize::MAX).unwrap();
+        let (w, h) = reduced.pixels;
+        assert!(u64::from(w) * u64::from(h) <= 100_000 && w <= 800);
+        assert!((f64::from(w) / f64::from(h) - 900.0 / 400.0).abs() < 0.02);
+        assert_eq!(image_size(&reduced.data), Some((w, h)));
+
+        let with_alpha = reduce_to_fit(&png(600, 600, true), 400, u64::MAX, usize::MAX).unwrap();
+        assert_eq!(with_alpha.mime, "image/png");
+        assert!(with_alpha.pixels.0 <= 400);
+        assert!(reduce_to_fit(&original, 900, 360_000, usize::MAX).is_none(), "an image that fits is left alone");
     }
 
     #[test]
