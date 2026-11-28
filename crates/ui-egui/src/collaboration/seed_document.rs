@@ -620,6 +620,7 @@ pub(super) fn prepare_local_copy(doc: &mut Document) -> Result<(), String> {
 
 fn validate_model(doc: &Document, protocol: RoomProtocol) -> Result<(), String> {
     validate_document_structure(doc, protocol)?;
+    super::oversized::check_document(doc)?;
     for (&id, asset) in &doc.assets {
         if id != asset.id {
             return Err(INVALID.into());
@@ -673,8 +674,8 @@ fn validate_asset_metadata(asset: &Asset, protocol: RoomProtocol) -> Result<(), 
         raster_extension(&asset.mime).ok_or(UNSUPPORTED_ASSET)?;
         check_artwork_protocol(&asset.mime, protocol).map_err(|error| error.to_string())?;
     }
-    if asset.pixels.is_some_and(|pixels| !valid_dimensions(pixels, MAX_IMAGE_PIXELS)) {
-        return Err("A shared image exceeds the room pixel limit.".into());
+    if let Some(pixels) = asset.pixels.filter(|&pixels| !valid_dimensions(pixels, MAX_IMAGE_PIXELS)) {
+        return Err(super::oversized::too_large_asset(asset, pixels));
     }
     if let Some(proxy) = &asset.proxy
         && (!matches!(proxy.mime.as_str(), "image/png" | "image/jpeg") || !valid_dimensions(proxy.pixels, MAX_PROXY_PIXELS))
@@ -732,6 +733,7 @@ fn payloads(doc: &Document, verify_image_body: bool, protocol: RoomProtocol) -> 
     let mut entries = Vec::new();
     let mut pixels = 0u64;
     let total_pixels = total_pixels(protocol);
+    super::oversized::check_document(doc)?;
     for asset in doc.assets.values() {
         check_artwork_protocol(&asset.mime, protocol).map_err(|error| error.to_string())?;
         let data = asset.data.embedded_bytes().ok_or(UNSUPPORTED_LINKS)?;

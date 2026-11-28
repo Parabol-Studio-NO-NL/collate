@@ -6,6 +6,7 @@ use designcraft_doc::{Document, Storage};
 use designcraft_engine::{DocState, FontScope, Session, file_access};
 use serde_json::{Value, json};
 
+use super::oversized::{ReducedImage, reduce_images};
 use crate::{DesignApp, app::file_dialogs::Bound, i18n::tr};
 
 pub(super) type CopyResult = mpsc::Receiver<Result<SharedCopy, String>>;
@@ -14,6 +15,7 @@ pub(super) struct SharedCopy {
     document: Arc<Document>,
     path: String,
     fonts: Option<Arc<FontScope>>,
+    reduced: Vec<ReducedImage>,
 }
 
 pub(super) fn has_linked_artwork(document: &Document) -> bool {
@@ -77,7 +79,11 @@ impl DesignApp {
         state.fonts = copy.fonts;
         self.session.add_document(state);
         self.after_engine();
-        self.connect_collaboration(true)
+        self.connect_collaboration(true)?;
+        if let Some(room) = self.collaboration.room.as_mut() {
+            room.notice = super::oversized::reduced_message(&copy.reduced);
+        }
+        Ok(())
     }
 }
 
@@ -88,6 +94,15 @@ fn prepare_copy(document: &Document, path: Option<String>, destination: String) 
     let saved = session.execute("file.saveACopy", &json!({"path": destination, "verifiedLinks": true})).map_err(|error| error.to_string())?;
     let path = saved["path"].as_str().ok_or("Could not find the saved shared copy.")?.to_string();
     session.execute("file.open", &json!({"path": path})).map_err(|error| error.to_string())?;
+    // Linked originals are embedded now, so every oversized image has bytes to reduce.
+    let opened = session.doc_mut().map_err(|error| error.to_string())?;
+    let mut document = (*opened.doc).clone();
+    let reduced = reduce_images(&mut document, |_| true)?;
+    if !reduced.is_empty() {
+        opened.doc = Arc::new(document);
+        opened.bump_revision();
+        session.execute("file.save", &json!({"path": path})).map_err(|error| error.to_string())?;
+    }
     let opened = session.doc().map_err(|error| error.to_string())?;
-    Ok(SharedCopy { document: opened.doc.clone(), path, fonts: opened.fonts.clone() })
+    Ok(SharedCopy { document: opened.doc.clone(), path, fonts: opened.fonts.clone(), reduced })
 }

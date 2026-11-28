@@ -6,6 +6,7 @@ mod edit_wire;
 mod history;
 mod join;
 mod linked_copy;
+mod oversized;
 mod presence;
 mod replay;
 mod seed;
@@ -190,6 +191,8 @@ struct Room {
     last_send: Option<Instant>,
     last_presence: Option<Instant>,
     error: Option<String>,
+    /// Information about a change sharing made, such as a reduced image.
+    notice: Option<String>,
     fatal: bool,
     #[cfg(target_os = "macos")]
     recovery_path_checked: Option<String>,
@@ -226,6 +229,8 @@ pub(crate) struct Collaboration {
     room: Option<Room>,
     joining: Option<PendingJoin>,
     linked_copy: Option<linked_copy::CopyResult>,
+    /// Images in the active document a room cannot share, by document uid and revision.
+    oversized: Option<((u64, u64), Vec<oversized::OversizedImage>)>,
     message: Option<String>,
     room_conflict: Option<RoomConflict>,
     comment: String,
@@ -611,6 +616,7 @@ impl Room {
             last_send: None,
             last_presence: None,
             error: None,
+            notice: None,
             fatal: false,
             #[cfg(target_os = "macos")]
             recovery_path_checked: None,
@@ -1059,9 +1065,13 @@ impl Room {
         }
     }
 
-    fn capture_edit(&mut self, session: &mut Session, edit: DeferredEdit) -> Result<(), String> {
+    fn capture_edit(&mut self, session: &mut Session, mut edit: DeferredEdit) -> Result<(), String> {
         let actor = self.local.as_ref().ok_or("The collaboration connection is still starting.")?.actor;
         self.error = None;
+        let reduced = reduce_new_images(&mut edit)?;
+        if !reduced.is_empty() {
+            self.notice = oversized::reduced_message(&reduced);
+        }
         let local = self.story_draft.as_ref().map_or(&self.replica, |draft| &draft.visible);
         if self.protocol.is_automerge()
             && let Some(story_sync::Captured { transaction, selection, replica }) = story_sync::capture(local, actor, &edit, self.next_sequence)?
@@ -1464,6 +1474,16 @@ impl Room {
             }
         }
     }
+}
+
+/// Artwork an edit adds or replaces is shared at a size every peer can decode.
+fn reduce_new_images(edit: &mut DeferredEdit) -> Result<Vec<oversized::ReducedImage>, String> {
+    let before = &edit.before;
+    let is_new = |asset: &designcraft_doc::Asset| before.assets.get(&asset.id).is_none_or(|old| old.data != asset.data);
+    if !edit.after.assets.values().any(|asset| is_new(asset) && oversized::is_oversized(asset)) {
+        return Ok(Vec::new());
+    }
+    oversized::reduce_images(Arc::make_mut(&mut edit.after), is_new)
 }
 
 fn install_confirmed(st: &mut designcraft_engine::DocState, doc: Document) {
